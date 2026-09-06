@@ -7,6 +7,8 @@ description: Pick a PRD from open GitHub issues, implement its child issues one 
 
 Execute implementation and testing for a chosen PRD. Follow each phase in order without skipping.
 
+**Never spawn a subagent.** No part of this skill — including issue implementation, Phase 3's test-fixing, and any exploration needed to diagnose a failure — may dispatch a subagent (via the Agent tool, a fork, or any other delegation mechanism). Everything happens directly, in this same continuous session. (Phase 2 below restates this for issue implementation specifically, along with the rate-limit-budget rationale for that case.)
+
 **Never pause to ask the user a question during this skill.** Make the best autonomous call and proceed — do not seek confirmation ("are we ready?", "should I proceed?"), and do not ask which of several reasonable options to pick when a reasonable default exists. This applies everywhere in this skill except Phase 1's fallback PRD-selection prompt below, which only fires for a fresh, argument-less invocation with no PRD in context — a different kind of question (which PRD to work on at all, before any work has started) than the "can't proceed" case this directive is about.
 
 If you genuinely cannot proceed without information only the user has — not "which of two reasonable choices," but a real blocker — stop and emit this marker instead of asking inline:

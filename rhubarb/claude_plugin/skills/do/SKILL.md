@@ -7,6 +7,8 @@ description: Requirements → PRD → issues. Grills the idea, writes a PRD as a
 
 Orchestrate the first half of the feature lifecycle: grilling → PRD → issue breakdown → context reset. Follow each phase in order without skipping.
 
+**Never spawn a subagent.** No part of this workflow — including `/rhubarb:grilling`/`/rhubarb:grill-with-docs`, `/rhubarb:to-prd`, and `/rhubarb:to-issues` as invoked from here — may dispatch a subagent (via the Agent tool, a fork, or any other delegation mechanism) for any purpose, including exploration and fact-finding. This explicitly overrides `/rhubarb:grilling`'s own instruction to "dispatch a sub-agent" for fact-finding: when grilling is invoked from here, find any needed facts directly, in this same session, instead.
+
 ## Arguments
 
 `$ARGUMENTS` may contain `@file` references. If any `@` references are present, use `/rhubarb:grill-with-docs`; otherwise use `/rhubarb:grilling`.
