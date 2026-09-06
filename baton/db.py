@@ -56,6 +56,10 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
         conn.execute(
             "ALTER TABLE settings ADD COLUMN parallel_implementation INTEGER NOT NULL DEFAULT 0"
         )
+    if "terminal_view_hidden" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE settings ADD COLUMN terminal_view_hidden INTEGER NOT NULL DEFAULT 0"
+        )
     if "model" not in existing_columns:
         conn.execute(
             f"ALTER TABLE settings ADD COLUMN model TEXT NOT NULL DEFAULT '{DEFAULT_MODEL}'"
@@ -158,6 +162,22 @@ def set_parallel_implementation(conn: sqlite3.Connection, value: bool) -> None:
         """
         INSERT INTO settings (id, parallel_implementation) VALUES (1, ?)
         ON CONFLICT(id) DO UPDATE SET parallel_implementation = excluded.parallel_implementation
+        """,
+        (1 if value else 0,),
+    )
+    conn.commit()
+
+
+def get_terminal_view_hidden(conn: sqlite3.Connection) -> bool:
+    row = conn.execute("SELECT terminal_view_hidden FROM settings WHERE id = 1").fetchone()
+    return bool(row["terminal_view_hidden"]) if row else False
+
+
+def set_terminal_view_hidden(conn: sqlite3.Connection, value: bool) -> None:
+    conn.execute(
+        """
+        INSERT INTO settings (id, terminal_view_hidden) VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET terminal_view_hidden = excluded.terminal_view_hidden
         """,
         (1 if value else 0,),
     )

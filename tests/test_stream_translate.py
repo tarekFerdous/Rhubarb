@@ -125,6 +125,11 @@ RESULT_SUCCESS = {
     "duration_ms": 5381,
 }
 
+TERMINAL_OUTPUT = {
+    "type": "terminal_output",
+    "data": "\x1b[32mHello\x1b[0m\r\n",
+}
+
 RATE_LIMIT_EVENT = {
     "type": "rate_limit_event",
     "rate_limit_info": {
@@ -165,6 +170,10 @@ RATE_LIMIT_EVENT = {
             },
         ),
         (RATE_LIMIT_EVENT, {"type": "usage", "five_hour_pct": 0.42, "seven_day_pct": 0.04}),
+        (
+            TERMINAL_OUTPUT,
+            {"type": "terminal_output", "data": "\x1b[32mHello\x1b[0m\r\n"},
+        ),
     ],
 )
 def test_translate_event(raw_event, expected):

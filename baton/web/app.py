@@ -105,6 +105,7 @@ def app_state():
     root_dir = db.get_root_dir(conn)
     afk_hours = db.get_afk_hours(conn)
     parallel_implementation = db.get_parallel_implementation(conn)
+    terminal_view_hidden = db.get_terminal_view_hidden(conn)
     model = db.get_model(conn)
     effort = db.get_effort(conn)
 
@@ -123,6 +124,7 @@ def app_state():
         "root_dir": root_dir,
         "afk_hours": afk_hours,
         "parallel_implementation": parallel_implementation,
+        "terminal_view_hidden": terminal_view_hidden,
         "model": model,
         "effort": effort,
         "active_project": active_project,
@@ -171,6 +173,14 @@ def set_parallel_implementation(body: dict):
     parallel_implementation = bool(body["parallel_implementation"])
     db.set_parallel_implementation(conn, parallel_implementation)
     return {"parallel_implementation": parallel_implementation}
+
+
+@app.post("/api/settings/terminal-view-hidden")
+def set_terminal_view_hidden(body: dict):
+    conn = db.get_connection()
+    terminal_view_hidden = bool(body["terminal_view_hidden"])
+    db.set_terminal_view_hidden(conn, terminal_view_hidden)
+    return {"terminal_view_hidden": terminal_view_hidden}
 
 
 @app.post("/api/settings/model")
@@ -317,6 +327,15 @@ def get_usage():
     if usage is None:
         return {"five_hour_pct": None, "seven_day_pct": None}
     return {"five_hour_pct": usage["five_hour_pct"], "seven_day_pct": usage["seven_day_pct"]}
+
+
+@app.get("/api/pty-tabs/count")
+def get_pty_tab_count():
+    """How many `PtyEngine` tabs are currently resident across every active
+    session (issue #88) -- backs the tab-count indicator next to the
+    "Sessions" label in the web UI. Polled rather than pushed over any one
+    card's SSE stream since the count is global, not scoped to a card."""
+    return {"count": session_runner.open_pty_tab_count()}
 
 
 @app.get("/api/sessions/{card_id}/stream")

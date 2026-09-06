@@ -42,6 +42,23 @@ def test_set_parallel_implementation_persists_and_reflects_in_app_state(client):
     assert client.get("/api/app-state").json()["parallel_implementation"] is True
 
 
+def test_app_state_defaults_terminal_view_hidden_to_false(client):
+    state = client.get("/api/app-state").json()
+    assert state["terminal_view_hidden"] is False
+
+
+def test_set_terminal_view_hidden_persists_and_reflects_in_app_state(client):
+    resp = client.post("/api/settings/terminal-view-hidden", json={"terminal_view_hidden": True})
+    assert resp.json() == {"terminal_view_hidden": True}
+
+    state = client.get("/api/app-state").json()
+    assert state["terminal_view_hidden"] is True
+
+    resp = client.post("/api/settings/terminal-view-hidden", json={"terminal_view_hidden": False})
+    assert resp.json() == {"terminal_view_hidden": False}
+    assert client.get("/api/app-state").json()["terminal_view_hidden"] is False
+
+
 def test_app_state_defaults_model_to_claude_sonnet(client):
     state = client.get("/api/app-state").json()
     assert state["model"] == "claude-sonnet-4-6"

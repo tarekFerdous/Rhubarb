@@ -31,6 +31,15 @@ def _isolated_implement_queues(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_pty_engines(monkeypatch):
+    """Same story again, but for the resident PtyEngine-per-card_id registry
+    (issue #87) -- card_id values restart at 1 in every test's fresh tmp db
+    too, so a leftover (fake) engine from one test must never be handed to
+    an unrelated test's identically-numbered card_id."""
+    monkeypatch.setattr(session_runner, "_pty_engines", {})
+
+
+@pytest.fixture(autouse=True)
 def _isolated_afk_loop(monkeypatch):
     """Same story again, but for the AFK loop's per-project idle clock and
     its per-project undismissed-notification queue."""

@@ -8,6 +8,7 @@ import pytest
 from baton import db, live_stream, session_runner
 from baton.cli_client import ClaudeCLIError
 from baton.github_publisher import GithubPublishError
+from baton.pty_engine import PtyEngineUnrecoverableError
 
 
 def _init_repo(path, remote_url):
@@ -41,6 +42,100 @@ def _result_event(text, session_id="s1", usage=None, model_usage=None):
     return event
 
 
+async def _run_and_drain(coro):
+    """Await `coro`, then let any `asyncio.create_task(...)` it scheduled
+    (e.g. `start_or_queue_implement`'s fire-and-forget implement job) run to
+    completion too, before returning -- a resident `PtyEngine` tab's work no
+    longer necessarily happens on a background OS thread the way the old
+    subprocess-per-turn model's blocking I/O did, so a test asserting on a
+    scheduled job's *end state* (pooled, implemented, etc.) drains it
+    explicitly instead of relying on incidental event-loop-shutdown timing."""
+    result = await coro
+    pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    if pending:
+        await asyncio.gather(*pending)
+    return result
+
+
+def _make_fake_engine_class(handler, *, fresh_ids=None):
+    """Build a fake stand-in for the `PtyEngine` class, for monkeypatching
+    `session_runner.PtyEngine` in these tests -- see `tests/test_pty_engine.py`
+    for the equivalent fake-backend style one level down (the real PTY
+    backend, rather than the engine built on top of it).
+
+    `handler(prompt, *, session_id, cwd, model, effort)` returns an iterable
+    of raw event dicts -- the same shape the old `stream_prompt` fakes
+    already produced, minus `card_id` (that concept is gone: every phase
+    now drives its turns through the same one-resident-tab-per-card_id
+    mechanism, not just the /do chain).
+
+    Since `session_runner` now keeps ONE engine alive across every turn for
+    a card (see `session_runner._get_or_create_engine`), a fake engine
+    forwards every turn over its own lifetime to this SAME `handler` --
+    tests that used to swap `stream_prompt` mid-test to change behavior
+    between calls instead give `handler` one prompt-keyed dispatcher
+    covering the whole scenario (a resident engine wouldn't see a mock
+    swapped out from under it either).
+
+    `fresh_ids`, if given, is a queue of ids handed out (in order) to
+    successive *fresh* (no `resume_session_id`) constructions -- standing
+    in for what a genuinely fresh `PtyEngine`'s own generated uuid would be,
+    so a test can pin down the exact id a "clear"/"pool" produces, the way
+    tests used to control `cli_client.clear_session`'s return value
+    directly.
+    """
+    fresh_queue = list(fresh_ids or [])
+
+    class FakeEngine:
+        instances: list["FakeEngine"] = []
+
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, pty_factory=None):
+            self.cwd = cwd
+            self.model = model
+            self.effort = effort
+            self.resume_session_id = resume_session_id
+            if resume_session_id is not None:
+                self.claude_session_id = resume_session_id
+            elif fresh_queue:
+                self.claude_session_id = fresh_queue.pop(0)
+            else:
+                self.claude_session_id = f"generated-{len(FakeEngine.instances) + 1}"
+            self.started = False
+            self.closed = False
+            FakeEngine.instances.append(self)
+
+        def start(self):
+            self.started = True
+            return self
+
+        def close(self):
+            self.closed = True
+
+        async def stream_turn(self, prompt):
+            yield {"type": "system", "subtype": "init", "session_id": self.claude_session_id}
+            # `session_id` here mirrors the old `stream_prompt(prompt,
+            # session_id=...)` kwarg tests already keyed off of: the
+            # conversation being *resumed*, or None for a fresh one -- not
+            # this engine's own assigned `claude_session_id` (which is
+            # always some non-None value, fresh uuid included).
+            for raw in handler(
+                prompt, session_id=self.resume_session_id, cwd=self.cwd, model=self.model, effort=self.effort
+            ):
+                yield raw
+
+    return FakeEngine
+
+
+def _mock_engine(monkeypatch, handler, *, fresh_ids=None):
+    """Monkeypatch `session_runner.PtyEngine` with a fake driven by
+    `handler` -- see `_make_fake_engine_class`. Returns the fake class so a
+    test can inspect `.instances` (e.g. to assert an engine was/wasn't
+    reconstructed, or to check constructor args)."""
+    fake_class = _make_fake_engine_class(handler, fresh_ids=fresh_ids)
+    monkeypatch.setattr(session_runner, "PtyEngine", fake_class)
+    return fake_class
+
+
 def test_start_session_job_publishes_usage_from_a_rate_limit_event(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
@@ -54,9 +149,8 @@ def test_start_session_job_publishes_usage_from_a_rate_limit_event(client, tmp_p
             }
         },
     }
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
+    _mock_engine(
+        monkeypatch,
         lambda prompt, **kw: iter([rate_limit_event, _result_event("❓ **Q1** - **Scope**: Only question?")]),
     )
 
@@ -69,6 +163,64 @@ def test_start_session_job_publishes_usage_from_a_rate_limit_event(client, tmp_p
     assert live_stream.last_usage() == {"type": "usage", "five_hour_pct": 12.5, "seven_day_pct": 3.1}
 
 
+def test_start_session_job_publishes_terminal_output_events_from_the_pty(client, tmp_path, monkeypatch):
+    """Issue #88: a `terminal_output` raw event yielded by (a faked)
+    `PtyEngine.stream_turn` must reach the session's live-stream buffer
+    verbatim -- this is what the SSE endpoint hands the frontend's terminal
+    view."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    raw_chunk = "\x1b[2K\rWorking on it...\r\n"
+    _mock_engine(
+        monkeypatch,
+        lambda prompt, **kw: iter(
+            [
+                {"type": "terminal_output", "data": raw_chunk},
+                _result_event("❓ **Q1** - **Scope**: Only question?"),
+            ]
+        ),
+    )
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    events = live_stream._buffers.get(row_id, [])
+    assert {"type": "terminal_output", "data": raw_chunk} in events
+
+
+def test_open_pty_tab_count_tracks_tabs_as_sessions_open_and_close(client, tmp_path, monkeypatch):
+    """Backs the web UI's tab-count indicator (issue #88):
+    `session_runner.open_pty_tab_count()` must accurately reflect how many
+    `PtyEngine` tabs are currently resident as sessions start (opening a
+    tab, one per card_id) and close (dropping it)."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    assert session_runner.open_pty_tab_count() == 0
+
+    _mock_engine(
+        monkeypatch,
+        lambda prompt, **kw: iter([_result_event(f"❓ **Q1** - **Scope**: {prompt}?", session_id=prompt)]),
+    )
+
+    conn = db.get_connection()
+    row_a = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_a, "feature A", cwd=cwd))
+    assert session_runner.open_pty_tab_count() == 1
+
+    row_b = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_b, "feature B", cwd=cwd))
+    assert session_runner.open_pty_tab_count() == 2
+
+    session_runner._close_engine(row_a)
+    assert session_runner.open_pty_tab_count() == 1
+
+    session_runner._close_engine(row_b)
+    assert session_runner.open_pty_tab_count() == 0
+
+
 def test_two_sessions_advance_concurrently_without_cross_contamination(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
@@ -77,14 +229,14 @@ def test_two_sessions_advance_concurrently_without_cross_contamination(client, t
     row_a = db.create_session(conn, project_id)
     row_b = db.create_session(conn, project_id)
 
-    def fake_stream_prompt(prompt, **kw):
+    def handler(prompt, **kw):
         if prompt == "/baton:do feature A":
             return iter([_result_event("❓ **Q1** - **Scope**: Question A?", session_id="sA")])
         if prompt == "/baton:do feature B":
             return iter([_result_event("❓ **Q1** - **Scope**: Question B?", session_id="sB")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+    _mock_engine(monkeypatch, handler)
 
     async def run_both():
         await asyncio.gather(
@@ -120,9 +272,8 @@ def test_no_cap_on_the_number_of_sessions_running_at_once(client, tmp_path, monk
     conn = db.get_connection()
     row_ids = [db.create_session(conn, project_id) for _ in range(8)]
 
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
+    _mock_engine(
+        monkeypatch,
         lambda prompt, **kw: iter([_result_event(f"❓ **Q1** - **Scope**: {prompt}?", session_id=prompt)]),
     )
 
@@ -144,9 +295,8 @@ def test_start_session_job_returns_card_with_grilling_questions(client, tmp_path
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
+    _mock_engine(
+        monkeypatch,
         lambda prompt, **kw: iter(
             [
                 _result_event(
@@ -183,9 +333,8 @@ def test_start_session_job_publishes_interview_even_with_no_structured_questions
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
+    _mock_engine(
+        monkeypatch,
         lambda prompt, **kw: iter([_result_event("Sure, tell me more about what you have in mind.")]),
     )
 
@@ -207,22 +356,18 @@ def test_continue_session_job_with_remaining_questions_does_not_auto_advance(cli
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
-        lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: First question?")]),
-    )
+    def handler(prompt, **kw):
+        if prompt in ("/baton:to-prd", "/baton:to-issues"):
+            raise AssertionError(f"chain must not run without confirm_advance, got {prompt!r}")
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: First question?")])
+        return iter([_result_event("❓ **Q1** - **Scope**: A follow-up question?")])
+
+    _mock_engine(monkeypatch, handler)
+
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    def fake_stream_prompt(prompt, **kw):
-        if prompt in ("/baton:to-prd", "/baton:to-issues"):
-            raise AssertionError(f"chain must not run without confirm_advance, got {prompt!r}")
-        return iter([_result_event("❓ **Q1** - **Scope**: A follow-up question?")])
-
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-
     asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
 
     row = db.get_session(conn, row_id)
@@ -242,22 +387,18 @@ def test_continue_session_job_with_no_more_questions_does_not_auto_advance(clien
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
-        lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: First question?")]),
-    )
+    def handler(prompt, **kw):
+        if prompt in ("/baton:to-prd", "/baton:to-issues"):
+            raise AssertionError(f"chain must not run without confirm_advance, got {prompt!r}")
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: First question?")])
+        return iter([_result_event("Thanks, that's everything I need.")])
+
+    _mock_engine(monkeypatch, handler)
+
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    def fake_stream_prompt(prompt, **kw):
-        if prompt in ("/baton:to-prd", "/baton:to-issues"):
-            raise AssertionError(f"chain must not run without confirm_advance, got {prompt!r}")
-        return iter([_result_event("Thanks, that's everything I need.")])
-
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-
     asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
 
     row = db.get_session(conn, row_id)
@@ -279,23 +420,16 @@ def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, 
     must go straight to /baton:to-prd -> /baton:to-issues -> details, resuming the
     session's existing claude_session_id, WITHOUT sending another grilling
     CLI turn first. Since #75, `details` auto-continues straight into
-    /baton:implement -- this test's fake handles that turn too and asserts
+    /baton:implement -- this test's handler covers that turn too and asserts
     the chain lands on `implemented`, not `details`."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
-        lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")]),
-    )
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
     seen_prompts = []
 
-    def fake_stream_prompt(prompt, **kw):
+    def handler(prompt, **kw):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         seen_prompts.append(prompt)
         if prompt == "/baton:to-prd":
             return iter([_result_event("Wrote PRD draft.")])
@@ -305,8 +439,11 @@ def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, 
             return iter([_result_event("Implemented.")])
         raise AssertionError(f"unexpected grilling-style prompt {prompt!r} during confirm_advance")
 
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "s2")
+    _mock_engine(monkeypatch, handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
     monkeypatch.setattr(
         session_runner, "publish_draft", lambda draft_path, cwd: "PRD #5: My PRD\nIssue #6: Child one"
     )
@@ -340,11 +477,11 @@ def test_start_session_job_passes_the_configured_model_to_the_cli(client, tmp_pa
 
     seen_models = []
 
-    def recording_stream_prompt(prompt, *, session_id=None, cwd=None, model=None, effort=None, card_id=None):
+    def handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
         seen_models.append(model)
         return iter([_result_event("- Only question?")])
 
-    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream_prompt)
+    _mock_engine(monkeypatch, handler)
 
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
@@ -363,14 +500,13 @@ def test_start_implement_job_passes_the_model_the_session_was_launched_with(clie
 
     seen_models = []
 
-    def recording_stream_prompt(prompt, *, session_id=None, cwd=None, model=None, effort=None, card_id=None):
+    def handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
         seen_models.append(model)
         return iter([_result_event("Implemented PRD #5", session_id="impl1")])
 
-    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None: "pooled-1")
+    _mock_engine(monkeypatch, handler, fresh_ids=["pooled-1"])
 
-    started = asyncio.run(session_runner.start_or_queue_implement(project_id, 5, "My PRD", cwd))
+    started = asyncio.run(_run_and_drain(session_runner.start_or_queue_implement(project_id, 5, "My PRD", cwd)))
     card_id = started["card_id"]
 
     assert seen_models == ["claude-opus-4-8"]
@@ -387,15 +523,11 @@ def test_chain_steps_use_the_model_the_session_was_created_with(client, tmp_path
     conn = db.get_connection()
     db.set_model(conn, "claude-opus-4-8")
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- Only question?")])
-    )
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
     seen_models = []
 
-    def recording_stream_prompt(prompt, *, session_id=None, cwd=None, model=None, effort=None, card_id=None):
+    def handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("- Only question?")])
         seen_models.append((prompt, model))
         if prompt == "/baton:to-prd":
             return iter([_result_event("PRD #5: My PRD")])
@@ -403,8 +535,9 @@ def test_chain_steps_use_the_model_the_session_was_created_with(client, tmp_path
             return iter([_result_event("Issue #6: Child one")])
         return iter([_result_event("Thanks, that's everything I need.")])
 
-    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "s2")
+    _mock_engine(monkeypatch, handler)
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
@@ -425,23 +558,20 @@ def test_in_flight_session_keeps_its_original_model_after_setting_changes_mid_se
     conn = db.get_connection()
     db.set_model(conn, "claude-opus-4-8")
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("- First question?")])
-    )
+    seen_models = []
+
+    def handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("- First question?")])
+        seen_models.append(model)
+        return iter([_result_event("Thanks, that's everything I need.")])
+
+    _mock_engine(monkeypatch, handler)
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     # Setting changes mid-session -- this row must not pick it up.
     db.set_model(conn, "claude-sonnet-4-6")
-
-    seen_models = []
-
-    def recording_stream_prompt(prompt, *, session_id=None, cwd=None, model=None, effort=None, card_id=None):
-        seen_models.append(model)
-        return iter([_result_event("Thanks, that's everything I need.")])
-
-    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "s2")
 
     asyncio.run(session_runner.continue_session_job(row_id, "a reply", cwd=cwd))
 
@@ -450,9 +580,8 @@ def test_in_flight_session_keeps_its_original_model_after_setting_changes_mid_se
     # A brand-new session started after the change picks up the new setting.
     new_row_id = db.create_session(conn, project_id)
     seen_models.clear()
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
+    _mock_engine(
+        monkeypatch,
         lambda prompt, **kw: (seen_models.append(kw.get("model")), iter([_result_event("- Q?")]))[1],
     )
     asyncio.run(session_runner.start_session_job(new_row_id, "another feature", cwd=cwd))
@@ -463,14 +592,9 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: First question?")])
-    )
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    def fake_stream_prompt(prompt, **kw):
+    def handler(prompt, **kw):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: First question?")])
         if prompt == "/baton:to-prd":
             return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/baton:to-issues":
@@ -478,8 +602,11 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
         # the grilling reply itself: no more bullet/heading questions -> grilling is done
         return iter([_result_event("Thanks, that's everything I need.")])
 
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "s2")
+    _mock_engine(monkeypatch, handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
     monkeypatch.setattr(
         session_runner,
         "publish_draft",
@@ -505,7 +632,6 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
         {"number": 6, "title": "Child one"},
         {"number": 7, "title": "Child two"},
     ]
-    assert row["claude_session_id"] == "s2"
     assert row["available_for_reuse"] == 1
 
     events = live_stream._buffers.get(row_id, [])
@@ -518,21 +644,15 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
 def test_confirm_advance_runs_publishing_phase_with_no_extra_cli_calls(client, tmp_path, monkeypatch):
     """Issue #58: the chain must sequence phase:creating_prd -> phase:creating_issues
     -> phase:publishing -> turn(details) -> done, and github_publisher.publish_draft
-    (not a Claude CLI turn) must be what actually creates the GitHub issues --
-    stream_prompt is only ever invoked for /baton:to-prd and /baton:to-issues."""
+    (not a Claude CLI turn) must be what actually creates the GitHub issues."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-    )
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
     seen_prompts = []
 
-    def fake_stream_prompt(prompt, **kw):
+    def handler(prompt, **kw):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         seen_prompts.append(prompt)
         if prompt == "/baton:to-prd":
             return iter([_result_event("Wrote PRD draft.")])
@@ -542,8 +662,10 @@ def test_confirm_advance_runs_publishing_phase_with_no_extra_cli_calls(client, t
             return iter([_result_event("Implemented.")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "s2")
+    _mock_engine(monkeypatch, handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     seen_publish_calls = []
 
@@ -585,21 +707,19 @@ def test_publish_draft_failure_stops_chain_with_error_turn(client, tmp_path, mon
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-    )
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    def fake_stream_prompt(prompt, **kw):
+    def handler(prompt, **kw):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/baton:to-prd":
             return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/baton:to-issues":
             return iter([_result_event("Wrote issues draft.")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
+    _mock_engine(monkeypatch, handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     def failing_publish_draft(draft_path, cwd):
         raise GithubPublishError("gh: not logged in, run `gh auth login`")
@@ -630,16 +750,15 @@ def test_retry_on_publishing_phase_reruns_publisher_and_completes(client, tmp_pa
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-    )
+    def handler(prompt, **kw):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
+        return iter([_result_event("draft written")])
+
+    _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("draft written")])
-    )
 
     def failing_publish_draft(draft_path, cwd):
         raise GithubPublishError("gh rate limited")
@@ -654,7 +773,6 @@ def test_retry_on_publishing_phase_reruns_publisher_and_completes(client, tmp_pa
     monkeypatch.setattr(
         session_runner, "publish_draft", lambda draft_path, cwd: "PRD #9: Retried PRD\nIssue #10: Only child"
     )
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "s2")
 
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
 
@@ -689,10 +807,10 @@ def test_grilling_claude_cli_error_never_sets_needs_github_login(client, tmp_pat
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    def failing_stream_prompt(prompt, **kw):
+    def failing(prompt, **kw):
         raise ClaudeCLIError("gh: not logged in, run `gh auth login`")
 
-    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
+    _mock_engine(monkeypatch, failing)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -714,19 +832,17 @@ def test_to_prd_claude_cli_error_never_sets_needs_github_login(client, tmp_path,
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-    )
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    def failing_stream_prompt(prompt, **kw):
+    def handler(prompt, **kw):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/baton:to-prd":
             raise ClaudeCLIError("gh: not logged in, run `gh auth login`")
         return iter([_result_event("Thanks, that's everything I need.")])
 
-    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
+    _mock_engine(monkeypatch, handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
@@ -745,30 +861,26 @@ def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypa
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-    )
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+    attempt = {"n": 0}
 
-    def failing_stream_prompt(prompt, **kw):
+    def handler(prompt, **kw):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/baton:to-prd":
-            raise ClaudeCLIError("not logged in")
-        return iter([_result_event("done")])
-
-    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
-
-    def fake_stream_prompt(prompt, **kw):
-        if prompt == "/baton:to-prd":
+            attempt["n"] += 1
+            if attempt["n"] == 1:
+                raise ClaudeCLIError("not logged in")
             return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/baton:to-issues":
             return iter([_result_event("Wrote issues draft.")])
         return iter([_result_event("done")])
 
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "s2")
+    _mock_engine(monkeypatch, handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
     monkeypatch.setattr(
         session_runner, "publish_draft", lambda draft_path, cwd: "PRD #9: Retried PRD\nIssue #10: Only child"
     )
@@ -800,12 +912,11 @@ def test_retry_on_errored_implement_session_creates_a_new_row_and_completes(clie
     )
     db.update_session(conn, row_id, error_text="agent crashed mid-turn")
 
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
+    _mock_engine(
+        monkeypatch,
         lambda prompt, **kw: iter([_result_event("Implemented PRD #12", session_id="impl-retry")]),
+        fresh_ids=["pooled-retry"],
     )
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None: "pooled-retry")
 
     response = client.post(f"/api/sessions/{row_id}/retry")
     assert response.status_code == 200
@@ -873,30 +984,26 @@ def test_retry_on_creating_prd_phase_is_unaffected_by_implement_branch(client, t
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-    )
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+    attempt = {"n": 0}
 
-    def failing_stream_prompt(prompt, **kw):
+    def handler(prompt, **kw):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/baton:to-prd":
-            raise ClaudeCLIError("not logged in")
-        return iter([_result_event("done")])
-
-    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
-
-    def fake_stream_prompt(prompt, **kw):
-        if prompt == "/baton:to-prd":
+            attempt["n"] += 1
+            if attempt["n"] == 1:
+                raise ClaudeCLIError("not logged in")
             return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/baton:to-issues":
             return iter([_result_event("Wrote issues draft.")])
         return iter([_result_event("done")])
 
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "s2")
+    _mock_engine(monkeypatch, handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
     monkeypatch.setattr(
         session_runner, "publish_draft", lambda draft_path, cwd: "PRD #30: Regression PRD\nIssue #31: Only child"
     )
@@ -916,12 +1023,14 @@ def test_start_implement_job_reaches_implemented_and_pools_falling_back_to_seede
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
+    _mock_engine(
+        monkeypatch,
         lambda prompt, **kw: iter([_result_event("Implemented PRD #5", session_id="impl1")]),
+        # Slot 0 is consumed by the turn's own engine (the row starts with no
+        # claude_session_id, so that construction is "fresh" too); slot 1 is
+        # the fresh engine minted when pooling.
+        fresh_ids=["turn-engine", "pooled-1"],
     )
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None: "pooled-1")
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -960,10 +1069,9 @@ def test_start_implement_job_populates_details_from_tracker_file_when_present(cl
     claude_dir.mkdir(parents=True, exist_ok=True)
     (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("done", session_id="impl2")])
+    _mock_engine(
+        monkeypatch, lambda prompt, **kw: iter([_result_event("done", session_id="impl2")]), fresh_ids=["pooled-2"]
     )
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None: "pooled-2")
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -988,10 +1096,10 @@ def test_start_implement_job_error_leaves_session_in_implementing_with_error_tex
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    def failing_stream_prompt(prompt, **kw):
+    def failing(prompt, **kw):
         raise ClaudeCLIError("gh: not logged in, run `gh auth login`")
 
-    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
+    _mock_engine(monkeypatch, failing)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -1020,10 +1128,10 @@ def test_start_implement_job_non_gh_error_does_not_set_needs_github_login(client
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    def failing_stream_prompt(prompt, **kw):
+    def failing(prompt, **kw):
         raise ClaudeCLIError("Claude CLI exited with code 1: permission denied")
 
-    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
+    _mock_engine(monkeypatch, failing)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -1053,14 +1161,14 @@ def test_start_implement_job_wraps_unexpected_worker_exceptions_as_session_error
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    def crashing_stream_prompt(prompt, **kw):
+    def crashing(prompt, **kw):
         def gen():
             raise ValueError("boom")
             yield  # pragma: no cover
 
         return gen()
 
-    monkeypatch.setattr(session_runner, "stream_prompt", crashing_stream_prompt)
+    _mock_engine(monkeypatch, crashing)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -1108,6 +1216,31 @@ def test_parallel_mode_starts_multiple_prds_immediately_without_queueing(client,
     assert session_runner._implement_queues.get(project_id, []) == []
 
 
+def test_parallel_mode_gives_each_prd_its_own_independent_engine(client, tmp_path, monkeypatch):
+    """With parallel_implementation on, two concurrently-running PRDs must
+    each get their own resident PtyEngine tab -- not share one."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_parallel_implementation(conn, True)
+
+    fake_class = _mock_engine(
+        monkeypatch,
+        lambda prompt, **kw: iter([_result_event("Implemented.", session_id="whichever")]),
+        fresh_ids=["pooled-a", "pooled-b"],
+    )
+
+    first = asyncio.run(_run_and_drain(session_runner.start_or_queue_implement(project_id, 5, "PRD Five", cwd)))
+    second = asyncio.run(_run_and_drain(session_runner.start_or_queue_implement(project_id, 6, "PRD Six", cwd)))
+
+    assert first["card_id"] != second["card_id"]
+    # Two independent tabs were constructed for the two turns (plus the two
+    # pooling-time fresh engines) -- never one shared instance.
+    assert len(fake_class.instances) >= 2
+    assert session_runner._pty_engines == {}
+
+
 def test_serial_mode_queues_second_prd_and_drains_it_when_first_finishes(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
@@ -1115,49 +1248,39 @@ def test_serial_mode_queues_second_prd_and_drains_it_when_first_finishes(client,
     conn = db.get_connection()
     db.set_parallel_implementation(conn, False)
 
-    # First PRD starts immediately (nothing else is running yet).
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("Implemented PRD #5", session_id="impl-a")])
-    )
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None: "pooled-a")
+    def handler(prompt, **kw):
+        if prompt == "/baton:implement prd: 6":
+            return iter([_result_event("Implemented PRD #6", session_id="impl-b")])
+        return iter([_result_event("Implemented PRD #5", session_id="impl-a")])
 
-    started = asyncio.run(session_runner.start_or_queue_implement(project_id, 5, "PRD Five", cwd))
-    row_a = started["card_id"]
-    assert row_a is not None
+    _mock_engine(monkeypatch, handler, fresh_ids=["pooled-a", "pooled-b"])
 
-    # A's session row is still "implementing" (its background job hasn't run
-    # yet -- it was only scheduled via asyncio.create_task).
-    assert db.get_session(conn, row_a)["phase"] == "implementing"
+    async def start_both():
+        # Both calls run inside one `asyncio.run` with no `await` in between
+        # that would let A's fire-and-forget `asyncio.create_task` job make
+        # any progress -- neither `start_or_queue_implement` call itself
+        # awaits anything (every DB call it makes is synchronous), so A's
+        # session row is still exactly as `_launch_implement` left it
+        # ("implementing", job merely scheduled) by the time B's queueing
+        # check runs, deterministically -- not by timing coincidence.
+        started = await session_runner.start_or_queue_implement(project_id, 5, "PRD Five", cwd)
+        row_a = started["card_id"]
+        assert row_a is not None
+        assert db.get_session(conn, row_a)["phase"] == "implementing"
 
-    # Second PRD, while A is live, must queue instead of starting.
-    queued = asyncio.run(session_runner.start_or_queue_implement(project_id, 6, "PRD Six", cwd))
-    assert queued == {"queued": True}
+        queued = await session_runner.start_or_queue_implement(project_id, 6, "PRD Six", cwd)
+        assert queued == {"queued": True}
+        return row_a
+
+    row_a = asyncio.run(start_both())
 
     sessions_before_drain = db.list_sessions_for_project(conn, project_id)
     implement_sessions_before = [s for s in sessions_before_drain if s["session_type"] == "implement"]
     assert len(implement_sessions_before) == 1
 
-    # Now run A's job for real (as its scheduled asyncio.create_task would),
-    # and let any follow-on drain task it schedules run to completion too.
-    def fake_stream_prompt(prompt, **kw):
-        if prompt == "/baton:implement prd: 6":
-            return iter([_result_event("Implemented PRD #6", session_id="impl-b")])
-        return iter([_result_event("Implemented PRD #5", session_id="impl-a")])
-
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None: f"pooled-{session_id}")
-
-    async def run_a_and_drain():
-        await session_runner.start_implement_job(row_a, 5, cwd=cwd)
-        # start_implement_job's own completion schedules the queue drain's
-        # follow-on job via asyncio.create_task -- let it run to completion
-        # before asserting on it, matching how this module fires background
-        # work across a job boundary.
-        pending = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
-        if pending:
-            await asyncio.gather(*pending)
-
-    asyncio.run(run_a_and_drain())
+    # Now run A's job for real, and let any follow-on drain task it
+    # schedules run to completion too.
+    asyncio.run(_run_and_drain(session_runner.start_implement_job(row_a, 5, cwd=cwd)))
 
     assert session_runner._implement_queues.get(project_id, []) == []
 
@@ -1174,22 +1297,18 @@ def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch)
     project_a = _open_project(client, tmp_path, "proj_a")
     cwd_a = _cwd_for(project_a)
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-    )
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_a)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd_a))
-
-    def fake_stream_prompt(prompt, **kw):
+    def handler(prompt, **kw):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt in ("/baton:to-prd", "/baton:to-issues"):
             return iter([_result_event("wrote draft")])
         return iter([_result_event("done")])
 
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(
-        session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "pooled-session"
-    )
+    _mock_engine(monkeypatch, handler, fresh_ids=["turn-engine", "pooled-session"])
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_a)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd_a))
+
     monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd: "PRD #1: p\nIssue #2: i")
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd_a, confirm_advance=True))
 
@@ -1199,11 +1318,11 @@ def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch)
 
     seen_session_ids = []
 
-    def recording_stream_prompt(prompt, *, session_id=None, cwd=None, model=None, effort=None, card_id=None):
+    def recording_handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
         seen_session_ids.append(session_id)
         return iter([_result_event("❓ **Q1** - **Scope**: Another question?", session_id="new")])
 
-    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream_prompt)
+    _mock_engine(monkeypatch, recording_handler)
 
     # Same project: should resume the pooled session.
     reused = db.claim_available_session(conn, project_a)
@@ -1269,15 +1388,11 @@ def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(c
         "qa_changes": [],
         "status": "implemented",
     }
-    from pathlib import Path
     claude_dir = Path(cwd) / ".claude"
     claude_dir.mkdir(parents=True, exist_ok=True)
     (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt",
-        lambda prompt, **kw: iter([_result_event(_QA_BLOCK, session_id="qa-session-id")])
-    )
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(_QA_BLOCK, session_id="qa-session-id")]))
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -1309,19 +1424,21 @@ def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(c
     assert qa_started_events[0]["qa_card_id"] == qa_row["id"]
     assert impl_events[-1] == {"type": "done"}
 
+    # The implement card's own tab is closed -- the new QA row starts fresh.
+    assert row_id not in session_runner._pty_engines
+
 
 def test_start_implement_job_pools_session_normally_when_no_qa_block(client, tmp_path, monkeypatch):
     """When the implement result has no qa_grilling block the session must be
-    pooled as before (no QA session created, clear_session called)."""
+    pooled as before (no QA session created)."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt",
-        lambda prompt, **kw: iter([_result_event("Implemented PRD #5", session_id="impl1")])
+    _mock_engine(
+        monkeypatch,
+        lambda prompt, **kw: iter([_result_event("Implemented PRD #5", session_id="impl1")]),
+        fresh_ids=["turn-engine", "pooled-1"],
     )
-    clear_calls = []
-    monkeypatch.setattr(session_runner, "clear_session", lambda sid, cwd=None, model=None, effort=None: (clear_calls.append(sid), "pooled-1")[1])
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -1333,11 +1450,14 @@ def test_start_implement_job_pools_session_normally_when_no_qa_block(client, tmp
 
     row = db.get_session(conn, row_id)
     assert row["available_for_reuse"] == 1
-    assert clear_calls == ["impl1"]
+    assert row["claude_session_id"] == "pooled-1"
 
     sessions = db.list_sessions_for_project(conn, project_id)
     qa_sessions = [s for s in sessions if s["session_type"] == "qa"]
     assert len(qa_sessions) == 0
+
+    # Pooling closed this card's tab.
+    assert row_id not in session_runner._pty_engines
 
 
 def test_start_qa_job_publishes_qa_grilling_turn_without_done(client, tmp_path, monkeypatch):
@@ -1378,11 +1498,11 @@ def test_continue_qa_job_runs_phase3_and_fires_done(client, tmp_path, monkeypatc
 
     seen_prompts = []
 
-    def recording_stream(prompt, **kw):
+    def recording(prompt, **kw):
         seen_prompts.append(prompt)
         return iter([_result_event("Closed all issues.", session_id="qa-done")])
 
-    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream)
+    _mock_engine(monkeypatch, recording)
 
     conn = db.get_connection()
     qa_row_id = db.create_session(
@@ -1404,15 +1524,28 @@ def test_continue_qa_job_runs_phase3_and_fires_done(client, tmp_path, monkeypatc
     events = live_stream._buffers.get(qa_row_id, [])
     assert {"type": "phase", "phase": "qa_closing"} in events
     assert events[-1] == {"type": "done"}
+    # This card's tab is done either way (recycled or not).
+    assert qa_row_id not in session_runner._pty_engines
+
+
+def _usage_event(input_tokens, cache_creation, cache_read, context_window, model="claude-sonnet-4-6"):
+    return _result_event(
+        "done",
+        usage={
+            "input_tokens": input_tokens,
+            "cache_creation_input_tokens": cache_creation,
+            "cache_read_input_tokens": cache_read,
+        },
+        model_usage={model: {"contextWindow": context_window}},
+    )
 
 
 def test_continue_qa_job_recycles_a_low_usage_finished_session(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
+    _mock_engine(
+        monkeypatch,
         lambda prompt, **kw: iter(
             [_usage_event(input_tokens=0, cache_creation=0, cache_read=300, context_window=1000, model="claude-sonnet-4-6")]
         ),
@@ -1441,9 +1574,8 @@ def test_continue_qa_job_does_not_recycle_a_high_usage_finished_session(client, 
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
+    _mock_engine(
+        monkeypatch,
         lambda prompt, **kw: iter(
             [_usage_event(input_tokens=0, cache_creation=0, cache_read=800, context_window=1000, model="claude-sonnet-4-6")]
         ),
@@ -1517,10 +1649,8 @@ def test_start_implement_job_suspends_as_blocked_when_result_contains_blocked_ma
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
-        lambda prompt, **kw: iter([_result_event(_IMPLEMENT_BLOCKED_BLOCK, session_id="impl-blocked")]),
+    _mock_engine(
+        monkeypatch, lambda prompt, **kw: iter([_result_event(_IMPLEMENT_BLOCKED_BLOCK, session_id="impl-blocked")])
     )
 
     conn = db.get_connection()
@@ -1542,6 +1672,9 @@ def test_start_implement_job_suspends_as_blocked_when_result_contains_blocked_ma
     # Suspended, not finished -- no `done` yet, same shape as qa_grilling awaiting Perfect.
     assert {"type": "done"} not in events
 
+    # Suspended, not finished -- the tab stays open for continue_implement_job.
+    assert row_id in session_runner._pty_engines
+
 
 def test_continue_implement_job_resolves_a_blocked_session(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
@@ -1557,12 +1690,11 @@ def test_continue_implement_job_resolves_a_blocked_session(client, tmp_path, mon
 
     seen_prompts = []
 
-    def fake_stream_prompt(prompt, **kw):
+    def handler(prompt, **kw):
         seen_prompts.append(prompt)
         return iter([_result_event("Implemented, using GitHub OAuth as you said.", session_id="impl-done")])
 
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "pooled-1")
+    _mock_engine(monkeypatch, handler, fresh_ids=["pooled-1"])
 
     asyncio.run(session_runner.continue_implement_job(row_id, "Use GitHub OAuth", cwd=cwd))
 
@@ -1590,9 +1722,7 @@ def test_continue_implement_job_can_re_block_on_a_second_question(client, tmp_pa
     )
 
     second_block = _IMPLEMENT_BLOCKED_BLOCK.replace("auth provider", "callback URL")
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event(second_block, session_id="impl-blocked-2")])
-    )
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(second_block, session_id="impl-blocked-2")]))
 
     asyncio.run(session_runner.continue_implement_job(row_id, "GitHub OAuth", cwd=cwd))
 
@@ -1606,60 +1736,64 @@ def test_continue_implement_job_can_re_block_on_a_second_question(client, tmp_pa
 
 
 # ---------------------------------------------------------------------------
-# Persistent-process routing (issue #61): the /baton:do chain must pass card_id
-# through to stream_prompt so it lands on cli_client's persistent-process
-# path; /implement and /qa must not, keeping their one-shot-per-turn
-# behavior unchanged.
+# Resident-tab persistence (issue #87): one PtyEngine per card_id, kept
+# alive across every turn for that card, not recreated per turn.
 # ---------------------------------------------------------------------------
 
 
-def test_do_chain_turns_pass_card_id_for_persistent_routing(client, tmp_path, monkeypatch):
+def test_engine_is_constructed_once_and_reused_across_turns_in_the_same_phase(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    seen_card_ids = []
+    def handler(prompt, **kw):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: First question?")])
+        return iter([_result_event("❓ **Q1** - **Scope**: Follow-up?")])
 
-    def recording_stream_prompt(prompt, **kw):
-        seen_card_ids.append((prompt, kw.get("card_id")))
-        if prompt == "/baton:to-prd":
-            return iter([_result_event("Wrote PRD draft.")])
-        if prompt == "/baton:to-issues":
-            return iter([_result_event("Wrote issues draft.")])
-        if prompt == "/baton:implement prd: 1":
-            return iter([_result_event("Implemented.")])
-        return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-
-    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "s2")
-    monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd: "PRD #1: p\nIssue #2: i")
+    fake_class = _mock_engine(monkeypatch, handler)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+    asyncio.run(session_runner.continue_session_job(row_id, "tell me more", cwd=cwd))
+    asyncio.run(session_runner.continue_session_job(row_id, "and more", cwd=cwd))
 
-    assert seen_card_ids == [
-        ("/baton:do a feature", row_id),
-        ("/baton:to-prd", row_id),
-        ("/baton:to-issues", row_id),
-        # #75's auto-continued /baton:implement turn is one-shot, not
-        # persistent-process-routed -- no card_id, unlike the /do chain above.
-        ("/baton:implement prd: 1", None),
-    ]
+    # Exactly one PtyEngine was ever constructed for this card_id, reused
+    # across all three turns.
+    assert len(fake_class.instances) == 1
+    assert fake_class.instances[0].started is True
+    assert row_id in session_runner._pty_engines
+    assert session_runner._pty_engines[row_id] is fake_class.instances[0]
 
 
-def test_implement_and_qa_turns_do_not_pass_card_id(client, tmp_path, monkeypatch):
+def test_engine_reattaches_via_resume_when_continuing_an_existing_session_id(client, tmp_path, monkeypatch):
+    """A brand-new card_id whose row already carries a claude_session_id
+    (e.g. a reused pooled session) must construct its engine with
+    `resume_session_id=`, not a fresh one."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    seen_kwargs = []
+    fake_class = _mock_engine(
+        monkeypatch, lambda prompt, **kw: iter([_result_event("- Another question?", session_id="pooled-session")])
+    )
 
-    def recording_stream_prompt(prompt, **kw):
-        seen_kwargs.append(kw)
-        return iter([_result_event("Implemented PRD #5", session_id="impl1")])
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id, claude_session_id="pooled-session")
+    asyncio.run(session_runner.start_session_job(row_id, "another feature", cwd=cwd))
 
-    monkeypatch.setattr(session_runner, "stream_prompt", recording_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None: "pooled-1")
+    assert len(fake_class.instances) == 1
+    assert fake_class.instances[0].resume_session_id == "pooled-session"
+
+
+def test_implement_tab_closes_when_the_session_is_pooled(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    fake_class = _mock_engine(
+        monkeypatch,
+        lambda prompt, **kw: iter([_result_event("Implemented.", session_id="impl1")]),
+        fresh_ids=["pooled-1"],
+    )
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -1668,33 +1802,195 @@ def test_implement_and_qa_turns_do_not_pass_card_id(client, tmp_path, monkeypatc
     )
     asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
 
-    assert len(seen_kwargs) == 1
-    assert "card_id" not in seen_kwargs[0]
+    assert db.get_session(conn, row_id)["available_for_reuse"] == 1
+    assert row_id not in session_runner._pty_engines
+    # The turn's own engine, and the fresh one minted for pooling, were both closed.
+    assert all(instance.closed for instance in fake_class.instances)
 
+
+# ---------------------------------------------------------------------------
+# Crash routing (issue #87): PtyEngineUnrecoverableError -> the same
+# blocked-card flow a genuine implement_blocked marker already uses.
+# ---------------------------------------------------------------------------
+
+
+def test_implement_turn_crash_routes_into_the_blocked_flow(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def crashing(prompt, **kw):
+        raise PtyEngineUnrecoverableError("claude PTY process died twice in a row", claude_session_id="crashed-1")
+
+    _mock_engine(monkeypatch, crashing)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "blocked"
+    assert row["claude_session_id"] == "crashed-1"
+    blocked = json.loads(row["blocked_json"])
+    assert blocked["phase"] == "implement_blocked"
+    assert "died twice in a row" in blocked["context"]
+
+    events = live_stream._buffers.get(row_id, [])
+    assert any(e.get("type") == "turn" and e.get("phase") == "blocked" for e in events)
+    # Suspended, not finished -- no done, no error/needs_github_login path.
+    assert {"type": "done"} not in events
+    # The dead tab was dropped so a reply reattaches a fresh one via --resume.
+    assert row_id not in session_runner._pty_engines
+
+
+def test_implement_crash_recovers_via_the_same_reply_endpoint_as_a_real_block(client, tmp_path, monkeypatch):
+    """After a crash-induced block, continue_implement_job (the same
+    endpoint that resumes a genuine implement_blocked session) must resume
+    this session too, reattaching via --resume at the crash's session id."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def crashing(prompt, **kw):
+        raise PtyEngineUnrecoverableError("died twice", claude_session_id="crashed-1")
+
+    _mock_engine(monkeypatch, crashing)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+    assert db.get_session(conn, row_id)["phase"] == "blocked"
+
+    fake_class = _mock_engine(
+        monkeypatch,
+        lambda prompt, **kw: iter([_result_event("Recovered and implemented.", session_id="recovered-1")]),
+        fresh_ids=["pooled-1"],
+    )
+
+    asyncio.run(session_runner.continue_implement_job(row_id, "still there?", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "implemented"
+    assert row["blocked_json"] is None
+    # The reply's engine reattached via --resume at the crash's session id.
+    assert fake_class.instances[0].resume_session_id == "crashed-1"
+
+
+def test_grilling_turn_crash_routes_into_the_blocked_flow(client, tmp_path, monkeypatch):
+    """The crash-routing mechanism is generic, not implement-specific --
+    any phase's stream_turn call can raise PtyEngineUnrecoverableError."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def crashing(prompt, **kw):
+        raise PtyEngineUnrecoverableError("died twice", claude_session_id="crashed-grilling")
+
+    _mock_engine(monkeypatch, crashing)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "blocked"
+    assert row["claude_session_id"] == "crashed-grilling"
+    assert row_id not in session_runner._pty_engines
+
+
+def test_implement_error_in_background_raises_a_notification(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def failing(prompt, **kw):
+        raise ClaudeCLIError("boom")
+
+    _mock_engine(monkeypatch, failing)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    notifications = session_runner.get_error_notifications(project_id)
+    assert len(notifications) == 1
+    assert notifications[0]["card_id"] == row_id
+    assert notifications[0]["phase"] == "implementing"
+    assert "boom" in notifications[0]["message"]
+
+
+def test_qa_closing_error_in_background_raises_a_notification(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def failing(prompt, **kw):
+        raise ClaudeCLIError("qa boom")
+
+    _mock_engine(monkeypatch, failing)
+
+    conn = db.get_connection()
     qa_row_id = db.create_session(
         conn, project_id, session_type="qa", phase="qa_grilling",
         claude_session_id="qa-session-1", details={"prd": {"number": 7, "title": "Test PRD"}},
     )
-    monkeypatch.setattr(
-        session_runner, "stream_prompt",
-        lambda prompt, **kw: (seen_kwargs.append(kw), iter([_result_event("Closed all issues.", session_id="qa-done")]))[1],
+    asyncio.run(session_runner.continue_qa_job(qa_row_id, "notes", cwd=cwd))
+
+    notifications = session_runner.get_error_notifications(project_id)
+    assert len(notifications) == 1
+    assert notifications[0]["card_id"] == qa_row_id
+    assert notifications[0]["phase"] == "qa_closing"
+    assert "qa boom" in notifications[0]["message"]
+
+
+def test_qa_closing_gh_auth_error_sets_needs_github_login(client, tmp_path, monkeypatch):
+    """/qa's closing step calls `gh issue close`/`gh issue edit` directly, so
+    a genuine gh auth failure must still surface the GitHub login button."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def failing(prompt, **kw):
+        raise ClaudeCLIError("gh: not logged in, run `gh auth login`")
+
+    _mock_engine(monkeypatch, failing)
+
+    conn = db.get_connection()
+    qa_row_id = db.create_session(
+        conn, project_id, session_type="qa", phase="qa_grilling",
+        claude_session_id="qa-session-1", details={"prd": {"number": 7, "title": "Test PRD"}},
     )
-    asyncio.run(session_runner.continue_qa_job(qa_row_id, "Looks great", cwd=cwd))
+    asyncio.run(session_runner.continue_qa_job(qa_row_id, "notes", cwd=cwd))
 
-    assert len(seen_kwargs) == 2
-    assert "card_id" not in seen_kwargs[1]
+    row = db.get_session(conn, qa_row_id)
+    assert bool(row["needs_github_login"]) is True
+    assert "not logged in" in row["error_text"]
 
 
-def _usage_event(input_tokens, cache_creation, cache_read, context_window, model="claude-sonnet-4-6"):
-    return _result_event(
-        "done",
-        usage={
-            "input_tokens": input_tokens,
-            "cache_creation_input_tokens": cache_creation,
-            "cache_read_input_tokens": cache_read,
-        },
-        model_usage={model: {"contextWindow": context_window}},
+def test_qa_closing_non_gh_error_does_not_set_needs_github_login(client, tmp_path, monkeypatch):
+    """A ClaudeCLIError during qa closing that isn't actually a `gh` auth
+    failure must not trigger the GitHub login button."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def failing(prompt, **kw):
+        raise ClaudeCLIError("Claude CLI exited with code 1: authentication error")
+
+    _mock_engine(monkeypatch, failing)
+
+    conn = db.get_connection()
+    qa_row_id = db.create_session(
+        conn, project_id, session_type="qa", phase="qa_grilling",
+        claude_session_id="qa-session-1", details={"prd": {"number": 7, "title": "Test PRD"}},
     )
+    asyncio.run(session_runner.continue_qa_job(qa_row_id, "notes", cwd=cwd))
+
+    row = db.get_session(conn, qa_row_id)
+    assert bool(row["needs_github_login"]) is False
+    assert "authentication error" in row["error_text"]
 
 
 def test_context_window_pct_computes_documented_formula():
@@ -1715,9 +2011,8 @@ def test_start_session_job_persists_context_pct_from_the_turn(client, tmp_path, 
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner,
-        "stream_prompt",
+    _mock_engine(
+        monkeypatch,
         lambda prompt, **kw: iter(
             [_usage_event(input_tokens=0, cache_creation=0, cache_read=500, context_window=1000)]
         ),
@@ -1735,10 +2030,7 @@ def test_maybe_clear_for_next_phase_continues_same_session_at_or_under_cutoff(cl
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("clear_session must not be called under the cutoff")
-
-    monkeypatch.setattr(session_runner, "clear_session", fail_if_called)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id, claude_session_id="s1")
@@ -1750,16 +2042,15 @@ def test_maybe_clear_for_next_phase_continues_same_session_at_or_under_cutoff(cl
     )
     assert result == "s1"
     assert db.get_session(conn, row_id)["claude_session_id"] == "s1"
+    # No fresh engine was constructed -- under the cutoff, nothing clears.
+    assert fake_class.instances == []
 
 
 def test_maybe_clear_for_next_phase_treats_unknown_context_pct_as_safe(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    def fail_if_called(*args, **kwargs):
-        raise AssertionError("clear_session must not be called when context_pct is unknown")
-
-    monkeypatch.setattr(session_runner, "clear_session", fail_if_called)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id, claude_session_id="s1")
@@ -1770,15 +2061,14 @@ def test_maybe_clear_for_next_phase_treats_unknown_context_pct_as_safe(client, t
         session_runner._maybe_clear_for_next_phase(row_id, conn, row, cwd=cwd, cutoff=0.40)
     )
     assert result == "s1"
+    assert fake_class.instances == []
 
 
 def test_maybe_clear_for_next_phase_clears_when_over_cutoff(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "cleared-1"
-    )
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]), fresh_ids=["cleared-1"])
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id, claude_session_id="s1")
@@ -1794,6 +2084,12 @@ def test_maybe_clear_for_next_phase_clears_when_over_cutoff(client, tmp_path, mo
     assert updated["claude_session_id"] == "cleared-1"
     assert updated["context_pct"] is None
 
+    # A genuinely fresh engine was constructed (no resume_session_id), and
+    # it's now this card's resident tab going forward.
+    assert len(fake_class.instances) == 1
+    assert fake_class.instances[0].resume_session_id is None
+    assert session_runner._pty_engines[row_id] is fake_class.instances[0]
+
 
 def test_finish_chain_publishes_minimize_before_the_implementing_phase(client, tmp_path, monkeypatch):
     """The frontend frees the left card for a new /do on `minimize` -- it
@@ -1802,22 +2098,20 @@ def test_finish_chain_publishes_minimize_before_the_implementing_phase(client, t
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-    )
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    def fake_stream_prompt(prompt, **kw):
+    def handler(prompt, **kw):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/baton:to-prd":
             return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/baton:to-issues":
             return iter([_result_event("Wrote issues draft.")])
         return iter([_result_event("Implemented.")])
 
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "s2")
+    _mock_engine(monkeypatch, handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
     monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd: "PRD #1: p\nIssue #2: i")
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
@@ -1841,22 +2135,20 @@ def test_finish_chain_falls_back_to_pooling_when_no_prd_was_parsed(client, tmp_p
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    monkeypatch.setattr(
-        session_runner, "stream_prompt", lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-    )
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    def fake_stream_prompt(prompt, **kw):
+    def handler(prompt, **kw):
+        if prompt == "/baton:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/baton:to-prd":
             return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/baton:to-issues":
             return iter([_result_event("no PRD/issue numbers in here at all")])
         raise AssertionError(f"unexpected prompt {prompt!r} -- must not auto-continue without a PRD")
 
-    monkeypatch.setattr(session_runner, "stream_prompt", fake_stream_prompt)
-    monkeypatch.setattr(session_runner, "clear_session", lambda session_id, cwd=None, model=None, effort=None, card_id=None: "s2")
+    _mock_engine(monkeypatch, handler, fresh_ids=["turn-engine", "s2"])
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
     monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd: "no PRD/issue numbers in here at all")
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
@@ -1869,98 +2161,8 @@ def test_finish_chain_falls_back_to_pooling_when_no_prd_was_parsed(client, tmp_p
     events = live_stream._buffers.get(row_id, [])
     assert not any(e.get("type") == "minimize" for e in events)
     assert events[-1] == {"type": "done"}
-
-
-def test_implement_error_in_background_raises_a_notification(client, tmp_path, monkeypatch):
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    def failing_stream_prompt(prompt, **kw):
-        raise ClaudeCLIError("boom")
-
-    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
-
-    conn = db.get_connection()
-    row_id = db.create_session(
-        conn, project_id, session_type="implement", phase="implementing",
-        details={"prd": {"number": 5, "title": "My PRD"}},
-    )
-    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
-
-    notifications = session_runner.get_error_notifications(project_id)
-    assert len(notifications) == 1
-    assert notifications[0]["card_id"] == row_id
-    assert notifications[0]["phase"] == "implementing"
-    assert "boom" in notifications[0]["message"]
-
-
-def test_qa_closing_error_in_background_raises_a_notification(client, tmp_path, monkeypatch):
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    def failing_stream_prompt(prompt, **kw):
-        raise ClaudeCLIError("qa boom")
-
-    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
-
-    conn = db.get_connection()
-    qa_row_id = db.create_session(
-        conn, project_id, session_type="qa", phase="qa_grilling",
-        claude_session_id="qa-session-1", details={"prd": {"number": 7, "title": "Test PRD"}},
-    )
-    asyncio.run(session_runner.continue_qa_job(qa_row_id, "notes", cwd=cwd))
-
-    notifications = session_runner.get_error_notifications(project_id)
-    assert len(notifications) == 1
-    assert notifications[0]["card_id"] == qa_row_id
-    assert notifications[0]["phase"] == "qa_closing"
-    assert "qa boom" in notifications[0]["message"]
-
-
-def test_qa_closing_gh_auth_error_sets_needs_github_login(client, tmp_path, monkeypatch):
-    """/qa's closing step calls `gh issue close`/`gh issue edit` directly, so
-    a genuine gh auth failure must still surface the GitHub login button."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    def failing_stream_prompt(prompt, **kw):
-        raise ClaudeCLIError("gh: not logged in, run `gh auth login`")
-
-    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
-
-    conn = db.get_connection()
-    qa_row_id = db.create_session(
-        conn, project_id, session_type="qa", phase="qa_grilling",
-        claude_session_id="qa-session-1", details={"prd": {"number": 7, "title": "Test PRD"}},
-    )
-    asyncio.run(session_runner.continue_qa_job(qa_row_id, "notes", cwd=cwd))
-
-    row = db.get_session(conn, qa_row_id)
-    assert bool(row["needs_github_login"]) is True
-    assert "not logged in" in row["error_text"]
-
-
-def test_qa_closing_non_gh_error_does_not_set_needs_github_login(client, tmp_path, monkeypatch):
-    """A ClaudeCLIError during qa closing that isn't actually a `gh` auth
-    failure must not trigger the GitHub login button."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    def failing_stream_prompt(prompt, **kw):
-        raise ClaudeCLIError("Claude CLI exited with code 1: authentication error")
-
-    monkeypatch.setattr(session_runner, "stream_prompt", failing_stream_prompt)
-
-    conn = db.get_connection()
-    qa_row_id = db.create_session(
-        conn, project_id, session_type="qa", phase="qa_grilling",
-        claude_session_id="qa-session-1", details={"prd": {"number": 7, "title": "Test PRD"}},
-    )
-    asyncio.run(session_runner.continue_qa_job(qa_row_id, "notes", cwd=cwd))
-
-    row = db.get_session(conn, qa_row_id)
-    assert bool(row["needs_github_login"]) is False
-    assert "authentication error" in row["error_text"]
+    # No PRD to implement -- this card's tab was closed when pooled.
+    assert row_id not in session_runner._pty_engines
 
 
 def test_dismiss_error_notifications_clears_the_project_queue(client, tmp_path):

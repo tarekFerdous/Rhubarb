@@ -70,6 +70,48 @@ def test_parallel_implementation_column_migrates_existing_db_defaulting_off(tmp_
     assert db.get_afk_hours(migrated) == 9
 
 
+def test_terminal_view_hidden_round_trip(tmp_path):
+    db_path = tmp_path / "baton.db"
+    conn = db.get_connection(db_path)
+    assert db.get_terminal_view_hidden(conn) is False
+
+    db.set_terminal_view_hidden(conn, True)
+    assert db.get_terminal_view_hidden(conn) is True
+
+    reopened = db.get_connection(db_path)
+    assert db.get_terminal_view_hidden(reopened) is True
+
+    db.set_terminal_view_hidden(reopened, False)
+    assert db.get_terminal_view_hidden(reopened) is False
+
+
+def test_terminal_view_hidden_column_migrates_existing_db_defaulting_visible(tmp_path):
+    """A DB created before `settings.terminal_view_hidden` existed (simulated
+    here by building the pre-migration schema by hand) must gain the column
+    defaulting to visible/expanded (issue #89's default), and keep its other
+    settings intact when `get_connection` runs its guarded ALTER TABLE."""
+    db_path = tmp_path / "baton.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            root_dir TEXT,
+            afk_hours INTEGER NOT NULL DEFAULT 6
+        )
+        """
+    )
+    conn.execute("INSERT INTO settings (id, root_dir, afk_hours) VALUES (1, '/some/root', 9)")
+    conn.commit()
+    conn.close()
+
+    migrated = db.get_connection(db_path)
+    assert db.get_terminal_view_hidden(migrated) is False
+    # Pre-existing data survived the migration untouched.
+    assert db.get_root_dir(migrated) == "/some/root"
+    assert db.get_afk_hours(migrated) == 9
+
+
 def test_model_round_trip(tmp_path):
     db_path = tmp_path / "baton.db"
     conn = db.get_connection(db_path)

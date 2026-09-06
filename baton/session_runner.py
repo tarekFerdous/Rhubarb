@@ -6,6 +6,11 @@ start of each step, `text`/`action`/`usage` as a turn streams, a richer
 `turn` event once a turn's semantics (interview/details/error) are known,
 and `done` once the session has reached a terminal state (details or an
 unrecoverable error).
+
+Every phase (`do`, `to-prd`, `to-issues`, `implement`, `qa`) drives its turns
+through a single resident `PtyEngine` "tab" per `card_id` -- see
+`_pty_engines` below -- instead of the old subprocess-per-turn
+`cli_client.run_prompt`/`stream_prompt` model (issue #87).
 """
 
 import asyncio
@@ -16,9 +21,10 @@ from pathlib import Path
 _FENCED_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```")
 
 from baton import db
-from baton.cli_client import ClaudeCLIError, clear_session, close_persistent_session, stream_prompt
+from baton.cli_client import ClaudeCLIError
 from baton.github_publisher import GithubPublishError, publish_draft
 from baton.live_stream import publish
+from baton.pty_engine import PtyEngine, PtyEngineUnrecoverableError
 from baton.qa_parser import parse_grilling_response
 from baton.stream_translate import translate_event
 
@@ -41,11 +47,24 @@ _DETAIL_RE = re.compile(r"\b(PRD|Issue)\s*#(\d+)\s*[:\-]\s*(.+)", re.IGNORECASE)
 
 # Context-window budget: before starting the next phase in a session chain,
 # `_maybe_clear_for_next_phase` checks the row's last-recorded `context_pct`
-# against the relevant cutoff below and `/clear`s first if it's over. Both
-# are pre-phase gates only -- a phase already running is never interrupted
-# even if it crosses its cutoff while in flight. Placeholders pending real
-# /baton:implement and /baton:qa context-growth telemetry (this repo's own
-# measurements only ever covered the /do chain) -- expect these to move.
+# against the relevant cutoff below and starts a fresh PtyEngine first if
+# it's over. Both are pre-phase gates only -- a phase already running is
+# never interrupted even if it crosses its cutoff while in flight.
+# Placeholders pending real /baton:implement and /baton:qa context-growth
+# telemetry (this repo's own measurements only ever covered the /do chain)
+# -- expect these to move.
+#
+# NOTE (issue #87): `PtyEngine`'s turn-complete-marker protocol carries no
+# usage/token-count data (interactive mode has no `--output-format
+# stream-json`-style `usage`/`modelUsage` fields the way headless `-p` did),
+# so `_context_window_pct` now always returns `None` for a turn driven
+# through `PtyEngine`, and every check below always falls into its
+# treat-as-safe/has-headroom branch. This is an inherent consequence of the
+# marker-based interactive protocol, not something this issue changes the
+# shape of -- the gate and the recycle cutoff are left in place exactly as
+# they already handle an unknown `context_pct` (safe-by-default), so a
+# future engine enhancement that recovers usage data would make them live
+# again with no further changes needed here.
 _DO_TO_IMPLEMENT_CONTEXT_CUTOFF = 0.40
 _IMPLEMENT_TO_QA_CONTEXT_CUTOFF = 0.68
 
@@ -61,16 +80,16 @@ def _context_window_pct(raw_result_event: dict) -> float | None:
     """Compute how full the context window was for one CLI turn, from the
     raw (untranslated) `result` event's usage fields -- the same formula
     Claude Code's own interactive statusline uses for its pre-calculated
-    `context_window.used_percentage` field (not itself available in headless
-    `-p` mode, hence computing it here): `(input_tokens +
+    `context_window.used_percentage` field: `(input_tokens +
     cache_creation_input_tokens + cache_read_input_tokens) / contextWindow`.
 
     Returns `None` when the event doesn't carry enough to compute this (no
-    `usage`/`modelUsage` block, or a zero/missing `contextWindow`) rather
-    than raising -- a session with an unknown context usage is treated as
-    safe-to-continue by every caller (see `_maybe_clear_for_next_phase`),
-    since erring toward "don't gate" only risks the growth this budget is
-    meant to catch, not silent data loss.
+    `usage`/`modelUsage` block, or a zero/missing `contextWindow` -- always
+    true of a `PtyEngine`-driven turn, see the module-level note above)
+    rather than raising -- a session with an unknown context usage is
+    treated as safe-to-continue by every caller (see
+    `_maybe_clear_for_next_phase`), since erring toward "don't gate" only
+    risks the growth this budget is meant to catch, not silent data loss.
     """
     usage = raw_result_event.get("usage") or {}
     model_usage = raw_result_event.get("modelUsage") or {}
@@ -87,6 +106,71 @@ def _context_window_pct(raw_result_event: dict) -> float | None:
     return used / context_window
 
 
+# One resident PtyEngine ("tab") per card_id, kept alive across every turn
+# for that card's session -- across grilling -> to-prd -> to-issues ->
+# implement, since those all continue the same claude conversation on the
+# same card_id today (see `_auto_continue_implement_and_qa`). Replaces
+# cli_client's old `_persistent_processes` pool: that pool was also
+# card_id-keyed, but only ever used by the /do chain, and only kept a
+# `-p`-style subprocess open (not a true interactive PTY) with its own
+# ad hoc fallback/respawn-with-`--resume` logic on death. Every phase now
+# shares this one mechanism instead -- see `_get_or_create_engine`.
+_pty_engines: dict[int, PtyEngine] = {}
+
+
+def _get_or_create_engine(
+    card_id: int, *, cwd: str | None, model: str | None, effort: str | None, resume_session_id: str | None
+) -> PtyEngine:
+    """Return this card's resident tab, constructing and starting one (fresh,
+    or reattached via `--resume resume_session_id` -- e.g. a reused pooled
+    session, or a session picked back up after a Baton restart) if this is
+    the first turn for this `card_id`. Every later turn for the same
+    `card_id` reuses the exact same `PtyEngine` instance -- never recreated
+    per turn."""
+    engine = _pty_engines.get(card_id)
+    if engine is not None:
+        return engine
+    engine = PtyEngine(cwd=cwd, model=model, effort=effort, resume_session_id=resume_session_id)
+    engine.start()
+    _pty_engines[card_id] = engine
+    return engine
+
+
+def _close_engine(card_id: int) -> None:
+    """Close and forget this card's resident tab, if any -- called whenever
+    a card's tab finishes: pooled for reuse, fully done, handed off to a
+    different card_id (the /implement -> /qa auto-handoff), or errored out
+    (a later retry reattaches a fresh tab via `--resume` instead of
+    continuing to drive a process that just raised)."""
+    engine = _pty_engines.pop(card_id, None)
+    if engine is not None:
+        engine.close()
+
+
+def open_pty_tab_count() -> int:
+    """How many `PtyEngine` "tabs" are currently resident (issue #88) --
+    one per `card_id` with a live entry in `_pty_engines`, across every
+    active session regardless of phase. Backs the web UI's tab-count
+    indicator next to the "Sessions" label (`GET /api/pty-tabs/count` in
+    `baton/web/app.py`); polled rather than pushed since it's a global
+    count, not scoped to any one card's SSE stream."""
+    return len(_pty_engines)
+
+
+def _spawn_fresh_engine(*, cwd: str | None, model: str | None, effort: str | None) -> PtyEngine:
+    """Construct and start a genuinely fresh `PtyEngine` -- no
+    `resume_session_id` -- a brand-new, empty conversation. Used everywhere
+    this module used to call `cli_client.clear_session`: issue #87 replaces
+    sending the literal text "/clear" to a resident process with tearing
+    that tab down and starting an actually-fresh one, since the whole point
+    of clearing is to reclaim context by starting over, not to keep talking
+    to the same process. Blocking (real spawn is a subprocess call) --
+    callers run this via `asyncio.to_thread`."""
+    engine = PtyEngine(cwd=cwd, model=model, effort=effort)
+    engine.start()
+    return engine
+
+
 async def _maybe_clear_for_next_phase(card_id: int, conn, row, *, cwd: str | None, cutoff: float) -> str:
     """The context-window budget gate: called right before starting the next
     phase in a session chain (currently `/baton:do` -> `/baton:implement` at
@@ -96,29 +180,47 @@ async def _maybe_clear_for_next_phase(card_id: int, conn, row, *, cwd: str | Non
 
     Reads `row["context_pct"]` (persisted after the previous phase's last
     turn) rather than measuring anything fresh: an unknown value (`None`,
-    e.g. no turn has completed yet, or the CLI's usage fields were
-    unavailable for some reason) is treated as safe to continue, same as
-    `_context_window_pct`'s own None-on-uncertainty behavior.
+    e.g. no turn has completed yet, or a `PtyEngine`-driven turn's usage
+    fields are unavailable -- see the module-level note above) is treated
+    as safe to continue, same as `_context_window_pct`'s own
+    None-on-uncertainty behavior.
 
     At or under `cutoff`: returns the row's existing `claude_session_id`
-    unchanged -- the next phase continues in the same session, no `/clear`.
+    unchanged -- the next phase continues in the same tab, no fresh engine.
 
-    Over `cutoff`: runs `/clear` (via `cli_client.clear_session`, same as
-    the end-of-chain pooling path), persists the new session id and resets
-    `context_pct` to `None` on the row (the cleared session starts with an
-    empty, unmeasured context again), and returns the new session id. This
-    is a pre-phase gate only -- once the next phase is running, it is never
-    interrupted mid-run even if it goes on to cross `cutoff` itself.
-    """
+    Over `cutoff`: tears down this card's resident tab and starts a
+    genuinely fresh one (see `_spawn_fresh_engine`) *for this same
+    card_id* -- the next phase continues right on in the new tab, it's just
+    talking to an empty conversation instead of the old one. Persists the
+    new session id and resets `context_pct` to `None` on the row (the fresh
+    tab starts with an empty, unmeasured context again). This is a
+    pre-phase gate only -- once the next phase is running, it is never
+    interrupted mid-run even if it goes on to cross `cutoff` itself."""
     context_pct = row["context_pct"]
     if context_pct is None or context_pct <= cutoff:
         return row["claude_session_id"]
 
-    new_session_id = await asyncio.to_thread(
-        clear_session, row["claude_session_id"], cwd=cwd, model=row["model"], effort=row["effort"]
-    )
+    _close_engine(card_id)
+    engine = await asyncio.to_thread(_spawn_fresh_engine, cwd=cwd, model=row["model"], effort=row["effort"])
+    _pty_engines[card_id] = engine
+    new_session_id = engine.claude_session_id
     db.update_session(conn, card_id, claude_session_id=new_session_id, context_pct=None)
     return new_session_id
+
+
+async def _clear_for_reuse(card_id: int, *, cwd: str | None, model: str | None, effort: str | None) -> str:
+    """Reclaim context by starting a genuinely fresh conversation (see
+    `_spawn_fresh_engine`), for a card whose row is about to be pooled
+    (`db.mark_session_available`) for reuse under a *different*, future
+    card_id -- this card's own tab is closed for good here, since nothing
+    will ever run another turn against this `card_id` again. The future
+    reuse constructs its own fresh tab, reattaching via `--resume` at
+    whatever id this returns."""
+    _close_engine(card_id)
+    engine = await asyncio.to_thread(_spawn_fresh_engine, cwd=cwd, model=model, effort=effort)
+    engine.close()
+    return engine.claude_session_id
+
 
 # In-memory, per-project FIFO queue for serial-mode ("parallel_implementation"
 # off) PRD implementation requests. Process-lifetime only, same as
@@ -173,6 +275,42 @@ def parse_details(text: str) -> dict:
     return {"prd": prd, "issues": issues, "raw": text}
 
 
+def _blocked_payload_from_crash(exc: PtyEngineUnrecoverableError) -> dict:
+    """Synthesize the same shape of payload a genuine `implement_blocked`
+    marker produces (see `_parse_implement_blocked_block`) out of a
+    `PtyEngineUnrecoverableError` -- issue #87's crash-routing requirement:
+    a turn that dies twice in a row (see that exception's docstring) is
+    routed into the exact same suspend-and-wait-for-a-human-reply mechanism
+    a genuine blocked marker already uses, rather than a new UI/error path."""
+    return {
+        "phase": "implement_blocked",
+        "issue": None,
+        "question": (
+            "This session's connection to Claude crashed twice in a row and "
+            "could not recover automatically. Reply below to try to continue."
+        ),
+        "context": str(exc),
+    }
+
+
+async def _route_crash_to_blocked(card_id: int, conn, exc: PtyEngineUnrecoverableError, *, phase: str) -> None:
+    """A `stream_turn` call raised `PtyEngineUnrecoverableError` (its
+    underlying process died twice in a row and gave up). Suspend this
+    session exactly like a genuine `implement_blocked` marker would: `phase:
+    blocked`, `blocked_json` set, a `turn` event carrying it -- so the same
+    reply flow that already resumes a blocked implement session
+    (`continue_implement_job`) picks this up too, regardless of which phase
+    hit the crash. The dead tab is dropped from the registry so the next
+    turn (that reply) constructs a fresh one, reattaching via `--resume` at
+    `exc.claude_session_id`."""
+    _close_engine(card_id)
+    blocked = _blocked_payload_from_crash(exc)
+    db.update_session(
+        conn, card_id, claude_session_id=exc.claude_session_id, phase="blocked", blocked_json=json.dumps(blocked)
+    )
+    publish(card_id, _turn_event(phase="blocked", blocked=blocked))
+
+
 async def _run_turn(
     card_id: int,
     prompt: str,
@@ -181,28 +319,24 @@ async def _run_turn(
     cwd: str | None,
     model: str | None = None,
     effort: str | None = None,
-    persistent: bool = False,
 ) -> dict:
-    """Run one CLI turn in a background thread, streaming translated events
-    into the session's live buffer as they arrive. Returns the raw `result`
-    event's translated boundary marker ({"result", "session_id", "is_error"})
-    once the turn finishes; raises ClaudeCLIError on failure -- the caller
-    decides what that means for the session (grilling vs. chain phase).
-
-    `persistent=True` (the /do chain -- grilling, /to-prd, /to-issues) routes
-    the turn through `stream_prompt`'s `card_id` path, which reuses one
-    long-lived `claude` process across every turn sharing this `card_id`
-    instead of spawning a fresh one per turn -- see `cli_client.stream_prompt`.
-    `persistent=False` (the default; /implement and /qa) keeps the original
-    one-shot-per-call behavior, unchanged.
+    """Run one turn against this card's resident `PtyEngine` tab (see
+    `_get_or_create_engine` -- constructed and started on the first call for
+    this `card_id`, reattached via `--resume session_id` if one is already
+    known, and reused unchanged on every later call for the same
+    `card_id`), streaming translated events into the session's live buffer
+    as they arrive. Returns the raw `result` event's translated boundary
+    marker ({"result", "session_id", "is_error"}) once the turn finishes;
+    raises `ClaudeCLIError` on an ordinary failure, or propagates
+    `PtyEngineUnrecoverableError` unwrapped -- callers route that into the
+    blocked-card flow (see `_route_crash_to_blocked`) instead of treating it
+    like a plain `ClaudeCLIError`.
     """
     holder: dict = {}
 
-    def worker():
-        kwargs = dict(session_id=session_id, cwd=cwd, model=model, effort=effort)
-        if persistent:
-            kwargs["card_id"] = card_id
-        for raw_event in stream_prompt(prompt, **kwargs):
+    async def runner():
+        engine = _get_or_create_engine(card_id, cwd=cwd, model=model, effort=effort, resume_session_id=session_id)
+        async for raw_event in engine.stream_turn(prompt):
             translated = translate_event(raw_event)
             if translated is None:
                 continue
@@ -213,11 +347,13 @@ async def _run_turn(
             publish(card_id, translated)
 
     try:
-        await asyncio.to_thread(worker)
+        await runner()
+    except PtyEngineUnrecoverableError:
+        raise
     except ClaudeCLIError as e:
         holder["error"] = e
     except Exception as e:
-        # Anything unexpected (a malformed CLI event, a bug in translation)
+        # Anything unexpected (a malformed raw event, a bug in translation)
         # must still resolve into a recorded session error, not an
         # unhandled exception on the fire-and-forget asyncio task -- that
         # would leave the card stuck in its in-flight phase silently
@@ -282,12 +418,15 @@ async def _run_grilling_turn(
             cwd=cwd,
             model=model,
             effort=effort,
-            persistent=True,
         )
+    except PtyEngineUnrecoverableError as e:
+        await _route_crash_to_blocked(card_id, conn, e, phase="grilling")
+        return None
     except ClaudeCLIError as e:
         # Grilling's Claude turn never calls `gh` (see .claude/skills' own
         # instructions), so any match here would be a false positive --
         # always report no GitHub login is needed.
+        _close_engine(card_id)
         message = str(e)
         db.update_session(
             conn, card_id, model=model, effort=effort, error_text=message, needs_github_login=0
@@ -333,12 +472,15 @@ async def _run_chain_step(
             cwd=cwd,
             model=model,
             effort=effort,
-            persistent=True,
         )
+    except PtyEngineUnrecoverableError as e:
+        await _route_crash_to_blocked(card_id, conn, e, phase=phase)
+        return False, None
     except ClaudeCLIError as e:
         # /to-prd and /to-issues are explicitly forbidden from calling `gh`
-        # (see their skill instructions), so any match here would be a false
-        # positive -- always report no GitHub login is needed.
+        # (see their skill instructions), so any match here would be a
+        # false positive -- always report no GitHub login is needed.
+        _close_engine(card_id)
         message = str(e)
         db.update_session(conn, row["id"], error_text=message, needs_github_login=0)
         publish(card_id, _turn_event(phase=phase, error=message, needs_github_login=False))
@@ -390,7 +532,7 @@ async def _finish_chain(card_id: int, conn, claude_session_id: str, cwd: str | N
     """`/baton:do` just reached `details` (PRD + issues published). Publishes
     the `details` turn event, then hands off to `_auto_continue_implement_and_qa`
     instead of the old immediate `/clear`-and-pool -- that function decides
-    whether to continue in this same session or `/clear` first (the
+    whether to continue in this same tab or start a fresh one (the
     context-window budget gate), and starts `/baton:implement` automatically."""
     row = db.get_session(conn, card_id)
     details = parse_details(row["console_text"])
@@ -416,27 +558,24 @@ async def _auto_continue_implement_and_qa(card_id: int, conn, cwd: str | None) -
     started `/implement`, so the existing right-side panel plumbing renders
     it with no special case beyond handling `minimize` itself.
 
-    Closes this card's persistent process first regardless of what happens
-    next: `/baton:do`'s chain runs through the `card_id`-keyed persistent
-    process (see `cli_client.stream_prompt`), but `/baton:implement` always
-    runs one-shot -- the underlying `claude_session_id` conversation
-    continues either way via `--resume`, only the *local* process handle
-    needs reaping here, whether or not the context-window gate below goes
-    on to `/clear` it too.
+    Unlike the old subprocess-per-turn model, this card's resident tab (see
+    `_pty_engines`) is left running across this transition when a PRD was
+    found -- `/baton:implement` continues in the exact same tab as the /do
+    chain that led here, just under a new `session_type`/`phase` on the row;
+    only the context-window budget gate (`_maybe_clear_for_next_phase`) ever
+    tears it down and starts fresh, same as for any other phase transition.
 
     Falls back to the old pool-and-wait behavior if `parse_details` in
     `_finish_chain` came up with no PRD number to implement, rather than
-    getting the session stuck mid-transition."""
+    getting the session stuck mid-transition -- this path pools the session
+    (and does close this card's tab; see `_clear_for_reuse`), since nothing
+    else is going to run on this `card_id` until a human picks a PRD."""
     row = db.get_session(conn, card_id)
     details = json.loads(row["details_json"]) if row["details_json"] else None
     prd = details.get("prd") if details else None
 
-    close_persistent_session(card_id)
-
     if prd is None:
-        new_session_id = await asyncio.to_thread(
-            clear_session, row["claude_session_id"], cwd=cwd, model=row["model"], effort=row["effort"]
-        )
+        new_session_id = await _clear_for_reuse(card_id, cwd=cwd, model=row["model"], effort=row["effort"])
         db.mark_session_available(conn, card_id, new_session_id)
         publish(card_id, {"type": "done"})
         return
@@ -630,7 +769,14 @@ async def start_or_queue_implement(
     timer decision never chains through a backlog the instant a slot frees
     up. A manually-clicked PRD (the default, `allow_queue=True`) is
     unaffected -- it still queues and drains as soon as the running session
-    finishes."""
+    finishes.
+
+    `db.get_parallel_implementation`/`_implement_queues` remain the only
+    concurrency policy: with it on, every PRD (this one included) starts
+    its own independent `PtyEngine` tab immediately; with it off, only one
+    implement tab runs per project at a time and everything else queues
+    here, same as before issue #87 -- only the underlying per-session
+    process model changed."""
     conn = db.get_connection()
     if db.has_active_implement_session(conn, project_id, number):
         return {"error": "Already implementing"}
@@ -680,9 +826,13 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
             model=model,
             effort=effort,
         )
+    except PtyEngineUnrecoverableError as e:
+        await _route_crash_to_blocked(card_id, conn, e, phase="implementing")
+        return
     except ClaudeCLIError as e:
         # /implement's PRD-selection step calls `gh issue list` directly, so
         # a genuine gh auth failure is possible here -- classify it.
+        _close_engine(card_id)
         message = str(e)
         needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
@@ -731,7 +881,9 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
     qa_data = _parse_qa_grilling_block(turn["result"])
     if qa_data is not None:
         # /implement Phase 5 ran /qa and emitted the checklist block.
-        # Hand the session_id to the QA session instead of pooling it here.
+        # Hand the session_id to the QA session instead of pooling it here
+        # -- this card's own tab is done; the new QA row's own tab starts
+        # fresh (reattached via --resume) on its own first turn.
         qa_row_id = db.create_session(
             conn,
             row["project_id"],
@@ -742,15 +894,14 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
             model=model,
             effort=effort,
         )
+        _close_engine(card_id)
         publish(card_id, {"type": "qa_started", "qa_card_id": qa_row_id})
         publish(card_id, _turn_event(phase="implemented", details=details))
         publish(card_id, {"type": "done"})
         await _drain_implement_queue(row["project_id"], cwd)
         asyncio.create_task(start_qa_job(qa_row_id, qa_data, cwd=cwd))
     else:
-        new_session_id = await asyncio.to_thread(
-            clear_session, turn["session_id"], cwd=cwd, model=model, effort=effort
-        )
+        new_session_id = await _clear_for_reuse(card_id, cwd=cwd, model=model, effort=effort)
         db.mark_session_available(conn, card_id, new_session_id)
         publish(card_id, _turn_event(phase="implemented", details=details))
         publish(card_id, {"type": "done"})
@@ -777,7 +928,11 @@ async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -
         turn = await _run_turn(
             card_id, reply, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort
         )
+    except PtyEngineUnrecoverableError as e:
+        await _route_crash_to_blocked(card_id, conn, e, phase="implementing")
+        return
     except ClaudeCLIError as e:
+        _close_engine(card_id)
         message = str(e)
         needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
@@ -832,9 +987,13 @@ async def continue_qa_job(card_id: int, notes: str, *, cwd: str | None) -> None:
         turn = await _run_turn(
             card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort
         )
+    except PtyEngineUnrecoverableError as e:
+        await _route_crash_to_blocked(card_id, conn, e, phase="qa_closing")
+        return
     except ClaudeCLIError as e:
         # /qa's closing step calls `gh issue close`/`gh issue edit` directly,
         # so a genuine gh auth failure is possible here -- classify it.
+        _close_engine(card_id)
         message = str(e)
         needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
@@ -849,9 +1008,12 @@ async def continue_qa_job(card_id: int, notes: str, *, cwd: str | None) -> None:
     # Recycle a low-usage finished session instead of leaving it dead weight:
     # an unknown context_pct is treated as "has headroom" (same
     # safe-by-default stance as `_context_window_pct`/`_maybe_clear_for_next_phase`),
-    # so it's marked available too.
+    # so it's marked available too. Either way, this card's tab is done --
+    # a recycled row's `claude_session_id` is picked up later by a brand-new
+    # card_id's own fresh tab, not this one.
     if context_pct is None or context_pct < _QA_DONE_RECYCLE_CONTEXT_CUTOFF:
         db.mark_session_available(conn, card_id, turn["session_id"])
+    _close_engine(card_id)
 
     publish(card_id, _turn_event(phase="qa_closing"))
     publish(card_id, {"type": "done"})

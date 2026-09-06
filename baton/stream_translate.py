@@ -32,6 +32,13 @@ def translate_event(raw_event: dict) -> dict | None:
     if kind == "system":
         return None
 
+    if kind == "terminal_output":
+        # Passed straight through from `PtyEngine.stream_turn` (issue #88) --
+        # the raw PTY chunk, unmodified, for a live-terminal-view consumer.
+        # Not filtered/parsed like every other event here since there is
+        # nothing to translate: `data` already IS what the frontend renders.
+        return {"type": "terminal_output", "data": raw_event.get("data", "")}
+
     if kind == "stream_event":
         event = raw_event.get("event", {})
         event_type = event.get("type")

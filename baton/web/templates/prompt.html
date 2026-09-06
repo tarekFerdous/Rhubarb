@@ -5,6 +5,12 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Baton</title>
   <link rel="stylesheet" href="/static/styles.css" />
+  <!-- Live PTY terminal view (issue #88): xterm.js, pinned, MIT-licensed --
+       correctly renders the ANSI/control-character stream the interactive
+       `claude` PTY actually produces, instead of dumping raw text into a
+       <pre>. -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
 </head>
 <body>
   <div class="split">
@@ -81,9 +87,14 @@
     <div class="card middle">
       <p class="console-title">Output</p>
       <div class="scroll-wrap"><div id="console-output" class="console"></div></div>
+      <p class="console-title terminal-title">Live Terminal</p>
+      <div id="terminal-view" class="terminal-view"></div>
     </div>
     <div class="card right">
-      <p class="console-title">Sessions <span id="session-count" class="session-count"></span></p>
+      <p class="console-title">
+        Sessions <span id="session-count" class="session-count"></span>
+        <span id="pty-tab-count" class="session-count pty-tab-count" title="Open PTY tabs"></span>
+      </p>
       <p id="usage-indicator" class="usage-indicator"></p>
       <div class="scroll-wrap"><div id="session-queue" class="session-queue"></div></div>
     </div>
@@ -105,6 +116,11 @@
       <p id="parallel-implementation-warning" class="modal-warning-text" hidden>
         Running multiple PRDs at once costs more tokens against your rate-limit budget than the sequential default.
       </p>
+
+      <label class="modal-checkbox-label">
+        <input id="terminal-view-hidden-toggle" type="checkbox" class="modal-checkbox-input" />
+        Hide live terminal view
+      </label>
 
       <label for="model-select-settings" class="modal-field-label">Model</label>
       <select id="model-select-settings" class="modal-select-input">
@@ -206,6 +222,8 @@
     const afkHoursInputEl = document.getElementById("afk-hours-input");
     const parallelImplementationToggleEl = document.getElementById("parallel-implementation-toggle");
     const parallelImplementationWarningEl = document.getElementById("parallel-implementation-warning");
+    const terminalViewHiddenToggleEl = document.getElementById("terminal-view-hidden-toggle");
+    const terminalViewEl = document.getElementById("terminal-view");
     const modelSelectCardEl = document.getElementById("model-select-card");
     const modelSelectSettingsEl = document.getElementById("model-select-settings");
     const modelChangeModalEl = document.getElementById("model-change-modal");
@@ -220,6 +238,7 @@
     const sessionQueueEl = document.getElementById("session-queue");
     const consoleOutputEl = document.getElementById("console-output");
     const sessionCountEl = document.getElementById("session-count");
+    const ptyTabCountEl = document.getElementById("pty-tab-count");
     const usageIndicatorEl = document.getElementById("usage-indicator");
     const phaseLabelEl = document.getElementById("phase-label");
     const detailsViewEl = document.getElementById("details-view");
@@ -242,6 +261,7 @@
     let knownRootDir = null;
     let knownAfkHours = null;
     let knownParallelImplementation = null;
+    let knownTerminalViewHidden = null;
     let knownModel = null;
     let knownEffort = null;
     // card_id's that have received at least one turn -- gates whether
@@ -702,6 +722,8 @@
       knownRootDir = state.root_dir;
       knownAfkHours = state.afk_hours;
       knownParallelImplementation = state.parallel_implementation;
+      knownTerminalViewHidden = state.terminal_view_hidden;
+      applyTerminalViewVisibility();
       knownModel = state.model;
       modelSelectCardEl.value = knownModel;
       modelSelectSettingsEl.value = knownModel;
@@ -728,6 +750,7 @@
       afkHoursInputEl.value = knownAfkHours ?? 6;
       parallelImplementationToggleEl.checked = knownParallelImplementation ?? false;
       parallelImplementationWarningEl.hidden = !parallelImplementationToggleEl.checked;
+      terminalViewHiddenToggleEl.checked = knownTerminalViewHidden ?? false;
       modelSelectSettingsEl.value = knownModel ?? "claude-sonnet-4-6";
       effortSelectSettingsEl.value = knownEffort ?? "auto";
       settingsModalEl.hidden = false;
@@ -765,6 +788,26 @@
       knownParallelImplementation = data.parallel_implementation;
       parallelImplementationToggleEl.checked = knownParallelImplementation;
       parallelImplementationWarningEl.hidden = !knownParallelImplementation;
+    }
+
+    // Applies the current terminal-view-hidden setting to the embedded live
+    // terminal view immediately -- called on load and right after the
+    // setting changes, so no page reload or Baton restart is needed.
+    function applyTerminalViewVisibility() {
+      terminalViewEl.hidden = !!knownTerminalViewHidden;
+    }
+
+    async function updateTerminalViewHidden() {
+      const value = terminalViewHiddenToggleEl.checked;
+      const res = await fetch("/api/settings/terminal-view-hidden", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ terminal_view_hidden: value }),
+      });
+      const data = await res.json();
+      knownTerminalViewHidden = data.terminal_view_hidden;
+      terminalViewHiddenToggleEl.checked = knownTerminalViewHidden;
+      applyTerminalViewVisibility();
     }
 
     async function updateModel(model) {
@@ -838,6 +881,7 @@
     document.getElementById("modal-pick-btn").addEventListener("click", pickRootDir);
     afkHoursInputEl.addEventListener("change", updateAfkHours);
     parallelImplementationToggleEl.addEventListener("change", updateParallelImplementation);
+    terminalViewHiddenToggleEl.addEventListener("change", updateTerminalViewHidden);
     document.getElementById("close-project-btn").addEventListener("click", closeActiveProject);
     afkModalCloseBtn.addEventListener("click", dismissAfkNotifications);
     sessionErrorNotificationCloseBtn.addEventListener("click", dismissSessionErrorNotifications);
@@ -852,6 +896,13 @@
     effortChangeModalCloseBtn.addEventListener("click", () => {
       effortChangeModalEl.hidden = true;
     });
+
+    // Embedded live terminal view (issue #88): one xterm.js instance,
+    // reused across sessions -- reset (not recreated) whenever the focused
+    // card changes, same lifecycle as consoleOutputEl's plain-text log.
+    // Visible by default (no `hidden` toggling anywhere on it).
+    const term = new Terminal({ convertEol: true, disableStdin: true, fontSize: 13 });
+    term.open(document.getElementById("terminal-view"));
 
     let eventSource = null;
     let currentTextEl = null;
@@ -976,6 +1027,7 @@
       if (eventSource) eventSource.close();
       consoleOutputEl.innerHTML = "";
       currentTextEl = null;
+      term.reset();
       const es = new EventSource(`/api/sessions/${cardId}/stream`);
       eventSource = es;
       es.onmessage = (e) => handleStreamEvent(cardId, es, JSON.parse(e.data));
@@ -1017,6 +1069,11 @@
       // Everything else is pure console streaming for the currently focused
       // session -- ignore stray events from a connection that's since been replaced.
       if (cardId !== leftCardId) return;
+
+      if (event.type === "terminal_output") {
+        term.write(event.data);
+        return;
+      }
 
       if (event.type === "phase") {
         currentTextEl = null;
@@ -1707,8 +1764,16 @@
     // this timer-driven lifecycle: it's event-driven only (see activateProject
     // and finishCard) since its endpoint is the expensive one (two `gh
     // issue list` subprocesses per call).
+    async function refreshPtyTabCount() {
+      const res = await fetch("/api/pty-tabs/count");
+      const data = await res.json();
+      const count = data.count || 0;
+      ptyTabCountEl.textContent = count > 0 ? `· ${count} tab${count === 1 ? "" : "s"}` : "";
+    }
+
     let usageIntervalId = null;
     let sessionQueueIntervalId = null;
+    let ptyTabCountIntervalId = null;
 
     function pollsShouldRun() {
       return Boolean(activeProject) && document.visibilityState === "visible";
@@ -1720,6 +1785,8 @@
       usageIntervalId = setInterval(refreshUsage, 8000);
       pollSessionQueueFreshness();
       sessionQueueIntervalId = setInterval(pollSessionQueueFreshness, 4000);
+      refreshPtyTabCount();
+      ptyTabCountIntervalId = setInterval(refreshPtyTabCount, 3000);
     }
 
     function stopPolls() {
@@ -1730,6 +1797,10 @@
       if (sessionQueueIntervalId) {
         clearInterval(sessionQueueIntervalId);
         sessionQueueIntervalId = null;
+      }
+      if (ptyTabCountIntervalId) {
+        clearInterval(ptyTabCountIntervalId);
+        ptyTabCountIntervalId = null;
       }
     }
 

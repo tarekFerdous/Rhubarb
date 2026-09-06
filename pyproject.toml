@@ -8,6 +8,12 @@ dependencies = [
     "uvicorn[standard]",
     "jinja2",
     "python-multipart",
+    # ConPTY backend for `baton.pty_engine`'s interactive session on Windows
+    # (issue #84).
+    "pywinpty; platform_system == 'Windows'",
+    # Unix pty backend for `baton.pty_engine`'s interactive session on
+    # macOS/Linux (issue #85), mirroring the Windows-only gating above.
+    "ptyprocess; platform_system != 'Windows'",
 ]
 
 [project.optional-dependencies]

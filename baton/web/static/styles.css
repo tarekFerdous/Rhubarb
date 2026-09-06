@@ -802,6 +802,23 @@ textarea.prompt-box:focus {
   font-variation-settings: "MONO" 0, "CASL" 0, "wght" 420, "slnt" 0, "CRSV" 0;
 }
 
+.pty-tab-count {
+  margin-left: 2px;
+}
+
+.terminal-title {
+  margin-top: 16px;
+}
+
+.terminal-view {
+  flex: 1;
+  min-height: 160px;
+  border-radius: 20px;
+  overflow: hidden;
+  padding: 8px;
+  background: #000;
+}
+
 .usage-indicator {
   color: var(--fg-muted);
   font-size: 0.72rem;

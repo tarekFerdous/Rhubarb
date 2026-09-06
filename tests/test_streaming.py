@@ -1,6 +1,6 @@
 import json
 
-from baton import live_stream
+from baton import live_stream, session_runner
 from baton.web import app as app_module
 
 
@@ -65,6 +65,39 @@ def test_stream_session_reconnect_replays_full_history_again(client):
     assert _connect_and_collect() == expected
     # Reconnecting later (e.g. a page reload) replays the same history again.
     assert _connect_and_collect() == expected
+
+
+def test_stream_session_carries_terminal_output_events_verbatim(client):
+    """Issue #88: raw/ANSI PTY output rides the same per-card SSE channel as
+    the existing turn events, as a `{"type": "terminal_output", "data":
+    ...}` event -- and must survive the JSON round trip byte-for-byte
+    (escape sequences, control characters, all of it) since a terminal
+    emulator on the frontend depends on getting the exact original bytes."""
+    card_id = 987654324
+    raw_chunk = "\x1b[1;32mRunning tests...\x1b[0m\r\n"
+    live_stream.publish(card_id, {"type": "terminal_output", "data": raw_chunk})
+    live_stream.publish(card_id, {"type": "done"})
+
+    with client.stream("GET", f"/api/sessions/{card_id}/stream") as response:
+        lines = [line for line in response.iter_lines() if line.startswith("data:")]
+
+    events = [json.loads(line[len("data:"):].strip()) for line in lines]
+    assert events == [
+        {"type": "terminal_output", "data": raw_chunk},
+        {"type": "done"},
+    ]
+
+
+def test_pty_tab_count_endpoint_reflects_resident_engines(client, monkeypatch):
+    """Backs the web UI's tab-count indicator (issue #88) -- the endpoint
+    just surfaces `session_runner.open_pty_tab_count()`."""
+    assert client.get("/api/pty-tabs/count").json() == {"count": 0}
+
+    monkeypatch.setitem(session_runner._pty_engines, 1, object())
+    assert client.get("/api/pty-tabs/count").json() == {"count": 1}
+
+    monkeypatch.setitem(session_runner._pty_engines, 2, object())
+    assert client.get("/api/pty-tabs/count").json() == {"count": 2}
 
 
 def test_usage_endpoint_returns_unknown_before_any_session_has_run(client):

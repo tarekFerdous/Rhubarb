@@ -1,0 +1,500 @@
+import asyncio
+import re
+
+import pytest
+
+from baton import pty_engine
+from baton.pty_engine import (
+    TURN_COMPLETE_MARKER,
+    PtyEngine,
+    PtyEngineError,
+    PtyEngineUnrecoverableError,
+)
+
+
+def run(coro):
+    return asyncio.run(coro)
+
+
+async def _collect(agen):
+    return [event async for event in agen]
+
+
+class FakePtyBackend:
+    """Stand-in for `winpty.PtyProcess`/`ptyprocess.PtyProcessUnicode`:
+    `chunks` is served one item per `read()` call (mimicking a real PTY's
+    output arriving incrementally), then either raises EOFError (process
+    exited) or returns "" forever (process still alive, nothing new yet)
+    once exhausted, per `eof_after`.
+    """
+
+    def __init__(self, chunks, *, eof_after=True):
+        self._chunks = list(chunks)
+        self._eof_after = eof_after
+        self.writes = []
+        self.terminated = False
+        self.reads = 0
+
+    def write(self, data):
+        self.writes.append(data)
+        return len(data)
+
+    def read(self, size=4096):
+        self.reads += 1
+        if self._chunks:
+            return self._chunks.pop(0)
+        if self._eof_after:
+            raise EOFError
+        return ""
+
+    def isalive(self):
+        return not self.terminated and (bool(self._chunks) or not self._eof_after)
+
+    def terminate(self, force=False):
+        self.terminated = True
+
+
+def _fake_factory(backend):
+    captured = {}
+
+    def factory(argv, *, cwd, env):
+        captured["argv"] = argv
+        captured["cwd"] = cwd
+        captured["env"] = env
+        return backend
+
+    return factory, captured
+
+
+def _sequenced_factory(backends):
+    """Factory that hands out one backend per call, in order, and records
+    every spawn's argv (unlike `_fake_factory`, which only keeps the most
+    recent) -- needed to inspect what a *restart* respawn passed."""
+    backends = list(backends)
+    calls = []
+
+    def factory(argv, *, cwd, env):
+        calls.append({"argv": argv, "cwd": cwd, "env": env})
+        return backends.pop(0)
+
+    return factory, calls
+
+
+# ---------------------------------------------------------------------------
+# Spawn args: skip-permissions, plugin-dir, env-stripping, marker instruction
+# ---------------------------------------------------------------------------
+
+
+def test_start_spawns_interactive_claude_with_skip_permissions_and_plugin_dir():
+    backend = FakePtyBackend([])
+    factory, captured = _fake_factory(backend)
+
+    engine = PtyEngine(pty_factory=factory)
+    engine.start()
+
+    assert "claude" in captured["argv"]
+    assert "-p" not in captured["argv"]  # interactive, not headless
+    assert "--dangerously-skip-permissions" in captured["argv"]
+    assert "--plugin-dir" in captured["argv"]
+    idx = captured["argv"].index("--plugin-dir")
+    assert captured["argv"][idx + 1] == pty_engine._plugin_args()[1]
+
+
+def test_start_appends_the_turn_complete_marker_instruction_to_the_system_prompt():
+    backend = FakePtyBackend([])
+    factory, captured = _fake_factory(backend)
+
+    PtyEngine(pty_factory=factory).start()
+
+    assert "--append-system-prompt" in captured["argv"]
+    idx = captured["argv"].index("--append-system-prompt")
+    assert TURN_COMPLETE_MARKER in captured["argv"][idx + 1]
+
+
+def test_start_strips_api_key_and_auth_token_from_child_env(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-be-inherited")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok-should-not-be-inherited")
+    backend = FakePtyBackend([])
+    factory, captured = _fake_factory(backend)
+
+    PtyEngine(pty_factory=factory).start()
+
+    assert "ANTHROPIC_API_KEY" not in captured["env"]
+    assert "ANTHROPIC_AUTH_TOKEN" not in captured["env"]
+
+
+def test_start_is_idempotent_and_does_not_respawn():
+    backend = FakePtyBackend([])
+    calls = []
+
+    def factory(argv, *, cwd, env):
+        calls.append(argv)
+        return backend
+
+    engine = PtyEngine(pty_factory=factory)
+    engine.start()
+    engine.start()
+
+    assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Fresh session id vs. --resume reattachment
+# ---------------------------------------------------------------------------
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def test_fresh_engine_generates_and_passes_a_session_id_up_front():
+    backend = FakePtyBackend([])
+    factory, captured = _fake_factory(backend)
+
+    engine = PtyEngine(pty_factory=factory)
+    assert _UUID_RE.match(engine.claude_session_id)
+
+    engine.start()
+
+    assert "--session-id" in captured["argv"]
+    idx = captured["argv"].index("--session-id")
+    assert captured["argv"][idx + 1] == engine.claude_session_id
+    assert "--resume" not in captured["argv"]
+
+
+def test_resume_reattaches_with_the_given_session_id_against_a_fresh_pty():
+    backend = FakePtyBackend([])
+    factory, captured = _fake_factory(backend)
+
+    engine = PtyEngine(resume_session_id="existing-session-123", pty_factory=factory)
+    assert engine.claude_session_id == "existing-session-123"
+
+    engine.start()
+
+    assert "--resume" in captured["argv"]
+    idx = captured["argv"].index("--resume")
+    assert captured["argv"][idx + 1] == "existing-session-123"
+    assert "--session-id" not in captured["argv"]
+
+
+# ---------------------------------------------------------------------------
+# Turn-event contract + marker detection
+# ---------------------------------------------------------------------------
+
+
+def test_stream_turn_yields_init_then_result_events_carrying_session_id():
+    backend = FakePtyBackend([f"Hello there.\n{TURN_COMPLETE_MARKER}\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("hi")))
+
+    assert events[0]["type"] == "system"
+    assert events[0]["session_id"] == engine.claude_session_id
+    assert events[-1]["type"] == "result"
+    assert events[-1]["session_id"] == engine.claude_session_id
+    assert events[-1]["is_error"] is False
+
+
+def test_stream_turn_writes_the_prompt_to_the_pty():
+    backend = FakePtyBackend([f"ok\n{TURN_COMPLETE_MARKER}\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    run(_collect(engine.stream_turn("what is 2+2?")))
+
+    assert backend.writes == ["what is 2+2?\r"]
+
+
+def test_stream_turn_stops_reading_as_soon_as_marker_appears_across_chunks():
+    """The marker can arrive split across separate PTY reads (a slow
+    terminal write, a chunk boundary mid-line) -- detection must work on
+    the accumulated buffer, not a single chunk, and must stop pulling
+    further chunks once satisfied."""
+    backend = FakePtyBackend(
+        [
+            "Working on it...\n",
+            "Here is the answer: 4\n<<<BATON_TURN_",
+            "COMPLETE>>>\n",
+            "SOMETHING THAT SHOULD NEVER BE READ",
+        ]
+    )
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("what is 2+2?")))
+
+    result_text = events[-1]["result"]
+    assert "Here is the answer: 4" in result_text
+    assert TURN_COMPLETE_MARKER not in result_text
+    assert "SHOULD NEVER BE READ" not in result_text
+    # Exactly the three chunks up to and including the marker were consumed.
+    assert backend.reads == 3
+
+
+def test_stream_turn_yields_terminal_output_events_for_every_raw_chunk_before_result():
+    """Issue #88: each raw chunk read off the PTY must be relayed as a
+    `{"type": "terminal_output", "data": ...}` event, in order, interleaved
+    BEFORE the final `result` event -- additive only, the existing
+    `system`/`result` event shapes and their positions are unchanged."""
+    chunks = ["Working", " on it...\n", f"Here you go.\n{TURN_COMPLETE_MARKER}\n"]
+    backend = FakePtyBackend(chunks)
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("hi")))
+
+    assert events[0]["type"] == "system"
+    assert events[-1]["type"] == "result"
+
+    terminal_events = [e for e in events if e["type"] == "terminal_output"]
+    assert [e["data"] for e in terminal_events] == chunks
+    # Every terminal_output event comes after the init event and before the
+    # final result event.
+    assert events.index(terminal_events[0]) > 0
+    assert events.index(terminal_events[-1]) < len(events) - 1
+
+
+def test_stream_turn_passes_through_fenced_json_marker_blocks_unmodified():
+    """Baton's existing markers (implement_blocked, qa_grilling -- see
+    session_runner._parse_implement_blocked_block/_parse_qa_grilling_block)
+    must survive unmangled inside the captured turn text; this engine only
+    ever looks for its own completion marker."""
+    fenced_block = (
+        "Some preamble text.\n"
+        "```json\n"
+        '{"phase": "implement_blocked", "reason": "need a decision"}\n'
+        "```\n"
+        "Trailing text.\n"
+    )
+    backend = FakePtyBackend([fenced_block + TURN_COMPLETE_MARKER + "\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("go")))
+
+    assert fenced_block in events[-1]["result"]
+
+
+def test_stream_turn_raises_if_process_exits_before_printing_the_marker():
+    """No fresh backend is available to retry into here (`_fake_factory`
+    always hands back the very same dead backend on respawn), so the one
+    automatic restart also dies immediately -- the caller still ultimately
+    sees a `PtyEngineError` (its subclass `PtyEngineUnrecoverableError`),
+    it just takes one extra internal attempt to get there."""
+    backend = FakePtyBackend(["partial output, then the process dies\n"], eof_after=True)
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    with pytest.raises(PtyEngineError):
+        run(_collect(engine.stream_turn("go")))
+
+
+def test_stream_turn_starts_the_process_automatically_if_not_already_started():
+    backend = FakePtyBackend([f"hi\n{TURN_COMPLETE_MARKER}\n"])
+    factory, captured = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    run(_collect(engine.stream_turn("hello")))
+
+    assert captured["argv"]  # start() was called implicitly
+
+
+# ---------------------------------------------------------------------------
+# Crash/restart recovery (issue #86)
+# ---------------------------------------------------------------------------
+
+
+def test_stream_turn_restarts_once_and_retries_the_same_prompt_after_a_mid_turn_death():
+    """First backend dies mid-turn (EOFError before the marker). The engine
+    should transparently respawn -- reattaching with `--resume
+    <claude_session_id>` -- resend the same prompt, and succeed on the
+    second (fresh) backend, all without the caller seeing any error."""
+    dead_backend = FakePtyBackend(["the process dies before the marker\n"], eof_after=True)
+    healthy_backend = FakePtyBackend([f"all good now\n{TURN_COMPLETE_MARKER}\n"])
+    factory, calls = _sequenced_factory([dead_backend, healthy_backend])
+
+    engine = PtyEngine(pty_factory=factory)
+    session_id = engine.claude_session_id
+
+    events = run(_collect(engine.stream_turn("what is 2+2?")))
+
+    # Exactly two spawns: the original, and the one restart.
+    assert len(calls) == 2
+
+    # First spawn was fresh (no prior resume requested).
+    assert "--session-id" in calls[0]["argv"]
+    idx = calls[0]["argv"].index("--session-id")
+    assert calls[0]["argv"][idx + 1] == session_id
+
+    # The restart respawn reattaches via --resume with the SAME session id,
+    # even though the original spawn used --session-id, not --resume.
+    assert "--resume" in calls[1]["argv"]
+    idx = calls[1]["argv"].index("--resume")
+    assert calls[1]["argv"][idx + 1] == session_id
+
+    # The same prompt was written to both backends (retry resends it).
+    assert dead_backend.writes == ["what is 2+2?\r"]
+    assert healthy_backend.writes == ["what is 2+2?\r"]
+
+    # Caller sees a perfectly normal, successful turn -- no error surfaced.
+    assert events[0]["type"] == "system"
+    assert events[-1]["type"] == "result"
+    assert events[-1]["is_error"] is False
+    assert "all good now" in events[-1]["result"]
+    assert events[-1]["session_id"] == session_id
+
+
+def test_restart_respawn_resumes_even_when_original_spawn_was_already_a_resume():
+    """Covers the "Baton itself restarted mid-phase" scenario: a fresh
+    `PtyEngine` constructed with `resume_session_id=` for a conversation
+    whose original process is already gone dies on its very first turn
+    through this instance, and must still retry via --resume (not give up
+    just because the *first* attempt was already a resume)."""
+    dead_backend = FakePtyBackend([], eof_after=True)
+    healthy_backend = FakePtyBackend([f"back online\n{TURN_COMPLETE_MARKER}\n"])
+    factory, calls = _sequenced_factory([dead_backend, healthy_backend])
+
+    engine = PtyEngine(resume_session_id="orphaned-session-456", pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("continue")))
+
+    assert len(calls) == 2
+    for call in calls:
+        assert "--resume" in call["argv"]
+        idx = call["argv"].index("--resume")
+        assert call["argv"][idx + 1] == "orphaned-session-456"
+
+    assert events[-1]["is_error"] is False
+    assert "back online" in events[-1]["result"]
+
+
+def test_stream_turn_gives_up_after_one_failed_restart_with_a_distinguishable_error():
+    """Both the original AND the restarted backend die -- the engine must
+    give up after exactly one restart attempt (not retry indefinitely) and
+    raise the distinguishable `PtyEngineUnrecoverableError` subclass, per
+    the failure shape documented in pty_engine.py for a future caller to
+    route into the blocked-card flow."""
+    first_dead = FakePtyBackend(["dying...\n"], eof_after=True)
+    second_dead = FakePtyBackend(["dying again...\n"], eof_after=True)
+    factory, calls = _sequenced_factory([first_dead, second_dead])
+
+    engine = PtyEngine(pty_factory=factory)
+    session_id = engine.claude_session_id
+
+    with pytest.raises(PtyEngineUnrecoverableError) as excinfo:
+        run(_collect(engine.stream_turn("go")))
+
+    # Exactly one restart attempt: two spawns total, never a third.
+    assert len(calls) == 2
+    assert excinfo.value.claude_session_id == session_id
+    # It's still a PtyEngineError for any caller only checking the base class.
+    assert isinstance(excinfo.value, PtyEngineError)
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform backend selection (issue #85)
+# ---------------------------------------------------------------------------
+
+
+def test_default_pty_factory_picks_winpty_backend_on_windows(monkeypatch):
+    monkeypatch.setattr(pty_engine.platform, "system", lambda: "Windows")
+
+    assert pty_engine._default_pty_factory() is pty_engine._spawn_winpty
+
+
+def test_default_pty_factory_picks_unix_backend_on_linux(monkeypatch):
+    monkeypatch.setattr(pty_engine.platform, "system", lambda: "Linux")
+
+    assert pty_engine._default_pty_factory() is pty_engine._spawn_unix_pty
+
+
+def test_default_pty_factory_picks_unix_backend_on_macos(monkeypatch):
+    monkeypatch.setattr(pty_engine.platform, "system", lambda: "Darwin")
+
+    assert pty_engine._default_pty_factory() is pty_engine._spawn_unix_pty
+
+
+def test_engine_uses_platform_selected_factory_when_none_is_injected(monkeypatch):
+    """`PtyEngine()` with no explicit `pty_factory` should resolve to
+    whatever `_default_pty_factory()` selects for the current platform,
+    without the caller having to know or care which OS it's running on."""
+    sentinel_backend = FakePtyBackend([])
+
+    def fake_unix_factory(argv, *, cwd, env):
+        return sentinel_backend
+
+    monkeypatch.setattr(pty_engine.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(pty_engine, "_spawn_unix_pty", fake_unix_factory)
+    monkeypatch.setattr(pty_engine, "_spawn_winpty", None)  # must not be used
+
+    engine = PtyEngine()
+    engine.start()
+
+    assert engine._proc is sentinel_backend
+
+
+def test_spawn_unix_pty_uses_ptyprocess_unicode_spawn(monkeypatch):
+    """`_spawn_unix_pty` should be a thin adapter over
+    `ptyprocess.PtyProcessUnicode.spawn`, imported lazily (so importing
+    `pty_engine` never requires `ptyprocess` to be installed on Windows).
+    A fake `ptyprocess` module is injected into `sys.modules` so this runs
+    without the real (Unix-only) dependency installed."""
+    import sys
+    import types
+
+    calls = {}
+
+    class FakePtyProcessUnicode:
+        @classmethod
+        def spawn(cls, argv, cwd=None, env=None):
+            calls["argv"] = argv
+            calls["cwd"] = cwd
+            calls["env"] = env
+            return FakePtyBackend([])
+
+    fake_module = types.SimpleNamespace(PtyProcessUnicode=FakePtyProcessUnicode)
+    monkeypatch.setitem(sys.modules, "ptyprocess", fake_module)
+
+    backend = pty_engine._spawn_unix_pty(["claude", "--foo"], cwd="/tmp", env={"A": "B"})
+
+    assert calls["argv"] == ["claude", "--foo"]
+    assert calls["cwd"] == "/tmp"
+    assert calls["env"] == {"A": "B"}
+    assert isinstance(backend, FakePtyBackend)
+
+
+def test_unix_pty_backend_conforms_to_pty_backend_protocol_surface():
+    """A backend produced by `_spawn_unix_pty` (real or faked) only needs
+    to support write/read/isalive/terminate to satisfy `PtyBackend` --
+    verify a stand-in shaped like `ptyprocess.PtyProcessUnicode` round-trips
+    through `PtyEngine` exactly like the Windows fake does."""
+    backend = FakePtyBackend([f"hi from unix\n{TURN_COMPLETE_MARKER}\n"])
+
+    def factory(argv, *, cwd, env):
+        return backend
+
+    engine = PtyEngine(pty_factory=factory)
+    events = run(_collect(engine.stream_turn("hello")))
+
+    assert "hi from unix" in events[-1]["result"]
+    assert backend.writes == ["hello\r"]
+
+
+# ---------------------------------------------------------------------------
+# close()
+# ---------------------------------------------------------------------------
+
+
+def test_close_terminates_a_live_process():
+    backend = FakePtyBackend([], eof_after=False)
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+    engine.start()
+
+    engine.close()
+
+    assert backend.terminated is True
+
+
+def test_close_is_a_noop_when_never_started():
+    engine = PtyEngine(pty_factory=lambda *a, **kw: FakePtyBackend([]))
+    engine.close()  # must not raise
