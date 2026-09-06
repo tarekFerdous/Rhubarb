@@ -1,4 +1,4 @@
-from baton.qa_parser import parse_grilling_response
+from rhubarb.qa_parser import parse_grilling_response
 
 
 def test_question_with_explicit_options_list():

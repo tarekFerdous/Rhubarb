@@ -10,12 +10,12 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from baton import afk_loop, db, live_stream, session_runner
-from baton.cli_client import ClaudeCLIError, get_auth_status
-from baton.folder_picker import pick_folder
-from baton.prd_list import compute_prd_list
-from baton.projects import scan_projects
-from baton.terminal import open_terminal_running
+from rhubarb import afk_loop, db, live_stream, session_runner
+from rhubarb.cli_client import ClaudeCLIError, get_auth_status
+from rhubarb.folder_picker import pick_folder
+from rhubarb.prd_list import compute_prd_list
+from rhubarb.projects import scan_projects
+from rhubarb.terminal import open_terminal_running
 
 BASE_DIR = Path(__file__).parent
 
@@ -42,7 +42,7 @@ app = FastAPI(lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
 
-# Active project is process-global: Baton is a local, single-user desktop-
+# Active project is process-global: Rhubarb is a local, single-user desktop-
 # oriented app (one browser tab talking to one backend process), not a
 # multi-tenant server, so there's exactly one "current project" at a time.
 _active_project_id: int | None = None

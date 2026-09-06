@@ -1,6 +1,0 @@
-{
-  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
-  "name": "baton",
-  "version": "0.1.0",
-  "description": "Baton's private skill set for automated /do, /implement, and /qa runs -- isolated from the user's global skills."
-}

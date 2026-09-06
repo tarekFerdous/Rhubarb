@@ -2,7 +2,7 @@
 implemented" card.
 
 Pure data transform -- no `gh`/subprocess calls here. The caller fetches two
-already-open-issue-scoped lists (see `baton.web.app`'s endpoint) and this
+already-open-issue-scoped lists (see `rhubarb.web.app`'s endpoint) and this
 module turns them into the sorted `{number, title, blocked}` shape the
 frontend renders as `PRD: N` buttons.
 """

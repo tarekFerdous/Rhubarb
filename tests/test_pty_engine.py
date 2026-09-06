@@ -3,8 +3,8 @@ import re
 
 import pytest
 
-from baton import pty_engine
-from baton.pty_engine import (
+from rhubarb import pty_engine
+from rhubarb.pty_engine import (
     TURN_COMPLETE_MARKER,
     PtyEngine,
     PtyEngineError,
@@ -212,7 +212,7 @@ def test_stream_turn_stops_reading_as_soon_as_marker_appears_across_chunks():
     backend = FakePtyBackend(
         [
             "Working on it...\n",
-            "Here is the answer: 4\n<<<BATON_TURN_",
+            "Here is the answer: 4\n<<<RHUBARB_TURN_",
             "COMPLETE>>>\n",
             "SOMETHING THAT SHOULD NEVER BE READ",
         ]
@@ -254,7 +254,7 @@ def test_stream_turn_yields_terminal_output_events_for_every_raw_chunk_before_re
 
 
 def test_stream_turn_passes_through_fenced_json_marker_blocks_unmodified():
-    """Baton's existing markers (implement_blocked, qa_grilling -- see
+    """Rhubarb's existing markers (implement_blocked, qa_grilling -- see
     session_runner._parse_implement_blocked_block/_parse_qa_grilling_block)
     must survive unmangled inside the captured turn text; this engine only
     ever looks for its own completion marker."""
@@ -344,7 +344,7 @@ def test_stream_turn_restarts_once_and_retries_the_same_prompt_after_a_mid_turn_
 
 
 def test_restart_respawn_resumes_even_when_original_spawn_was_already_a_resume():
-    """Covers the "Baton itself restarted mid-phase" scenario: a fresh
+    """Covers the "Rhubarb itself restarted mid-phase" scenario: a fresh
     `PtyEngine` constructed with `resume_session_id=` for a conversation
     whose original process is already gone dies on its very first turn
     through this instance, and must still retry via --resume (not give up

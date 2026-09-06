@@ -2,7 +2,7 @@ import subprocess
 
 import pytest
 
-from baton.projects import get_current_branch, has_github_remote, scan_projects
+from rhubarb.projects import get_current_branch, has_github_remote, scan_projects
 
 
 def _init_repo(path, remote_url=None):

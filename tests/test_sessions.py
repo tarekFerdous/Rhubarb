@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-from baton import db, live_stream, session_runner
-from baton.cli_client import ClaudeCLIError
-from baton.github_publisher import GithubPublishError
-from baton.pty_engine import PtyEngineUnrecoverableError
+from rhubarb import db, live_stream, session_runner
+from rhubarb.cli_client import ClaudeCLIError
+from rhubarb.github_publisher import GithubPublishError
+from rhubarb.pty_engine import PtyEngineUnrecoverableError
 
 
 def _init_repo(path, remote_url):
@@ -230,9 +230,9 @@ def test_two_sessions_advance_concurrently_without_cross_contamination(client, t
     row_b = db.create_session(conn, project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/baton:do feature A":
+        if prompt == "/rhubarb:do feature A":
             return iter([_result_event("❓ **Q1** - **Scope**: Question A?", session_id="sA")])
-        if prompt == "/baton:do feature B":
+        if prompt == "/rhubarb:do feature B":
             return iter([_result_event("❓ **Q1** - **Scope**: Question B?", session_id="sB")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
@@ -286,9 +286,9 @@ def test_no_cap_on_the_number_of_sessions_running_at_once(client, tmp_path, monk
 
     for i, row_id in enumerate(row_ids):
         row = db.get_session(conn, row_id)
-        assert row["claude_session_id"] == f"/baton:do feature {i}"
+        assert row["claude_session_id"] == f"/rhubarb:do feature {i}"
         interview = json.loads(row["interview_json"])
-        assert interview["sections"][0]["questions"][0]["text"] == f"/baton:do feature {i}?"
+        assert interview["sections"][0]["questions"][0]["text"] == f"/rhubarb:do feature {i}?"
 
 
 def test_start_session_job_returns_card_with_grilling_questions(client, tmp_path, monkeypatch):
@@ -327,7 +327,7 @@ def test_start_session_job_returns_card_with_grilling_questions(client, tmp_path
 
 
 def test_start_session_job_publishes_interview_even_with_no_structured_questions(client, tmp_path, monkeypatch):
-    """A real /baton:do turn can reply with plain prose (no bullet/heading
+    """A real /rhubarb:do turn can reply with plain prose (no bullet/heading
     questions qa_parser recognizes as structured). The left card must still
     render that turn -- it must not look like nothing happened."""
     project_id = _open_project(client, tmp_path, "proj")
@@ -357,9 +357,9 @@ def test_continue_session_job_with_remaining_questions_does_not_auto_advance(cli
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt in ("/baton:to-prd", "/baton:to-issues"):
+        if prompt in ("/rhubarb:to-prd", "/rhubarb:to-issues"):
             raise AssertionError(f"chain must not run without confirm_advance, got {prompt!r}")
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: First question?")])
         return iter([_result_event("❓ **Q1** - **Scope**: A follow-up question?")])
 
@@ -383,14 +383,14 @@ def test_continue_session_job_with_remaining_questions_does_not_auto_advance(cli
 def test_continue_session_job_with_no_more_questions_does_not_auto_advance(client, tmp_path, monkeypatch):
     """Issue #33: a reply that comes back with zero remaining questions must
     stay in grilling and publish the wrap-up turn -- it must NOT silently
-    fire /baton:to-prd on its own anymore."""
+    fire /rhubarb:to-prd on its own anymore."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt in ("/baton:to-prd", "/baton:to-issues"):
+        if prompt in ("/rhubarb:to-prd", "/rhubarb:to-issues"):
             raise AssertionError(f"chain must not run without confirm_advance, got {prompt!r}")
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: First question?")])
         return iter([_result_event("Thanks, that's everything I need.")])
 
@@ -417,10 +417,10 @@ def test_continue_session_job_with_no_more_questions_does_not_auto_advance(clien
 
 def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, tmp_path, monkeypatch):
     """Issue #33: the explicit "Yes, proceed" path (confirm_advance=True)
-    must go straight to /baton:to-prd -> /baton:to-issues -> details, resuming the
+    must go straight to /rhubarb:to-prd -> /rhubarb:to-issues -> details, resuming the
     session's existing claude_session_id, WITHOUT sending another grilling
     CLI turn first. Since #75, `details` auto-continues straight into
-    /baton:implement -- this test's handler covers that turn too and asserts
+    /rhubarb:implement -- this test's handler covers that turn too and asserts
     the chain lands on `implemented`, not `details`."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
@@ -428,14 +428,14 @@ def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, 
     seen_prompts = []
 
     def handler(prompt, **kw):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         seen_prompts.append(prompt)
-        if prompt == "/baton:to-prd":
+        if prompt == "/rhubarb:to-prd":
             return iter([_result_event("Wrote PRD draft.")])
-        if prompt == "/baton:to-issues":
+        if prompt == "/rhubarb:to-issues":
             return iter([_result_event("Wrote issues draft.")])
-        if prompt == "/baton:implement prd: 5":
+        if prompt == "/rhubarb:implement prd: 5":
             return iter([_result_event("Implemented.")])
         raise AssertionError(f"unexpected grilling-style prompt {prompt!r} during confirm_advance")
 
@@ -452,7 +452,7 @@ def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, 
 
     # The two chain prompts ran, followed by the auto-continued implement
     # turn -- no grilling reply was ever sent.
-    assert seen_prompts == ["/baton:to-prd", "/baton:to-issues", "/baton:implement prd: 5"]
+    assert seen_prompts == ["/rhubarb:to-prd", "/rhubarb:to-issues", "/rhubarb:implement prd: 5"]
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "implemented"
@@ -514,7 +514,7 @@ def test_start_implement_job_passes_the_model_the_session_was_launched_with(clie
 
 
 def test_chain_steps_use_the_model_the_session_was_created_with(client, tmp_path, monkeypatch):
-    """/baton:to-prd and /baton:to-issues (run via advance_past_grilling) must be
+    """/rhubarb:to-prd and /rhubarb:to-issues (run via advance_past_grilling) must be
     invoked with the same model the session's grilling turn used, not
     whatever `settings.model` currently is."""
     project_id = _open_project(client, tmp_path, "proj")
@@ -526,12 +526,12 @@ def test_chain_steps_use_the_model_the_session_was_created_with(client, tmp_path
     seen_models = []
 
     def handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("- Only question?")])
         seen_models.append((prompt, model))
-        if prompt == "/baton:to-prd":
+        if prompt == "/rhubarb:to-prd":
             return iter([_result_event("PRD #5: My PRD")])
-        if prompt == "/baton:to-issues":
+        if prompt == "/rhubarb:to-issues":
             return iter([_result_event("Issue #6: Child one")])
         return iter([_result_event("Thanks, that's everything I need.")])
 
@@ -544,8 +544,8 @@ def test_chain_steps_use_the_model_the_session_was_created_with(client, tmp_path
 
     assert seen_models == [
         ("all good", "claude-opus-4-8"),
-        ("/baton:to-prd", "claude-opus-4-8"),
-        ("/baton:to-issues", "claude-opus-4-8"),
+        ("/rhubarb:to-prd", "claude-opus-4-8"),
+        ("/rhubarb:to-issues", "claude-opus-4-8"),
     ]
 
 
@@ -561,7 +561,7 @@ def test_in_flight_session_keeps_its_original_model_after_setting_changes_mid_se
     seen_models = []
 
     def handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("- First question?")])
         seen_models.append(model)
         return iter([_result_event("Thanks, that's everything I need.")])
@@ -593,11 +593,11 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: First question?")])
-        if prompt == "/baton:to-prd":
+        if prompt == "/rhubarb:to-prd":
             return iter([_result_event("Wrote PRD draft.")])
-        if prompt == "/baton:to-issues":
+        if prompt == "/rhubarb:to-issues":
             return iter([_result_event("Wrote issues draft.")])
         # the grilling reply itself: no more bullet/heading questions -> grilling is done
         return iter([_result_event("Thanks, that's everything I need.")])
@@ -620,7 +620,7 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
     assert row["phase"] == "grilling"
 
     # Explicit "Yes, proceed" is what actually advances the chain -- since
-    # #75, straight through into an auto-continued /baton:implement turn too
+    # #75, straight through into an auto-continued /rhubarb:implement turn too
     # (this test's fallback branch answers that prompt the same generic way).
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
@@ -651,14 +651,14 @@ def test_confirm_advance_runs_publishing_phase_with_no_extra_cli_calls(client, t
     seen_prompts = []
 
     def handler(prompt, **kw):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         seen_prompts.append(prompt)
-        if prompt == "/baton:to-prd":
+        if prompt == "/rhubarb:to-prd":
             return iter([_result_event("Wrote PRD draft.")])
-        if prompt == "/baton:to-issues":
+        if prompt == "/rhubarb:to-issues":
             return iter([_result_event("Wrote issues draft.")])
-        if prompt == "/baton:implement prd: 5":
+        if prompt == "/rhubarb:implement prd: 5":
             return iter([_result_event("Implemented.")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
@@ -677,9 +677,9 @@ def test_confirm_advance_runs_publishing_phase_with_no_extra_cli_calls(client, t
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
-    # /baton:to-prd, /baton:to-issues, and the auto-continued implement turn
+    # /rhubarb:to-prd, /rhubarb:to-issues, and the auto-continued implement turn
     # went through the Claude CLI -- publishing did not.
-    assert seen_prompts == ["/baton:to-prd", "/baton:to-issues", "/baton:implement prd: 5"]
+    assert seen_prompts == ["/rhubarb:to-prd", "/rhubarb:to-issues", "/rhubarb:implement prd: 5"]
     assert len(seen_publish_calls) == 1
 
     row = db.get_session(conn, row_id)
@@ -708,11 +708,11 @@ def test_publish_draft_failure_stops_chain_with_error_turn(client, tmp_path, mon
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-        if prompt == "/baton:to-prd":
+        if prompt == "/rhubarb:to-prd":
             return iter([_result_event("Wrote PRD draft.")])
-        if prompt == "/baton:to-issues":
+        if prompt == "/rhubarb:to-issues":
             return iter([_result_event("Wrote issues draft.")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
@@ -751,7 +751,7 @@ def test_retry_on_publishing_phase_reruns_publisher_and_completes(client, tmp_pa
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         return iter([_result_event("draft written")])
 
@@ -833,9 +833,9 @@ def test_to_prd_claude_cli_error_never_sets_needs_github_login(client, tmp_path,
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-        if prompt == "/baton:to-prd":
+        if prompt == "/rhubarb:to-prd":
             raise ClaudeCLIError("gh: not logged in, run `gh auth login`")
         return iter([_result_event("Thanks, that's everything I need.")])
 
@@ -864,14 +864,14 @@ def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypa
     attempt = {"n": 0}
 
     def handler(prompt, **kw):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-        if prompt == "/baton:to-prd":
+        if prompt == "/rhubarb:to-prd":
             attempt["n"] += 1
             if attempt["n"] == 1:
                 raise ClaudeCLIError("not logged in")
             return iter([_result_event("Wrote PRD draft.")])
-        if prompt == "/baton:to-issues":
+        if prompt == "/rhubarb:to-issues":
             return iter([_result_event("Wrote issues draft.")])
         return iter([_result_event("done")])
 
@@ -987,14 +987,14 @@ def test_retry_on_creating_prd_phase_is_unaffected_by_implement_branch(client, t
     attempt = {"n": 0}
 
     def handler(prompt, **kw):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-        if prompt == "/baton:to-prd":
+        if prompt == "/rhubarb:to-prd":
             attempt["n"] += 1
             if attempt["n"] == 1:
                 raise ClaudeCLIError("not logged in")
             return iter([_result_event("Wrote PRD draft.")])
-        if prompt == "/baton:to-issues":
+        if prompt == "/rhubarb:to-issues":
             return iter([_result_event("Wrote issues draft.")])
         return iter([_result_event("done")])
 
@@ -1249,7 +1249,7 @@ def test_serial_mode_queues_second_prd_and_drains_it_when_first_finishes(client,
     db.set_parallel_implementation(conn, False)
 
     def handler(prompt, **kw):
-        if prompt == "/baton:implement prd: 6":
+        if prompt == "/rhubarb:implement prd: 6":
             return iter([_result_event("Implemented PRD #6", session_id="impl-b")])
         return iter([_result_event("Implemented PRD #5", session_id="impl-a")])
 
@@ -1298,9 +1298,9 @@ def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch)
     cwd_a = _cwd_for(project_a)
 
     def handler(prompt, **kw):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-        if prompt in ("/baton:to-prd", "/baton:to-issues"):
+        if prompt in ("/rhubarb:to-prd", "/rhubarb:to-issues"):
             return iter([_result_event("wrote draft")])
         return iter([_result_event("done")])
 
@@ -1598,7 +1598,7 @@ def test_continue_qa_job_does_not_recycle_a_high_usage_finished_session(client, 
 
 def test_parse_qa_grilling_block_extracts_json_from_code_fence(client, tmp_path):
     """_parse_qa_grilling_block must find and return the qa_grilling JSON block."""
-    from baton.session_runner import _parse_qa_grilling_block
+    from rhubarb.session_runner import _parse_qa_grilling_block
 
     text = "Some preamble\n\n" + _QA_BLOCK + "\n\nSome trailing text"
     result = _parse_qa_grilling_block(text)
@@ -1610,7 +1610,7 @@ def test_parse_qa_grilling_block_extracts_json_from_code_fence(client, tmp_path)
 
 def test_parse_qa_grilling_block_returns_none_for_plain_text(client, tmp_path):
     """_parse_qa_grilling_block must return None when no qa_grilling block is present."""
-    from baton.session_runner import _parse_qa_grilling_block
+    from rhubarb.session_runner import _parse_qa_grilling_block
 
     assert _parse_qa_grilling_block("Implemented PRD #5") is None
     assert _parse_qa_grilling_block("") is None
@@ -1619,7 +1619,7 @@ def test_parse_qa_grilling_block_returns_none_for_plain_text(client, tmp_path):
 
 def test_parse_implement_blocked_block_extracts_json_from_code_fence():
     """_parse_implement_blocked_block must find and return the implement_blocked JSON block."""
-    from baton.session_runner import _parse_implement_blocked_block
+    from rhubarb.session_runner import _parse_implement_blocked_block
 
     result = _parse_implement_blocked_block(_IMPLEMENT_BLOCKED_BLOCK)
     assert result is not None
@@ -1629,7 +1629,7 @@ def test_parse_implement_blocked_block_extracts_json_from_code_fence():
 
 
 def test_parse_implement_blocked_block_extracts_bare_json():
-    from baton.session_runner import _parse_implement_blocked_block
+    from rhubarb.session_runner import _parse_implement_blocked_block
 
     bare = json.dumps({"phase": "implement_blocked", "issue": None, "question": "Which one?", "context": "ambiguous"})
     result = _parse_implement_blocked_block(bare)
@@ -1638,7 +1638,7 @@ def test_parse_implement_blocked_block_extracts_bare_json():
 
 
 def test_parse_implement_blocked_block_returns_none_for_plain_text():
-    from baton.session_runner import _parse_implement_blocked_block
+    from rhubarb.session_runner import _parse_implement_blocked_block
 
     assert _parse_implement_blocked_block("Implemented PRD #5") is None
     assert _parse_implement_blocked_block("") is None
@@ -1746,7 +1746,7 @@ def test_engine_is_constructed_once_and_reused_across_turns_in_the_same_phase(cl
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: First question?")])
         return iter([_result_event("❓ **Q1** - **Scope**: Follow-up?")])
 
@@ -2099,11 +2099,11 @@ def test_finish_chain_publishes_minimize_before_the_implementing_phase(client, t
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-        if prompt == "/baton:to-prd":
+        if prompt == "/rhubarb:to-prd":
             return iter([_result_event("Wrote PRD draft.")])
-        if prompt == "/baton:to-issues":
+        if prompt == "/rhubarb:to-issues":
             return iter([_result_event("Wrote issues draft.")])
         return iter([_result_event("Implemented.")])
 
@@ -2130,17 +2130,17 @@ def test_finish_chain_publishes_minimize_before_the_implementing_phase(client, t
 
 def test_finish_chain_falls_back_to_pooling_when_no_prd_was_parsed(client, tmp_path, monkeypatch):
     """If parse_details comes up with no PRD number (e.g. an unexpected
-    /baton:to-issues result shape), the session must not get stuck --
+    /rhubarb:to-issues result shape), the session must not get stuck --
     it falls back to the old clear-and-pool-immediately behavior."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/baton:do a feature":
+        if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-        if prompt == "/baton:to-prd":
+        if prompt == "/rhubarb:to-prd":
             return iter([_result_event("Wrote PRD draft.")])
-        if prompt == "/baton:to-issues":
+        if prompt == "/rhubarb:to-issues":
             return iter([_result_event("no PRD/issue numbers in here at all")])
         raise AssertionError(f"unexpected prompt {prompt!r} -- must not auto-continue without a PRD")
 

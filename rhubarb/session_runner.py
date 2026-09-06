@@ -1,5 +1,5 @@
 """Per-session background jobs: run CLI turns off the event loop thread and
-stream their translated output live via `baton.live_stream`.
+stream their translated output live via `rhubarb.live_stream`.
 
 Each job publishes app-level events for a session's card_id: `phase` at the
 start of each step, `text`/`action`/`usage` as a turn streams, a richer
@@ -20,13 +20,13 @@ from pathlib import Path
 
 _FENCED_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```")
 
-from baton import db
-from baton.cli_client import ClaudeCLIError
-from baton.github_publisher import GithubPublishError, publish_draft
-from baton.live_stream import publish
-from baton.pty_engine import PtyEngine, PtyEngineUnrecoverableError
-from baton.qa_parser import parse_grilling_response
-from baton.stream_translate import translate_event
+from rhubarb import db
+from rhubarb.cli_client import ClaudeCLIError
+from rhubarb.github_publisher import GithubPublishError, publish_draft
+from rhubarb.live_stream import publish
+from rhubarb.pty_engine import PtyEngine, PtyEngineUnrecoverableError
+from rhubarb.qa_parser import parse_grilling_response
+from rhubarb.stream_translate import translate_event
 
 # The old broad pattern (`auth|login|not logged in|permission denied|401|403`)
 # matched any Claude CLI failure that happened to contain one of those common
@@ -50,7 +50,7 @@ _DETAIL_RE = re.compile(r"\b(PRD|Issue)\s*#(\d+)\s*[:\-]\s*(.+)", re.IGNORECASE)
 # against the relevant cutoff below and starts a fresh PtyEngine first if
 # it's over. Both are pre-phase gates only -- a phase already running is
 # never interrupted even if it crosses its cutoff while in flight.
-# Placeholders pending real /baton:implement and /baton:qa context-growth
+# Placeholders pending real /rhubarb:implement and /rhubarb:qa context-growth
 # telemetry (this repo's own measurements only ever covered the /do chain)
 # -- expect these to move.
 #
@@ -68,7 +68,7 @@ _DETAIL_RE = re.compile(r"\b(PRD|Issue)\s*#(\d+)\s*[:\-]\s*(.+)", re.IGNORECASE)
 _DO_TO_IMPLEMENT_CONTEXT_CUTOFF = 0.40
 _IMPLEMENT_TO_QA_CONTEXT_CUTOFF = 0.68
 
-# A session that just finished /baton:qa (closed its issues/PRD) is only
+# A session that just finished /rhubarb:qa (closed its issues/PRD) is only
 # fully closed if its context usage is over this -- under it, it's marked
 # available for reuse instead (`db.claim_available_session` picks it up for
 # the next fresh /do session on the left card, warm cache and all) rather
@@ -123,7 +123,7 @@ def _get_or_create_engine(
 ) -> PtyEngine:
     """Return this card's resident tab, constructing and starting one (fresh,
     or reattached via `--resume resume_session_id` -- e.g. a reused pooled
-    session, or a session picked back up after a Baton restart) if this is
+    session, or a session picked back up after a Rhubarb restart) if this is
     the first turn for this `card_id`. Every later turn for the same
     `card_id` reuses the exact same `PtyEngine` instance -- never recreated
     per turn."""
@@ -152,7 +152,7 @@ def open_pty_tab_count() -> int:
     one per `card_id` with a live entry in `_pty_engines`, across every
     active session regardless of phase. Backs the web UI's tab-count
     indicator next to the "Sessions" label (`GET /api/pty-tabs/count` in
-    `baton/web/app.py`); polled rather than pushed since it's a global
+    `rhubarb/web/app.py`); polled rather than pushed since it's a global
     count, not scoped to any one card's SSE stream."""
     return len(_pty_engines)
 
@@ -173,8 +173,8 @@ def _spawn_fresh_engine(*, cwd: str | None, model: str | None, effort: str | Non
 
 async def _maybe_clear_for_next_phase(card_id: int, conn, row, *, cwd: str | None, cutoff: float) -> str:
     """The context-window budget gate: called right before starting the next
-    phase in a session chain (currently `/baton:do` -> `/baton:implement` at
-    `_DO_TO_IMPLEMENT_CONTEXT_CUTOFF`, `/baton:implement` -> `/baton:qa` at
+    phase in a session chain (currently `/rhubarb:do` -> `/rhubarb:implement` at
+    `_DO_TO_IMPLEMENT_CONTEXT_CUTOFF`, `/rhubarb:implement` -> `/rhubarb:qa` at
     `_IMPLEMENT_TO_QA_CONTEXT_CUTOFF` -- wired in by whichever caller is
     orchestrating that transition).
 
@@ -529,11 +529,11 @@ async def _run_publish_step(card_id: int, conn, row, *, cwd: str | None) -> bool
 
 
 async def _finish_chain(card_id: int, conn, claude_session_id: str, cwd: str | None) -> None:
-    """`/baton:do` just reached `details` (PRD + issues published). Publishes
+    """`/rhubarb:do` just reached `details` (PRD + issues published). Publishes
     the `details` turn event, then hands off to `_auto_continue_implement_and_qa`
     instead of the old immediate `/clear`-and-pool -- that function decides
     whether to continue in this same tab or start a fresh one (the
-    context-window budget gate), and starts `/baton:implement` automatically."""
+    context-window budget gate), and starts `/rhubarb:implement` automatically."""
     row = db.get_session(conn, card_id)
     details = parse_details(row["console_text"])
     db.update_session(
@@ -546,7 +546,7 @@ async def _finish_chain(card_id: int, conn, claude_session_id: str, cwd: str | N
 
 
 async def _auto_continue_implement_and_qa(card_id: int, conn, cwd: str | None) -> None:
-    """Continue a session past `details` straight into `/baton:implement`
+    """Continue a session past `details` straight into `/rhubarb:implement`
     (and, if that phase's own Phase 5 hands off to `/qa`, into that too --
     already-automatic today via `_parse_qa_grilling_block`/`start_qa_job`,
     unchanged here) instead of pooling the session for a later manual PRD
@@ -560,7 +560,7 @@ async def _auto_continue_implement_and_qa(card_id: int, conn, cwd: str | None) -
 
     Unlike the old subprocess-per-turn model, this card's resident tab (see
     `_pty_engines`) is left running across this transition when a PRD was
-    found -- `/baton:implement` continues in the exact same tab as the /do
+    found -- `/rhubarb:implement` continues in the exact same tab as the /do
     chain that led here, just under a new `session_type`/`phase` on the row;
     only the context-window budget gate (`_maybe_clear_for_next_phase`) ever
     tears it down and starts fresh, same as for any other phase transition.
@@ -602,14 +602,14 @@ async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
     model = row["model"]
     effort = row["effort"]
     ok, _ = await _run_chain_step(
-        card_id, conn, row, phase="creating_prd", prompt="/baton:to-prd", cwd=cwd, model=model, effort=effort
+        card_id, conn, row, phase="creating_prd", prompt="/rhubarb:to-prd", cwd=cwd, model=model, effort=effort
     )
     if not ok:
         return
 
     row = db.get_session(conn, card_id)
     ok, claude_session_id = await _run_chain_step(
-        card_id, conn, row, phase="creating_issues", prompt="/baton:to-issues", cwd=cwd, model=model, effort=effort
+        card_id, conn, row, phase="creating_issues", prompt="/rhubarb:to-issues", cwd=cwd, model=model, effort=effort
     )
     if not ok:
         return
@@ -639,7 +639,7 @@ async def start_session_job(card_id: int, prompt: str, *, cwd: str | None) -> No
     model = db.get_model(conn)
     row = db.get_session(conn, card_id)
     await _run_grilling_turn(
-        card_id, conn, row, f"/baton:do {prompt}", cwd=cwd, model=model, effort=row["effort"], publish_when_empty=True
+        card_id, conn, row, f"/rhubarb:do {prompt}", cwd=cwd, model=model, effort=row["effort"], publish_when_empty=True
     )
 
 
@@ -693,7 +693,7 @@ def _parse_qa_grilling_block(text: str) -> dict | None:
 
 def _parse_implement_blocked_block(text: str) -> dict | None:
     """Extract the first JSON code block with phase=='implement_blocked' from
-    a CLI turn result, as emitted by /baton:implement when it genuinely
+    a CLI turn result, as emitted by /rhubarb:implement when it genuinely
     cannot proceed without user-only information (see the skill's top-level
     "never pause to ask" directive). Returns None for the normal,
     not-blocked case -- structurally identical to `_parse_qa_grilling_block`."""
@@ -820,7 +820,7 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
     try:
         turn = await _run_turn(
             card_id,
-            f"/baton:implement prd: {prd_number}",
+            f"/rhubarb:implement prd: {prd_number}",
             session_id=row["claude_session_id"],
             cwd=cwd,
             model=model,
@@ -1052,7 +1052,7 @@ async def retry_session_job(card_id: int, cwd: str | None) -> None:
             conn,
             row,
             phase="creating_issues",
-            prompt="/baton:to-issues",
+            prompt="/rhubarb:to-issues",
             cwd=cwd,
             model=row["model"],
             effort=row["effort"],

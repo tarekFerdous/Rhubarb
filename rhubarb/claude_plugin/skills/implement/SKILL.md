@@ -1,9 +1,9 @@
 ---
 name: implement
-description: Pick a PRD from open GitHub issues, implement its child issues one at a time in this session, run tests, write a tracker file, then clear. Hand off to /baton:qa to finish.
+description: Pick a PRD from open GitHub issues, implement its child issues one at a time in this session, run tests, write a tracker file, then clear. Hand off to /rhubarb:qa to finish.
 ---
 
-# /baton:implement — Implementation Workflow
+# /rhubarb:implement — Implementation Workflow
 
 Execute implementation and testing for a chosen PRD. Follow each phase in order without skipping.
 
@@ -15,15 +15,15 @@ If you genuinely cannot proceed without information only the user has — not "w
 {"phase": "implement_blocked", "issue": <number-or-null>, "question": "<the question>", "context": "<why it's blocked>"}
 ```
 
-Baton detects this marker and hands your question to the user through the app UI; your next turn will carry their reply as a normal message, resuming from here. Do not use this for anything a reasonable default would resolve — it exists for the rare case, not as a routine checkpoint.
+Rhubarb detects this marker and hands your question to the user through the app UI; your next turn will carry their reply as a normal message, resuming from here. Do not use this for anything a reasonable default would resolve — it exists for the rare case, not as a routine checkpoint.
 
 ---
 
 ## Phase 1 — PRD Selection
 
-If the invocation already specifies `prd: <N>` (e.g. `/baton:implement prd: 34`), skip this entire phase — no `gh issue list` fetch, no table, no pause — and go straight to Phase 2 using PRD issue N as the selected PRD.
+If the invocation already specifies `prd: <N>` (e.g. `/rhubarb:implement prd: 34`), skip this entire phase — no `gh issue list` fetch, no table, no pause — and go straight to Phase 2 using PRD issue N as the selected PRD.
 
-Otherwise: if a PRD was already created earlier in this same conversation (e.g. via `/baton:do`), use that PRD's issue number directly and go straight to Phase 2 — it's already in your context, no need to ask or re-fetch anything.
+Otherwise: if a PRD was already created earlier in this same conversation (e.g. via `/rhubarb:do`), use that PRD's issue number directly and go straight to Phase 2 — it's already in your context, no need to ask or re-fetch anything.
 
 Otherwise (a genuinely fresh invocation, nothing in context, no `prd:` argument), continue with steps 1-6 below:
 
@@ -51,7 +51,7 @@ Using only the child issues that belong to the selected PRD:
 
 1. Re-fetch those issues to get their current bodies and labels.
 2. Identify **unblocked** issues (those whose body says "None - can start immediately" or whose blockers are already closed).
-3. Implement all unblocked issues **one at a time, in this same continuous session** — do not dispatch sub-agents and do not implement issues in parallel, regardless of how many are unblocked at once. Baton-sized PRDs are small enough that sequential is cheap; parallel sub-agent fan-out is what was burning the account's rate-limit budget.
+3. Implement all unblocked issues **one at a time, in this same continuous session** — do not dispatch sub-agents and do not implement issues in parallel, regardless of how many are unblocked at once. Rhubarb-sized PRDs are small enough that sequential is cheap; parallel sub-agent fan-out is what was burning the account's rate-limit budget.
 4. Once unblocked issues are complete, resolve the next wave of now-unblocked issues — also one at a time.
 5. **Triage decisions are made autonomously by default.** Pick the most reasonable interpretation and proceed; note the call you made in that issue's tracker summary (Phase 4) rather than pausing over it. Only emit the blocked marker (above) if the issue is genuinely ambiguous in a way no reasonable default resolves.
 
@@ -86,8 +86,8 @@ Write `.claude/implement-tracker.json` at the project root with the following st
 }
 ```
 
-- `qa_changes` starts as an empty array — `/baton:qa` will populate it during the QA loop.
-- `acceptance_criteria` lists every criterion from the issue body so `/baton:qa` can check them off.
+- `qa_changes` starts as an empty array — `/rhubarb:qa` will populate it during the QA loop.
+- `acceptance_criteria` lists every criterion from the issue body so `/rhubarb:qa` can check them off.
 
 ---
 
@@ -97,4 +97,4 @@ Run `/clear`.
 
 ---
 
-**Done.** Use `/baton:qa` to run the QA loop, close issues, commit, and clean up.
+**Done.** Use `/rhubarb:qa` to run the QA loop, close issues, commit, and clean up.

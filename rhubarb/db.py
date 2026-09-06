@@ -6,19 +6,27 @@ an isolated temp database instead of the real one under the user's home dir.
 """
 
 import json
+import shutil
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-DEFAULT_DB_PATH = Path.home() / ".baton" / "baton.db"
+# Issue #91 renamed the package from `baton` to `rhubarb` but deliberately
+# left the on-disk data path alone, since moving it needs migration logic
+# rather than a plain rename -- that migration lives here (issue #93).
+# `OLD_DB_PATH` is kept around (rather than just being a comment) so it can
+# be pointed at an isolated tmp path in tests instead of the user's real
+# home directory -- see `_migrate_legacy_db` and `get_connection` below.
+OLD_DB_PATH = Path.home() / ".baton" / "baton.db"
+DEFAULT_DB_PATH = Path.home() / ".rhubarb" / "rhubarb.db"
 
-# The model Baton passes to every `claude` CLI invocation (via `--model`)
+# The model Rhubarb passes to every `claude` CLI invocation (via `--model`)
 # unless a session already has one recorded -- see `get_model`/`set_model`
 # (the global setting) and the `sessions.model` column (the value a given
 # session was created with) below.
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
-# The reasoning-effort level Baton passes to every `claude` CLI invocation
+# The reasoning-effort level Rhubarb passes to every `claude` CLI invocation
 # (via `--effort`, omitted entirely for "auto") unless a session already has
 # one recorded -- see `get_effort`/`set_effort` (the global setting) and the
 # `sessions.effort` column (the value a given session was created with, or
@@ -26,7 +34,24 @@ DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_EFFORT = "auto"
 
 
+def _migrate_legacy_db(new_path: Path, old_path: Path) -> None:
+    """One-time migration for users upgrading across the #91 package rename:
+    if `new_path` (the `.rhubarb` data path) doesn't exist yet but
+    `old_path` (the pre-rename `.baton` data path) does, copy the old file's
+    contents to the new location before anything opens it. Uses `copy2`, not
+    `move` -- the old file is left in place afterward as a fallback/backup.
+    No-ops if `new_path` already exists (never overwrite real data with a
+    stale copy -- this only ever runs once, on first run after the rename)
+    or if `old_path` doesn't exist (fresh install, nothing to migrate)."""
+    if new_path.exists() or not old_path.exists():
+        return
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(old_path, new_path)
+
+
 def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
+    if db_path is None:
+        _migrate_legacy_db(DEFAULT_DB_PATH, OLD_DB_PATH)
     path = db_path or DEFAULT_DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -402,7 +427,7 @@ def cleanup_sessions_on_shutdown(conn: sqlite3.Connection) -> None:
 
 
 INTERRUPTED_ERROR_TEXT = (
-    "Interrupted: Baton was restarted while this session was implementing."
+    "Interrupted: Rhubarb was restarted while this session was implementing."
 )
 
 

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from baton import cli_client
+from rhubarb import cli_client
 
 
 def test_run_prompt_skips_permission_checks(monkeypatch):
@@ -24,7 +24,7 @@ def test_run_prompt_skips_permission_checks(monkeypatch):
     assert "--dangerously-skip-permissions" in captured["args"]
 
 
-def test_run_prompt_loads_baton_own_plugin(monkeypatch):
+def test_run_prompt_loads_rhubarb_own_plugin(monkeypatch):
     captured = {}
 
     class FakeResult:

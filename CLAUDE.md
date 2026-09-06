@@ -1,4 +1,4 @@
-# Baton
+# Rhubarb
 
 Python controller that drives Claude Code through phases of software
 development, gating progression on scenario-based decisions rather than on

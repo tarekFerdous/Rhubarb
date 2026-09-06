@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from baton.github_publisher import GithubPublishError, publish_draft
+from rhubarb.github_publisher import GithubPublishError, publish_draft
 
 _DRAFT = {
     "prd": {"title": "My PRD", "body": "PRD body", "labels": ["ready-for-agent"]},
@@ -41,7 +41,7 @@ def test_publish_draft_happy_path(tmp_path, monkeypatch):
             return _ok("https://github.com/x/y/issues/7")
         raise AssertionError(f"unexpected args {args}")
 
-    monkeypatch.setattr("baton.github_publisher.subprocess.run", fake_run)
+    monkeypatch.setattr("rhubarb.github_publisher.subprocess.run", fake_run)
 
     result = publish_draft(draft_path, cwd=str(tmp_path))
 
@@ -61,7 +61,7 @@ def test_publish_draft_fails_on_prd_creation(tmp_path, monkeypatch):
     def fake_run(args, **kwargs):
         return _fail("gh: not logged in")
 
-    monkeypatch.setattr("baton.github_publisher.subprocess.run", fake_run)
+    monkeypatch.setattr("rhubarb.github_publisher.subprocess.run", fake_run)
 
     with pytest.raises(GithubPublishError, match="not logged in"):
         publish_draft(draft_path, cwd=str(tmp_path))
@@ -77,7 +77,7 @@ def test_publish_draft_fails_on_child_issue_after_prd_succeeds(tmp_path, monkeyp
             return _ok("https://github.com/x/y/issues/5")
         return _fail("network error")
 
-    monkeypatch.setattr("baton.github_publisher.subprocess.run", fake_run)
+    monkeypatch.setattr("rhubarb.github_publisher.subprocess.run", fake_run)
 
     with pytest.raises(GithubPublishError, match="PRD #5") as exc_info:
         publish_draft(draft_path, cwd=str(tmp_path))

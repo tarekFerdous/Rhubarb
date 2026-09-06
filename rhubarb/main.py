@@ -1,6 +1,6 @@
 import sys
 
-from baton.cli_client import run_prompt
+from rhubarb.cli_client import run_prompt
 
 
 def main() -> None:

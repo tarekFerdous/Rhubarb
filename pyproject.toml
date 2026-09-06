@@ -1,5 +1,5 @@
 [project]
-name = "baton"
+name = "rhubarb"
 version = "0.1.0"
 description = "An agentic software development system in Python. Generates full-stack applications across 13 layers and gates each one on tests that actually run."
 requires-python = ">=3.11"
@@ -8,10 +8,10 @@ dependencies = [
     "uvicorn[standard]",
     "jinja2",
     "python-multipart",
-    # ConPTY backend for `baton.pty_engine`'s interactive session on Windows
+    # ConPTY backend for `rhubarb.pty_engine`'s interactive session on Windows
     # (issue #84).
     "pywinpty; platform_system == 'Windows'",
-    # Unix pty backend for `baton.pty_engine`'s interactive session on
+    # Unix pty backend for `rhubarb.pty_engine`'s interactive session on
     # macOS/Linux (issue #85), mirroring the Windows-only gating above.
     "ptyprocess; platform_system != 'Windows'",
 ]

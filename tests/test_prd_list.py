@@ -1,4 +1,4 @@
-from baton.prd_list import compute_prd_list
+from rhubarb.prd_list import compute_prd_list
 
 
 def _prd(number, title):

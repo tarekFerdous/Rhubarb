@@ -13,7 +13,7 @@ This skill takes the current conversation context and codebase understanding and
 
 Check with the user that these seams match their expectations.
 
-3. Write the PRD using the template below, then publish it to the project issue tracker via `gh issue create --title "<title>" --body "<body>" --label ready-for-agent --label prd`. Both labels are required: `ready-for-agent` so the AFK session runner picks it up, and `prd` so it appears in the "To be implemented" panel (child issues from `/baton:to-issues` carry `ready-for-agent` only, so they're correctly excluded from that panel). No need for additional triage.
+3. Write the PRD using the template below, then publish it to the project issue tracker via `gh issue create --title "<title>" --body "<body>" --label ready-for-agent --label prd`. Both labels are required: `ready-for-agent` so the AFK session runner picks it up, and `prd` so it appears in the "To be implemented" panel (child issues from `/rhubarb:to-issues` carry `ready-for-agent` only, so they're correctly excluded from that panel). No need for additional triage.
 
 <prd-template>
 

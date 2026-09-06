@@ -1,0 +1,6 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "rhubarb",
+  "version": "0.1.0",
+  "description": "Rhubarb's private skill set for automated /do, /implement, and /qa runs -- isolated from the user's global skills."
+}

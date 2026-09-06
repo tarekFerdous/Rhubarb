@@ -33,7 +33,7 @@ turn, hand control back."
 The approach chosen here: `--append-system-prompt` (present in `claude
 --help` on this build) appends an instruction to the assistant's system
 prompt telling it to print a single, distinctive marker line -- exactly
-`<<<BATON_TURN_COMPLETE>>>` and nothing else -- immediately after finishing
+`<<<RHUBARB_TURN_COMPLETE>>>` and nothing else -- immediately after finishing
 its response to every user turn. `stream_turn()` accumulates PTY output
 into a buffer and stops reading as soon as that literal string appears in
 it, then splits the buffer on the marker and yields everything before it as
@@ -46,8 +46,8 @@ Why this over alternatives:
 - The marker is plain assistant *output*, not a control-plane signal, so it
   costs nothing beyond one line of text and needs no CLI/protocol support
   beyond a flag that already exists (`--append-system-prompt`).
-- `<<<BATON_TURN_COMPLETE>>>` is chosen to be extremely unlikely to appear
-  in ordinary Claude output (code, prose, or the fenced-JSON markers Baton
+- `<<<RHUBARB_TURN_COMPLETE>>>` is chosen to be extremely unlikely to appear
+  in ordinary Claude output (code, prose, or the fenced-JSON markers Rhubarb
   already parses elsewhere -- `implement_blocked`, `qa_grilling`; see
   `session_runner._parse_implement_blocked_block`/`_parse_qa_grilling_block`)
   while still being trivially greppable. Those fenced-JSON blocks are left
@@ -98,7 +98,7 @@ process.
 
 The PTY/process backing a `PtyEngine` can die mid-turn for reasons that
 have nothing to do with the conversation itself: a transient PTY hiccup,
-the `claude` binary crashing, or -- notably -- Baton's own process having
+the `claude` binary crashing, or -- notably -- Rhubarb's own process having
 been restarted while a phase was mid-flight, so a brand-new `PtyEngine` is
 constructed with `resume_session_id=` for a conversation whose original
 backing process is long gone before a single turn is ever sent through
@@ -122,14 +122,14 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Protocol
 
-from baton.cli_client import _clean_env, _effort_args, _plugin_args
+from rhubarb.cli_client import _clean_env, _effort_args, _plugin_args
 
 # Printed by the assistant (via --append-system-prompt, below) as the last
 # line of every turn's output. Chosen to be inert as ordinary Claude output
-# (code fences, prose, or Baton's own fenced-JSON markers like
+# (code fences, prose, or Rhubarb's own fenced-JSON markers like
 # `implement_blocked`/`qa_grilling` never produce this literal string) while
 # staying trivially detectable in a raw PTY byte/text stream.
-TURN_COMPLETE_MARKER = "<<<BATON_TURN_COMPLETE>>>"
+TURN_COMPLETE_MARKER = "<<<RHUBARB_TURN_COMPLETE>>>"
 
 _MARKER_INSTRUCTION = (
     "After you finish your ENTIRE response to a user turn (including any "

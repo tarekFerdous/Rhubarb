@@ -16,10 +16,10 @@ class ClaudeCLIError(RuntimeError):
     pass
 
 
-# Baton's own private, plugin-scoped skill set (do/grilling/to-prd/to-issues/
-# implement/qa/etc, namespaced as /baton:*) -- shipped inside the `baton`
+# Rhubarb's own private, plugin-scoped skill set (do/grilling/to-prd/to-issues/
+# implement/qa/etc, namespaced as /rhubarb:*) -- shipped inside the `rhubarb`
 # package itself, never inside a target project's repo. Passed via
-# `--plugin-dir` on every subprocess call so Baton-driven sessions never see
+# `--plugin-dir` on every subprocess call so Rhubarb-driven sessions never see
 # (and can never accidentally invoke) the user's global ~/.claude/skills.
 _PLUGIN_DIR = str(Path(__file__).parent / "claude_plugin")
 
@@ -29,7 +29,7 @@ def _plugin_args() -> list[str]:
 
 
 def _effort_args(effort: str | None) -> list[str]:
-    """"auto" (Baton's default) and `None` both omit `--effort` entirely,
+    """"auto" (Rhubarb's default) and `None` both omit `--effort` entirely,
     letting the model's own built-in default apply -- "auto" is not a valid
     `--effort` flag value (only low/medium/high/xhigh/max are), so there is
     no flag that means "auto" here, only the absence of one."""

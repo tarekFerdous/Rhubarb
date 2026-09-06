@@ -1,8 +1,8 @@
 import json
 import subprocess
 
-from baton import afk_loop, db, session_runner
-from baton.web import app as app_module
+from rhubarb import afk_loop, db, session_runner
+from rhubarb.web import app as app_module
 
 
 def _init_repo(path, remote_url):

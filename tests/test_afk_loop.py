@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from baton import afk_loop, db, session_runner
+from rhubarb import afk_loop, db, session_runner
 
 from tests.test_sessions import _cwd_for, _open_project
 

@@ -1,13 +1,19 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from baton import afk_loop, db, live_stream, session_runner
-from baton.web import app as app_module
+from rhubarb import afk_loop, db, live_stream, session_runner
+from rhubarb.web import app as app_module
 
 
 @pytest.fixture
 def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "DEFAULT_DB_PATH", tmp_path / "baton.db")
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", tmp_path / "rhubarb.db")
+    # Also isolate the legacy #93 migration source path -- otherwise
+    # `get_connection()` (called with no explicit path all over the app)
+    # would check the real `~/.baton/baton.db` on whatever machine runs the
+    # tests and, if one happens to exist there, migrate its real data into
+    # this test's fresh tmp db.
+    monkeypatch.setattr(db, "OLD_DB_PATH", tmp_path / "not-a-real-legacy-db" / "baton.db")
     monkeypatch.setattr(app_module, "_active_project_id", None)
     return TestClient(app_module.app)
 

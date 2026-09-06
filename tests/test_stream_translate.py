@@ -1,6 +1,6 @@
 import pytest
 
-from baton.stream_translate import translate_event
+from rhubarb.stream_translate import translate_event
 
 # Raw event shapes below are trimmed captures from a real
 # `claude -p --output-format stream-json --include-partial-messages --verbose` run.
@@ -8,7 +8,7 @@ from baton.stream_translate import translate_event
 SYSTEM_INIT = {
     "type": "system",
     "subtype": "init",
-    "cwd": "D:\\GitHub Repos\\Baton",
+    "cwd": "D:\\GitHub Repos\\Rhubarb",
     "session_id": "7d373094-4d99-499c-8766-c6c9914b44b7",
     "tools": ["Bash", "Read"],
     "model": "claude-sonnet-5",
@@ -66,7 +66,7 @@ ASSISTANT_WITH_READ_TOOL_USE = {
                 "type": "tool_use",
                 "id": "toolu_018SFjLEyKF31Lkqc6b1fPC9",
                 "name": "Read",
-                "input": {"file_path": "D:\\GitHub Repos\\Baton\\baton\\db.py"},
+                "input": {"file_path": "D:\\GitHub Repos\\Rhubarb\\rhubarb\\db.py"},
             }
         ],
     },
@@ -119,7 +119,7 @@ RESULT_SUCCESS = {
     "type": "result",
     "subtype": "success",
     "is_error": False,
-    "result": "I've read `baton/db.py` — it's the SQLite persistence layer.",
+    "result": "I've read `rhubarb/db.py` — it's the SQLite persistence layer.",
     "session_id": "7d373094-4d99-499c-8766-c6c9914b44b7",
     "total_cost_usd": 0.0711224,
     "duration_ms": 5381,
@@ -154,7 +154,7 @@ RATE_LIMIT_EVENT = {
         (THINKING_BLOCK_START, {"type": "action", "summary": "thinking…"}),
         (
             ASSISTANT_WITH_READ_TOOL_USE,
-            {"type": "action", "summary": "Read D:\\GitHub Repos\\Baton\\baton\\db.py"},
+            {"type": "action", "summary": "Read D:\\GitHub Repos\\Rhubarb\\rhubarb\\db.py"},
         ),
         (ASSISTANT_WITH_BASH_TOOL_USE, {"type": "action", "summary": "$ npm test"}),
         (ASSISTANT_WITH_GREP_TOOL_USE, {"type": "action", "summary": "Grep def foo"}),
@@ -164,7 +164,7 @@ RATE_LIMIT_EVENT = {
             RESULT_SUCCESS,
             {
                 "type": "turn",
-                "result": "I've read `baton/db.py` — it's the SQLite persistence layer.",
+                "result": "I've read `rhubarb/db.py` — it's the SQLite persistence layer.",
                 "session_id": "7d373094-4d99-499c-8766-c6c9914b44b7",
                 "is_error": False,
             },

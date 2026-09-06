@@ -1,7 +1,7 @@
 import json
 
-from baton import live_stream, session_runner
-from baton.web import app as app_module
+from rhubarb import live_stream, session_runner
+from rhubarb.web import app as app_module
 
 
 async def _noop_job(*args, **kwargs):

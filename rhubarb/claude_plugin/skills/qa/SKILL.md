@@ -3,9 +3,9 @@ name: qa
 description: Reads the implement tracker file, runs the QA grilling loop, closes child issues and the PRD, clears the tracker, commits, pushes, and does a final /clear.
 ---
 
-# /baton:qa — QA, Close, and Commit
+# /rhubarb:qa — QA, Close, and Commit
 
-Pick up where `/baton:implement` left off. Reads the tracker file, runs QA, closes everything, commits, and cleans up. Follow each phase in order without skipping.
+Pick up where `/rhubarb:implement` left off. Reads the tracker file, runs QA, closes everything, commits, and cleans up. Follow each phase in order without skipping.
 
 ---
 
@@ -13,21 +13,21 @@ Pick up where `/baton:implement` left off. Reads the tracker file, runs QA, clos
 
 Read `.claude/implement-tracker.json` from the project root.
 
-- If the file does not exist or `status` is not `"implemented"`, stop and tell the user: "No completed implementation found. Run `/baton:implement` first."
+- If the file does not exist or `status` is not `"implemented"`, stop and tell the user: "No completed implementation found. Run `/rhubarb:implement` first."
 - Extract the PRD number/title, all child issues, their summaries, and acceptance criteria.
 
 ---
 
 ## Phase 2 — QA Grilling Loop (repeat until user says "perfect!")
 
-Invoke `/baton:qa-grilling` to verify everything is working as intended.
+Invoke `/rhubarb:qa-grilling` to verify everything is working as intended.
 
 - If the user requests any fixes or adjustments during this session, apply them.
 - After applying fixes, append a record to `qa_changes` in the tracker file:
   ```json
   { "issue": <number-or-null>, "change": "<brief description of what was changed>" }
   ```
-- After applying fixes, invoke `/baton:qa-grilling` again.
+- After applying fixes, invoke `/rhubarb:qa-grilling` again.
 - **Keep looping** until the user explicitly says the word **"perfect!"**
 
 ---

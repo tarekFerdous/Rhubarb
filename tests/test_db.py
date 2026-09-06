@@ -1,11 +1,11 @@
 import json
 import sqlite3
 
-from baton import db
+from rhubarb import db
 
 
 def test_root_dir_round_trip(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     assert db.get_root_dir(conn) is None
 
     db.set_root_dir(conn, "/some/root")
@@ -16,7 +16,7 @@ def test_root_dir_round_trip(tmp_path):
 
 
 def test_afk_hours_round_trip(tmp_path):
-    db_path = tmp_path / "baton.db"
+    db_path = tmp_path / "rhubarb.db"
     conn = db.get_connection(db_path)
     assert db.get_afk_hours(conn) == 6
 
@@ -28,7 +28,7 @@ def test_afk_hours_round_trip(tmp_path):
 
 
 def test_parallel_implementation_round_trip(tmp_path):
-    db_path = tmp_path / "baton.db"
+    db_path = tmp_path / "rhubarb.db"
     conn = db.get_connection(db_path)
     assert db.get_parallel_implementation(conn) is False
 
@@ -48,7 +48,7 @@ def test_parallel_implementation_column_migrates_existing_db_defaulting_off(tmp_
     defaulting to off (sequential), not the old on-by-default behavior, and
     keep its other settings intact when `get_connection` runs its guarded
     ALTER TABLE."""
-    db_path = tmp_path / "baton.db"
+    db_path = tmp_path / "rhubarb.db"
     conn = sqlite3.connect(db_path)
     conn.execute(
         """
@@ -71,7 +71,7 @@ def test_parallel_implementation_column_migrates_existing_db_defaulting_off(tmp_
 
 
 def test_terminal_view_hidden_round_trip(tmp_path):
-    db_path = tmp_path / "baton.db"
+    db_path = tmp_path / "rhubarb.db"
     conn = db.get_connection(db_path)
     assert db.get_terminal_view_hidden(conn) is False
 
@@ -90,7 +90,7 @@ def test_terminal_view_hidden_column_migrates_existing_db_defaulting_visible(tmp
     here by building the pre-migration schema by hand) must gain the column
     defaulting to visible/expanded (issue #89's default), and keep its other
     settings intact when `get_connection` runs its guarded ALTER TABLE."""
-    db_path = tmp_path / "baton.db"
+    db_path = tmp_path / "rhubarb.db"
     conn = sqlite3.connect(db_path)
     conn.execute(
         """
@@ -113,7 +113,7 @@ def test_terminal_view_hidden_column_migrates_existing_db_defaulting_visible(tmp
 
 
 def test_model_round_trip(tmp_path):
-    db_path = tmp_path / "baton.db"
+    db_path = tmp_path / "rhubarb.db"
     conn = db.get_connection(db_path)
     assert db.get_model(conn) == "claude-sonnet-4-6"
 
@@ -129,7 +129,7 @@ def test_model_column_migrates_existing_db_without_data_loss(tmp_path):
     building the pre-migration schema by hand) must gain the column,
     default to claude-sonnet-4-6, and keep its other settings intact when
     `get_connection` runs its guarded ALTER TABLE."""
-    db_path = tmp_path / "baton.db"
+    db_path = tmp_path / "rhubarb.db"
     conn = sqlite3.connect(db_path)
     conn.execute(
         """
@@ -153,7 +153,7 @@ def test_model_column_migrates_existing_db_without_data_loss(tmp_path):
 
 
 def test_effort_round_trip(tmp_path):
-    db_path = tmp_path / "baton.db"
+    db_path = tmp_path / "rhubarb.db"
     conn = db.get_connection(db_path)
     assert db.get_effort(conn) == "auto"
 
@@ -169,7 +169,7 @@ def test_effort_column_migrates_existing_db_without_data_loss(tmp_path):
     building the pre-migration schema by hand) must gain the column,
     default to "auto", and keep its other settings intact when
     `get_connection` runs its guarded ALTER TABLE."""
-    db_path = tmp_path / "baton.db"
+    db_path = tmp_path / "rhubarb.db"
     conn = sqlite3.connect(db_path)
     conn.execute(
         """
@@ -194,7 +194,7 @@ def test_effort_column_migrates_existing_db_without_data_loss(tmp_path):
 
 
 def test_create_session_seeds_effort_column(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     db.upsert_project(conn, "/repos/foo", "foo", "main")
     [project] = db.list_projects(conn)
 
@@ -207,8 +207,77 @@ def test_create_session_seeds_effort_column(tmp_path):
     assert default_row["effort"] == "auto"
 
 
+def test_get_connection_migrates_legacy_baton_db_when_new_path_absent(tmp_path, monkeypatch):
+    """Issue #93: a user upgrading across the #91 package rename has data at
+    the old `~/.baton/baton.db` path but nothing yet at the new
+    `~/.rhubarb/rhubarb.db` path. `get_connection()` (called with no
+    explicit path, as the real app does) must copy the old file over before
+    opening the new path, and must leave the old file untouched afterward."""
+    old_path = tmp_path / "old_home" / ".baton" / "baton.db"
+    new_path = tmp_path / "new_home" / ".rhubarb" / "rhubarb.db"
+    old_path.parent.mkdir(parents=True)
+
+    legacy_conn = db.get_connection(old_path)
+    db.set_root_dir(legacy_conn, "/legacy/root")
+    legacy_conn.close()
+    old_mtime = old_path.stat().st_mtime
+
+    monkeypatch.setattr(db, "OLD_DB_PATH", old_path)
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", new_path)
+
+    migrated_conn = db.get_connection()
+    assert new_path.exists()
+    assert db.get_root_dir(migrated_conn) == "/legacy/root"
+
+    # Old file is a fallback/backup -- left in place, unmodified.
+    assert old_path.exists()
+    assert old_path.stat().st_mtime == old_mtime
+
+
+def test_get_connection_does_not_clobber_existing_new_db_with_legacy_data(tmp_path, monkeypatch):
+    """If `~/.rhubarb/rhubarb.db` already exists, migration must never run --
+    even if an old `~/.baton/baton.db` is also present, the new path's own
+    data wins and is left exactly as it was."""
+    old_path = tmp_path / "old_home" / ".baton" / "baton.db"
+    new_path = tmp_path / "new_home" / ".rhubarb" / "rhubarb.db"
+    old_path.parent.mkdir(parents=True)
+    new_path.parent.mkdir(parents=True)
+
+    legacy_conn = db.get_connection(old_path)
+    db.set_root_dir(legacy_conn, "/legacy/root")
+    legacy_conn.close()
+
+    existing_conn = db.get_connection(new_path)
+    db.set_root_dir(existing_conn, "/current/root")
+    existing_conn.close()
+
+    monkeypatch.setattr(db, "OLD_DB_PATH", old_path)
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", new_path)
+
+    reopened = db.get_connection()
+    assert db.get_root_dir(reopened) == "/current/root"
+
+
+def test_get_connection_creates_fresh_db_when_neither_path_exists(tmp_path, monkeypatch):
+    """No `.baton` and no `.rhubarb` data anywhere -- behaves exactly as
+    today, creating a fresh DB at the new path with no migration attempted."""
+    old_path = tmp_path / "old_home" / ".baton" / "baton.db"
+    new_path = tmp_path / "new_home" / ".rhubarb" / "rhubarb.db"
+
+    monkeypatch.setattr(db, "OLD_DB_PATH", old_path)
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", new_path)
+
+    assert not old_path.exists()
+    assert not new_path.exists()
+
+    conn = db.get_connection()
+    assert new_path.exists()
+    assert not old_path.exists()
+    assert db.get_root_dir(conn) is None
+
+
 def test_project_open_close_reopen_preserves_state(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     db.upsert_project(conn, "/repos/foo", "foo", "main")
 
     [row] = db.list_projects(conn)
@@ -223,7 +292,7 @@ def test_project_open_close_reopen_preserves_state(tmp_path):
 
 
 def test_clear_projects_removes_all_rows(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     db.upsert_project(conn, "/repos/foo", "foo", "main")
     db.upsert_project(conn, "/repos/bar", "bar", "dev")
     assert len(db.list_projects(conn)) == 2
@@ -233,7 +302,7 @@ def test_clear_projects_removes_all_rows(tmp_path):
 
 
 def test_create_session_starts_in_grilling_phase(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     row_id = db.create_session(conn, project_id=1)
 
     row = db.get_session(conn, row_id)
@@ -242,7 +311,7 @@ def test_create_session_starts_in_grilling_phase(tmp_path):
 
 
 def test_session_phase_transitions_through_state_machine(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     row_id = db.create_session(conn, project_id=1, claude_session_id="s1")
 
     for phase in ("creating_prd", "creating_issues", "details"):
@@ -251,7 +320,7 @@ def test_session_phase_transitions_through_state_machine(tmp_path):
 
 
 def test_claim_available_session_is_scoped_to_its_project(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     session_a = db.create_session(conn, project_id=1, claude_session_id="a1")
     db.mark_session_available(conn, session_a, "a1")
 
@@ -267,7 +336,7 @@ def test_claim_available_session_is_scoped_to_its_project(tmp_path):
 
 
 def test_create_session_seeds_session_type_phase_and_details(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     row_id = db.create_session(
         conn,
         project_id=1,
@@ -283,7 +352,7 @@ def test_create_session_seeds_session_type_phase_and_details(tmp_path):
 
 
 def test_create_session_defaults_model_to_claude_sonnet(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     row_id = db.create_session(conn, project_id=1)
 
     row = db.get_session(conn, row_id)
@@ -291,7 +360,7 @@ def test_create_session_defaults_model_to_claude_sonnet(tmp_path):
 
 
 def test_create_session_accepts_explicit_model(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     row_id = db.create_session(conn, project_id=1, model="claude-opus-4-8")
 
     row = db.get_session(conn, row_id)
@@ -299,7 +368,7 @@ def test_create_session_accepts_explicit_model(tmp_path):
 
 
 def test_create_session_defaults_session_type_to_do(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     row_id = db.create_session(conn, project_id=1)
 
     row = db.get_session(conn, row_id)
@@ -307,7 +376,7 @@ def test_create_session_defaults_session_type_to_do(tmp_path):
 
 
 def test_has_active_implement_session_detects_live_session_for_prd_number(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     db.create_session(
         conn, project_id=1, session_type="implement", phase="implementing", details={"prd": {"number": 9, "title": "X"}}
     )
@@ -318,7 +387,7 @@ def test_has_active_implement_session_detects_live_session_for_prd_number(tmp_pa
 
 
 def test_has_active_implement_session_ignores_terminal_or_errored_sessions(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     db.create_session(
         conn, project_id=1, session_type="implement", phase="implemented", details={"prd": {"number": 4, "title": "Y"}}
     )
@@ -331,7 +400,7 @@ def test_has_active_implement_session_ignores_terminal_or_errored_sessions(tmp_p
 
 
 def test_has_any_active_implement_session_ignores_prd_number(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     assert db.has_any_active_implement_session(conn, project_id=1) is False
 
     db.create_session(
@@ -344,7 +413,7 @@ def test_has_any_active_implement_session_ignores_prd_number(tmp_path):
 
 
 def test_has_any_active_implement_session_ignores_terminal_or_errored_sessions(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     db.create_session(
         conn, project_id=1, session_type="implement", phase="implemented", details={"prd": {"number": 4, "title": "Y"}}
     )
@@ -357,7 +426,7 @@ def test_has_any_active_implement_session_ignores_terminal_or_errored_sessions(t
 
 
 def test_cleanup_sessions_on_shutdown_keeps_only_most_recently_used(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     old = db.create_session(conn, project_id=1, claude_session_id="old")
     conn.execute("UPDATE sessions SET last_activity = '2020-01-01T00:00:00' WHERE id = ?", (old,))
 
@@ -375,7 +444,7 @@ def test_cleanup_sessions_on_shutdown_keeps_only_most_recently_used(tmp_path):
 
 
 def test_recover_interrupted_implement_sessions_marks_stuck_row(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     stuck_id = db.create_session(
         conn, project_id=1, session_type="implement", phase="implementing", details={"prd": {"number": 1}}
     )
@@ -388,7 +457,7 @@ def test_recover_interrupted_implement_sessions_marks_stuck_row(tmp_path):
 
 
 def test_recover_interrupted_implement_sessions_leaves_existing_error_untouched(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     errored_id = db.create_session(
         conn, project_id=1, session_type="implement", phase="implementing", details={"prd": {"number": 1}}
     )
@@ -401,7 +470,7 @@ def test_recover_interrupted_implement_sessions_leaves_existing_error_untouched(
 
 
 def test_recover_interrupted_implement_sessions_leaves_implemented_untouched(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     implemented_id = db.create_session(
         conn, project_id=1, session_type="implement", phase="implemented", details={"prd": {"number": 1}}
     )
@@ -413,7 +482,7 @@ def test_recover_interrupted_implement_sessions_leaves_implemented_untouched(tmp
 
 
 def test_recover_interrupted_implement_sessions_leaves_do_session_untouched(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     do_id = db.create_session(conn, project_id=1, session_type="do", phase="implementing")
 
     db.recover_interrupted_implement_sessions(conn)
@@ -423,7 +492,7 @@ def test_recover_interrupted_implement_sessions_leaves_do_session_untouched(tmp_
 
 
 def test_recover_interrupted_implement_sessions_leaves_grilling_do_session_untouched(tmp_path):
-    conn = db.get_connection(tmp_path / "baton.db")
+    conn = db.get_connection(tmp_path / "rhubarb.db")
     do_id = db.create_session(conn, project_id=1, session_type="do", phase="grilling")
 
     db.recover_interrupted_implement_sessions(conn)

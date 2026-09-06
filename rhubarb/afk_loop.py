@@ -8,7 +8,7 @@ around would create a cycle.
 
 The idle clock is in-memory only, keyed by project id, and reset via
 `record_activity` -- both on a manual PRD-button click and whenever a
-self-implement fires. It is intentionally not persisted: a Baton restart
+self-implement fires. It is intentionally not persisted: a Rhubarb restart
 resets everything to a clean slate, same as `session_runner._implement_queues`
 and `app._active_project_id`.
 """
@@ -17,7 +17,7 @@ import asyncio
 import time
 from typing import Callable
 
-from baton import db, session_runner
+from rhubarb import db, session_runner
 
 # project_id -> time.monotonic() timestamp of last activity (manual click or
 # self-implement fire). Process-lifetime only.
@@ -26,7 +26,7 @@ _last_activity: dict[int, float] = {}
 # project_id -> list of undismissed self-implement notifications, each
 # {"number": int, "title": str}. Server-held (not per-connection/per-browser-
 # tab) so a page refresh can rebuild the modal from this state -- and, like
-# `_last_activity`, in-memory only: a Baton restart clears it.
+# `_last_activity`, in-memory only: a Rhubarb restart clears it.
 _notifications: dict[int, list[dict]] = {}
 
 
