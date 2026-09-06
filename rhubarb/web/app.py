@@ -451,8 +451,9 @@ async def qa_complete(body: dict):
     if row is None:
         return {"error": "Session not found"}
     cwd = _active_project_cwd()
-    notes = body.get("notes", "")
-    asyncio.create_task(session_runner.continue_qa_job(row["id"], notes, cwd=cwd))
+    answers = body.get("answers", {})
+    extra_notes = body.get("extra_notes", "")
+    asyncio.create_task(session_runner.continue_qa_job(row["id"], answers, extra_notes, cwd=cwd))
     return {"ok": True}
 
 

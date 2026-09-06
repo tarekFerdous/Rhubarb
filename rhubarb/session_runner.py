@@ -25,7 +25,7 @@ from rhubarb.cli_client import ClaudeCLIError
 from rhubarb.github_publisher import GithubPublishError, publish_draft
 from rhubarb.live_stream import publish
 from rhubarb.pty_engine import PtyEngine, PtyEngineUnrecoverableError
-from rhubarb.qa_parser import parse_grilling_response
+from rhubarb.qa_parser import parse_grilling_response, parse_qa_response
 from rhubarb.stream_translate import translate_event
 
 # The old broad pattern (`auth|login|not logged in|permission denied|401|403`)
@@ -401,11 +401,11 @@ async def _run_grilling_turn(
     off the row instead of re-checking the current setting.
 
     `publish_when_empty` covers `start_session_job`: a brand-new session's
-    very first turn must always render (even a bare preamble with no
+    very first turn must always render (even a bare header with no
     structured questions), matching the old behavior of always surfacing
     `parse_grilling_response`'s result on start. `continue_session_job` now
-    always passes `True` too -- zero sections there means grilling is done
-    and the turn's preamble is the assistant's wrap-up message, which the
+    always passes `True` too -- zero questions there means grilling is done
+    and the turn's header is the assistant's wrap-up message, which the
     frontend renders as a "ready to proceed?" gate rather than the chain
     auto-advancing on its own."""
     publish(card_id, {"type": "phase", "phase": "grilling"})
@@ -447,10 +447,10 @@ async def _run_grilling_turn(
         context_pct=turn.get("context_pct"),
     )
 
-    if parsed["sections"] or publish_when_empty:
+    if parsed["questions"] or publish_when_empty:
         publish(card_id, _turn_event(phase="grilling", interview=parsed))
 
-    return parsed if parsed["sections"] else None
+    return parsed if parsed["questions"] else None
 
 
 async def _run_chain_step(
@@ -648,9 +648,9 @@ async def continue_session_job(card_id: int, reply: str, *, cwd: str | None, con
 
     Normal replies (`confirm_advance=False`, the default) always run one
     more grilling CLI turn and publish its `turn` event -- whether or not
-    `sections` comes back empty -- and then stop; there is no auto-advance
+    `questions` comes back empty -- and then stop; there is no auto-advance
     into the PRD/issues chain anymore. When grilling has no more questions,
-    the frontend shows the turn's `preamble` with "Yes, proceed" / "No, keep
+    the frontend shows the turn's `header` with "Yes, proceed" / "No, keep
     discussing" buttons, and "Yes" is what re-invokes this function with
     `confirm_advance=True`.
 
@@ -880,17 +880,23 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
 
     qa_data = _parse_qa_grilling_block(turn["result"])
     if qa_data is not None:
-        # /implement Phase 5 ran /qa and emitted the checklist block.
+        # /implement Phase 5 ran /qa, which replied with the new nested
+        # "QA session for PRD N: ..." question format (see qa_parser.py) --
+        # the qa_grilling JSON block itself is now just a lightweight signal
+        # ({phase, prd}) that this handoff happened; the actual issues/
+        # questions are parsed from the turn's own free text.
         # Hand the session_id to the QA session instead of pooling it here
         # -- this card's own tab is done; the new QA row's own tab starts
         # fresh (reattached via --resume) on its own first turn.
+        qa_prd = qa_data.get("prd")
+        qa_issues = parse_qa_response(turn["result"])["issues"]
         qa_row_id = db.create_session(
             conn,
             row["project_id"],
             claude_session_id=turn["session_id"],
             session_type="qa",
             phase="qa_grilling",
-            details={"prd": qa_data.get("prd")},
+            details={"prd": qa_prd},
             model=model,
             effort=effort,
         )
@@ -899,7 +905,7 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
         publish(card_id, _turn_event(phase="implemented", details=details))
         publish(card_id, {"type": "done"})
         await _drain_implement_queue(row["project_id"], cwd)
-        asyncio.create_task(start_qa_job(qa_row_id, qa_data, cwd=cwd))
+        asyncio.create_task(start_qa_job(qa_row_id, qa_prd, qa_issues, cwd=cwd))
     else:
         new_session_id = await _clear_for_reuse(card_id, cwd=cwd, model=model, effort=effort)
         db.mark_session_available(conn, card_id, new_session_id)
@@ -946,17 +952,19 @@ async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -
     await _finish_implement_turn(card_id, conn, row, turn, cwd=cwd, model=model, effort=effort)
 
 
-async def start_qa_job(card_id: int, qa_data: dict, *, cwd: str | None) -> None:
+async def start_qa_job(card_id: int, prd: dict | None, issues: list[dict], *, cwd: str | None) -> None:
     """Publish the qa_grilling turn event for a QA session created by the
-    /implement auto-handoff. The JSON block was already parsed from the
-    implement turn's result; emit it and leave the session suspended (no
-    'done') until POST /api/session/qa-complete is called."""
+    /implement auto-handoff. `prd`/`issues` were already parsed from the
+    implement turn's result (the qa_grilling JSON marker for `prd`,
+    `qa_parser.parse_qa_response` for the nested `issues`/`questions`); emit
+    them and leave the session suspended (no 'done') until POST
+    /api/session/qa-complete is called."""
     publish(card_id, {"type": "phase", "phase": "qa_grilling"})
     publish(card_id, {
         "type": "turn",
         "phase": "qa_grilling",
-        "prd": qa_data.get("prd"),
-        "checklist": qa_data.get("checklist", []),
+        "prd": prd,
+        "issues": issues,
         "interview": None,
         "details": None,
         "error": None,
@@ -965,9 +973,11 @@ async def start_qa_job(card_id: int, qa_data: dict, *, cwd: str | None) -> None:
     })
 
 
-async def continue_qa_job(card_id: int, notes: str, *, cwd: str | None) -> None:
-    """Called from POST /api/session/qa-complete. Unblocks the QA session
-    by running Phase 3+ with the user's notes forwarded as context."""
+async def continue_qa_job(card_id: int, answers: dict, extra_notes: str, *, cwd: str | None) -> None:
+    """Called from POST /api/session/qa-complete. Unblocks the QA session by
+    running Phase 3+ with the user's per-question answers (keyed by question
+    id, as published in start_qa_job's `issues`) and the trailing free-text
+    box's content forwarded as context."""
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
     model = row["model"]
@@ -976,7 +986,14 @@ async def continue_qa_job(card_id: int, notes: str, *, cwd: str | None) -> None:
     db.update_session(conn, card_id, phase="qa_closing", error_text=None)
     publish(card_id, {"type": "phase", "phase": "qa_closing"})
 
-    note_ctx = f"\nUser notes: {notes}" if notes.strip() else ""
+    answer_lines = "\n".join(f"- {qid}: {text}" for qid, text in answers.items() if text and text.strip())
+    context_parts = []
+    if answer_lines:
+        context_parts.append(f"Answers:\n{answer_lines}")
+    if extra_notes.strip():
+        context_parts.append(f"Additional notes: {extra_notes}")
+    note_ctx = "\n" + "\n".join(context_parts) if context_parts else ""
+
     prompt = (
         f"The user reviewed the implementation and clicked Perfect.{note_ctx}\n\n"
         "Please continue from Phase 3: close all child issues, close the parent PRD, "

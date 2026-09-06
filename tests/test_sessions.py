@@ -202,7 +202,7 @@ def test_open_pty_tab_count_tracks_tabs_as_sessions_open_and_close(client, tmp_p
 
     _mock_engine(
         monkeypatch,
-        lambda prompt, **kw: iter([_result_event(f"❓ **Q1** - **Scope**: {prompt}?", session_id=prompt)]),
+        lambda prompt, **kw: iter([_result_event(f'Question 1: "{prompt}?"', session_id=prompt)]),
     )
 
     conn = db.get_connection()
@@ -231,9 +231,9 @@ def test_two_sessions_advance_concurrently_without_cross_contamination(client, t
 
     def handler(prompt, **kw):
         if prompt == "/rhubarb:do feature A":
-            return iter([_result_event("❓ **Q1** - **Scope**: Question A?", session_id="sA")])
+            return iter([_result_event('Question 1: "Question A?"', session_id="sA")])
         if prompt == "/rhubarb:do feature B":
-            return iter([_result_event("❓ **Q1** - **Scope**: Question B?", session_id="sB")])
+            return iter([_result_event('Question 1: "Question B?"', session_id="sB")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
@@ -253,8 +253,8 @@ def test_two_sessions_advance_concurrently_without_cross_contamination(client, t
 
     interview_a = json.loads(row_a_data["interview_json"])
     interview_b = json.loads(row_b_data["interview_json"])
-    assert interview_a["sections"][0]["questions"][0]["text"] == "Question A?"
-    assert interview_b["sections"][0]["questions"][0]["text"] == "Question B?"
+    assert interview_a["questions"][0]["text"] == "Question A?"
+    assert interview_b["questions"][0]["text"] == "Question B?"
 
     events_a = live_stream._buffers.get(row_a, [])
     events_b = live_stream._buffers.get(row_b, [])
@@ -274,7 +274,7 @@ def test_no_cap_on_the_number_of_sessions_running_at_once(client, tmp_path, monk
 
     _mock_engine(
         monkeypatch,
-        lambda prompt, **kw: iter([_result_event(f"❓ **Q1** - **Scope**: {prompt}?", session_id=prompt)]),
+        lambda prompt, **kw: iter([_result_event(f'Question 1: "{prompt}?"', session_id=prompt)]),
     )
 
     async def run_all():
@@ -288,7 +288,7 @@ def test_no_cap_on_the_number_of_sessions_running_at_once(client, tmp_path, monk
         row = db.get_session(conn, row_id)
         assert row["claude_session_id"] == f"/rhubarb:do feature {i}"
         interview = json.loads(row["interview_json"])
-        assert interview["sections"][0]["questions"][0]["text"] == f"/rhubarb:do feature {i}?"
+        assert interview["questions"][0]["text"] == f"/rhubarb:do feature {i}?"
 
 
 def test_start_session_job_returns_card_with_grilling_questions(client, tmp_path, monkeypatch):
@@ -300,11 +300,9 @@ def test_start_session_job_returns_card_with_grilling_questions(client, tmp_path
         lambda prompt, **kw: iter(
             [
                 _result_event(
-                    "❓ **Q1** - **Behavior**: What should it do?\n"
+                    'Question 1: "What should it do?"\n'
                     "\n"
-                    "---\n"
-                    "\n"
-                    "❓ **Q2** - **Audience**: Who is it for?"
+                    'Question 2: "Who is it for?"\n'
                 )
             ]
         ),
@@ -317,8 +315,7 @@ def test_start_session_job_returns_card_with_grilling_questions(client, tmp_path
 
     row = db.get_session(conn, row_id)
     interview = json.loads(row["interview_json"])
-    assert len(interview["sections"]) == 1
-    assert len(interview["sections"][0]["questions"]) == 2
+    assert len(interview["questions"]) == 2
     assert row["claude_session_id"] == "s1"
 
     events = live_stream._buffers.get(row_id, [])
@@ -345,8 +342,8 @@ def test_start_session_job_publishes_interview_even_with_no_structured_questions
     events = live_stream._buffers.get(row_id, [])
     turn_events = [e for e in events if e["type"] == "turn"]
     assert len(turn_events) == 1
-    assert turn_events[0]["interview"]["sections"] == []
-    assert turn_events[0]["interview"]["preamble"]
+    assert turn_events[0]["interview"]["questions"] == []
+    assert turn_events[0]["interview"]["header"]
 
 
 def test_continue_session_job_with_remaining_questions_does_not_auto_advance(client, tmp_path, monkeypatch):
@@ -360,8 +357,8 @@ def test_continue_session_job_with_remaining_questions_does_not_auto_advance(cli
         if prompt in ("/rhubarb:to-prd", "/rhubarb:to-issues"):
             raise AssertionError(f"chain must not run without confirm_advance, got {prompt!r}")
         if prompt == "/rhubarb:do a feature":
-            return iter([_result_event("❓ **Q1** - **Scope**: First question?")])
-        return iter([_result_event("❓ **Q1** - **Scope**: A follow-up question?")])
+            return iter([_result_event('Question 1: "First question?"')])
+        return iter([_result_event('Question 1: "A follow-up question?"')])
 
     _mock_engine(monkeypatch, handler)
 
@@ -373,11 +370,11 @@ def test_continue_session_job_with_remaining_questions_does_not_auto_advance(cli
     row = db.get_session(conn, row_id)
     assert row["phase"] == "grilling"
     interview = json.loads(row["interview_json"])
-    assert interview["sections"][0]["questions"][0]["text"] == "A follow-up question?"
+    assert interview["questions"][0]["text"] == "A follow-up question?"
 
     events = live_stream._buffers.get(row_id, [])
     turn_events = [e for e in events if e["type"] == "turn"]
-    assert turn_events[-1]["interview"]["sections"]
+    assert turn_events[-1]["interview"]["questions"]
 
 
 def test_continue_session_job_with_no_more_questions_does_not_auto_advance(client, tmp_path, monkeypatch):
@@ -391,7 +388,7 @@ def test_continue_session_job_with_no_more_questions_does_not_auto_advance(clien
         if prompt in ("/rhubarb:to-prd", "/rhubarb:to-issues"):
             raise AssertionError(f"chain must not run without confirm_advance, got {prompt!r}")
         if prompt == "/rhubarb:do a feature":
-            return iter([_result_event("❓ **Q1** - **Scope**: First question?")])
+            return iter([_result_event('Question 1: "First question?"')])
         return iter([_result_event("Thanks, that's everything I need.")])
 
     _mock_engine(monkeypatch, handler)
@@ -410,8 +407,8 @@ def test_continue_session_job_with_no_more_questions_does_not_auto_advance(clien
     # One turn from start_session_job's first question, one from this reply.
     assert len(turn_events) == 2
     assert turn_events[-1]["phase"] == "grilling"
-    assert turn_events[-1]["interview"]["sections"] == []
-    assert turn_events[-1]["interview"]["preamble"]
+    assert turn_events[-1]["interview"]["questions"] == []
+    assert turn_events[-1]["interview"]["header"]
     assert not any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
 
 
@@ -1392,7 +1389,14 @@ def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(c
     claude_dir.mkdir(parents=True, exist_ok=True)
     (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
 
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(_QA_BLOCK, session_id="qa-session-id")]))
+    qa_turn_text = (
+        _QA_BLOCK + "\n\n"
+        'QA session for PRD 7: "Tracked PRD"\n\n'
+        'Issue 8: "Child"\n'
+        'Question 1: "Does it work?"\n'
+        'Recommended text: "Yes."\n'
+    )
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(qa_turn_text, session_id="qa-session-id")]))
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -1426,6 +1430,20 @@ def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(c
 
     # The implement card's own tab is closed -- the new QA row starts fresh.
     assert row_id not in session_runner._pty_engines
+
+    # The nested issues/questions structure was parsed from the turn's free
+    # text (parse_qa_response) and published on the new QA session's stream
+    # -- the qa_grilling JSON block itself only carried the {phase, prd} signal.
+    qa_events = live_stream._buffers.get(qa_row["id"], [])
+    qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
+    assert len(qa_turn_events) == 1
+    assert qa_turn_events[0]["issues"] == [
+        {
+            "number": 8,
+            "title": "Child",
+            "questions": [{"id": "issue8-q1", "text": "Does it work?", "recommended_text": "Yes."}],
+        }
+    ]
 
 
 def test_start_implement_job_pools_session_normally_when_no_qa_block(client, tmp_path, monkeypatch):
@@ -1471,22 +1489,23 @@ def test_start_qa_job_publishes_qa_grilling_turn_without_done(client, tmp_path, 
         details={"prd": {"number": 7, "title": "Test PRD"}},
     )
 
-    qa_data = {
-        "phase": "qa_grilling",
-        "prd": {"number": 7, "title": "Test PRD"},
-        "checklist": [
-            {"issue_number": 8, "issue_title": "Child", "items": [{"id": "8-0", "text": "works"}]}
-        ],
-    }
+    prd = {"number": 7, "title": "Test PRD"}
+    issues = [
+        {
+            "number": 8,
+            "title": "Child",
+            "questions": [{"id": "issue8-q1", "text": "Does it work?", "recommended_text": None}],
+        }
+    ]
 
-    asyncio.run(session_runner.start_qa_job(qa_row_id, qa_data, cwd=None))
+    asyncio.run(session_runner.start_qa_job(qa_row_id, prd, issues, cwd=None))
 
     events = live_stream._buffers.get(qa_row_id, [])
     assert {"type": "phase", "phase": "qa_grilling"} in events
     turn_events = [e for e in events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
     assert len(turn_events) == 1
-    assert turn_events[0]["prd"] == {"number": 7, "title": "Test PRD"}
-    assert turn_events[0]["checklist"] == qa_data["checklist"]
+    assert turn_events[0]["prd"] == prd
+    assert turn_events[0]["issues"] == issues
     # No done event — session is suspended awaiting Perfect
     assert {"type": "done"} not in events
 
@@ -1512,10 +1531,12 @@ def test_continue_qa_job_runs_phase3_and_fires_done(client, tmp_path, monkeypatc
         details={"prd": {"number": 7, "title": "Test PRD"}},
     )
 
-    asyncio.run(session_runner.continue_qa_job(qa_row_id, "Looks great", cwd=cwd))
+    asyncio.run(
+        session_runner.continue_qa_job(qa_row_id, {"issue8-q1": "Looks great"}, "", cwd=cwd)
+    )
 
     assert len(seen_prompts) == 1
-    assert "Looks great" in seen_prompts[0]
+    assert "issue8-q1: Looks great" in seen_prompts[0]
 
     row = db.get_session(conn, qa_row_id)
     assert row["phase"] == "qa_closing"
@@ -1559,7 +1580,7 @@ def test_continue_qa_job_recycles_a_low_usage_finished_session(client, tmp_path,
         details={"prd": {"number": 7, "title": "Test PRD"}},
     )
 
-    asyncio.run(session_runner.continue_qa_job(qa_row_id, "Looks great", cwd=cwd))
+    asyncio.run(session_runner.continue_qa_job(qa_row_id, {}, "Looks great", cwd=cwd))
 
     row = db.get_session(conn, qa_row_id)
     assert row["available_for_reuse"] == 1
@@ -1589,7 +1610,7 @@ def test_continue_qa_job_does_not_recycle_a_high_usage_finished_session(client, 
         details={"prd": {"number": 7, "title": "Test PRD"}},
     )
 
-    asyncio.run(session_runner.continue_qa_job(qa_row_id, "Looks great", cwd=cwd))
+    asyncio.run(session_runner.continue_qa_job(qa_row_id, {}, "Looks great", cwd=cwd))
 
     row = db.get_session(conn, qa_row_id)
     assert row["available_for_reuse"] == 0
@@ -1938,7 +1959,7 @@ def test_qa_closing_error_in_background_raises_a_notification(client, tmp_path, 
         conn, project_id, session_type="qa", phase="qa_grilling",
         claude_session_id="qa-session-1", details={"prd": {"number": 7, "title": "Test PRD"}},
     )
-    asyncio.run(session_runner.continue_qa_job(qa_row_id, "notes", cwd=cwd))
+    asyncio.run(session_runner.continue_qa_job(qa_row_id, {}, "notes", cwd=cwd))
 
     notifications = session_runner.get_error_notifications(project_id)
     assert len(notifications) == 1
@@ -1963,7 +1984,7 @@ def test_qa_closing_gh_auth_error_sets_needs_github_login(client, tmp_path, monk
         conn, project_id, session_type="qa", phase="qa_grilling",
         claude_session_id="qa-session-1", details={"prd": {"number": 7, "title": "Test PRD"}},
     )
-    asyncio.run(session_runner.continue_qa_job(qa_row_id, "notes", cwd=cwd))
+    asyncio.run(session_runner.continue_qa_job(qa_row_id, {}, "notes", cwd=cwd))
 
     row = db.get_session(conn, qa_row_id)
     assert bool(row["needs_github_login"]) is True
@@ -1986,7 +2007,7 @@ def test_qa_closing_non_gh_error_does_not_set_needs_github_login(client, tmp_pat
         conn, project_id, session_type="qa", phase="qa_grilling",
         claude_session_id="qa-session-1", details={"prd": {"number": 7, "title": "Test PRD"}},
     )
-    asyncio.run(session_runner.continue_qa_job(qa_row_id, "notes", cwd=cwd))
+    asyncio.run(session_runner.continue_qa_job(qa_row_id, {}, "notes", cwd=cwd))
 
     row = db.get_session(conn, qa_row_id)
     assert bool(row["needs_github_login"]) is False

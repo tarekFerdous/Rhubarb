@@ -7,19 +7,30 @@ Interview the user relentlessly until you reach a shared understanding. Map this
 
 Work the tree in **rounds**. The **frontier** is every decision whose prerequisites are already settled: the questions you can ask _now_ without guessing at answers you haven't heard yet. Ask the whole frontier in one round: number each question and give your recommended answer. Then wait for the user's answers before the next round.
 
-Format a round like so:
+Format a round in this exact structure, so it can be parsed deterministically — free-text framing before the first question and after the last one is fine (e.g. "Here is round 1 of questions." / "Based on your answers, a second wave might be needed."), but every question itself must follow this shape precisely:
 
 ```
-❓ **Q1** - **<question title>**: <question body, might be multiple paragraphs, including multiple choices>
+Question 1: "<question text>"
+Options:
+Option 1: "<option text>"
+Option 2: "<option text>"
+Recommended: [1]
 
-➡️ <your recommended answer>
+Question 2 (select multiple): "<question text>"
+Options:
+Option 1: "<option text>"
+Option 2: "<option text>"
+Option 3: "<option text>"
+Recommended: [1, 3]
 
----
-
-❓ **Q2** - **<question title>**: <question body, might be multiple paragraphs, including multiple choices>
-
-➡️ <your recommended answer>
+Question 3: "<question text, no discrete options>"
+Recommended text: "<your recommended free-text answer>"
 ```
+
+- A question with an `Options:` block is single-select by default (mutually exclusive); mark it `Question N (select multiple):` to make it multi-select instead (independently toggleable).
+- `Recommended: [n]` (single-select) or `Recommended: [n, m, ...]` (multi-select) references option numbers, 1-based.
+- A question with no `Options:` block is open-ended — give a `Recommended text: "<...>"` line instead of `Recommended:`, or omit it if you have no recommendation.
+- Ask the whole frontier in one round, one `Question N:` block per question, numbered sequentially within the round.
 
 Each round the user answers reshapes the tree: settled decisions push the frontier outward and unblock questions that depended on them. Recompute the frontier and ask the next round. A question whose answer depends on another question still open in this round belongs to a _later_ round, not this one.
 

@@ -698,6 +698,15 @@ textarea.prompt-box:focus {
   color: #fff;
 }
 
+@keyframes breathe {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(127, 127, 127, 0.35); }
+  50% { box-shadow: 0 0 0 6px rgba(127, 127, 127, 0); }
+}
+
+.option-btn.recommended {
+  animation: breathe 2.2s ease-in-out infinite;
+}
+
 .answer-box {
   width: 100%;
   min-height: 56px;

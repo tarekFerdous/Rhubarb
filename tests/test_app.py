@@ -387,7 +387,7 @@ def test_dismiss_afk_notifications_does_not_touch_session_rows(client, tmp_path,
     assert after == before
 
 
-def test_qa_complete_endpoint_accepts_notes_and_returns_ok(client, tmp_path, monkeypatch):
+def test_qa_complete_endpoint_accepts_answers_and_extra_notes_and_returns_ok(client, tmp_path, monkeypatch):
     root = tmp_path / "root"
     root.mkdir()
     _init_repo(root / "repo1", "https://github.com/x/repo1.git")
@@ -405,20 +405,25 @@ def test_qa_complete_endpoint_accepts_notes_and_returns_ok(client, tmp_path, mon
 
     received = {}
 
-    async def _fake_continue(card_id, notes, *, cwd):
+    async def _fake_continue(card_id, answers, extra_notes, *, cwd):
         received["card_id"] = card_id
-        received["notes"] = notes
+        received["answers"] = answers
+        received["extra_notes"] = extra_notes
 
     monkeypatch.setattr(session_runner, "continue_qa_job", _fake_continue)
 
-    resp = client.post("/api/session/qa-complete", json={"card_id": qa_card_id, "notes": "All good"})
+    resp = client.post(
+        "/api/session/qa-complete",
+        json={"card_id": qa_card_id, "answers": {"issue7-q1": "Works great"}, "extra_notes": "All good"},
+    )
     assert resp.json() == {"ok": True}
     assert received["card_id"] == qa_card_id
-    assert received["notes"] == "All good"
+    assert received["answers"] == {"issue7-q1": "Works great"}
+    assert received["extra_notes"] == "All good"
 
 
 def test_qa_complete_endpoint_returns_error_for_unknown_session(client):
-    resp = client.post("/api/session/qa-complete", json={"card_id": 9999, "notes": ""})
+    resp = client.post("/api/session/qa-complete", json={"card_id": 9999, "answers": {}, "extra_notes": ""})
     assert "error" in resp.json()
 
 

@@ -932,58 +932,73 @@
       interviewEl.innerHTML = "";
       startForm.style.display = "none";
 
-      (data.checklist || []).forEach((group) => {
+      if (data.prd && data.prd.title) {
+        const p = document.createElement("p");
+        p.className = "preamble";
+        p.textContent = `QA session for PRD #${data.prd.number}: ${data.prd.title}`;
+        interviewEl.appendChild(p);
+      }
+
+      const answerBoxes = {};
+
+      (data.issues || []).forEach((issue) => {
         const h = document.createElement("h3");
         h.className = "section-heading";
-        h.textContent = group.issue_title;
+        h.textContent = `Issue #${issue.number}: ${issue.title}`;
         interviewEl.appendChild(h);
 
-        (group.items || []).forEach((item) => {
-          const label = document.createElement("label");
-          label.className = "qa-checklist-item";
-          const cb = document.createElement("input");
-          cb.type = "checkbox";
-          cb.id = `qa-item-${item.id}`;
-          label.appendChild(cb);
-          const span = document.createElement("span");
-          span.textContent = " " + item.text;
-          label.appendChild(span);
-          interviewEl.appendChild(label);
+        (issue.questions || []).forEach((q) => {
+          const block = document.createElement("div");
+          block.className = "question-block";
+
+          const label = document.createElement("p");
+          label.className = "question-text";
+          label.textContent = q.text;
+          block.appendChild(label);
+
+          const box = document.createElement("textarea");
+          box.className = "answer-box";
+          if (q.recommended_text) box.value = q.recommended_text;
+          box.addEventListener("input", () => autoGrow(box));
+          block.appendChild(box);
+
+          interviewEl.appendChild(block);
+          // scrollHeight is only measurable once attached to the document,
+          // so a programmatic pre-fill can only be sized here, after the
+          // append -- not at the point the value was assigned above.
+          if (q.recommended_text) autoGrow(box);
+
+          answerBoxes[q.id] = box;
         });
       });
 
-      const notesLabel = document.createElement("label");
-      notesLabel.className = "qa-notes-label";
-      notesLabel.htmlFor = "qa-notes-box";
-      notesLabel.textContent = "Notes";
-      interviewEl.appendChild(notesLabel);
-
-      const notesBox = document.createElement("textarea");
-      notesBox.className = "answer-box";
-      notesBox.id = "qa-notes-box";
-      notesBox.placeholder = "Add observations or concerns…";
-      notesBox.addEventListener("input", () => autoGrow(notesBox));
-      interviewEl.appendChild(notesBox);
+      const { wrap: trailingWrap, textarea: extraNotesBox } = renderTrailingNotesBox("Anything else?");
+      interviewEl.appendChild(trailingWrap);
 
       const perfectBtn = document.createElement("button");
       perfectBtn.type = "button";
       perfectBtn.className = "glass-btn";
       perfectBtn.textContent = "Perfect";
       perfectBtn.style.marginTop = "12px";
-      perfectBtn.addEventListener("click", () => handlePerfectClick(notesBox, perfectBtn));
+      perfectBtn.addEventListener("click", () => handlePerfectClick(answerBoxes, extraNotesBox, perfectBtn));
       interviewEl.appendChild(perfectBtn);
     }
 
-    async function handlePerfectClick(notesBox, btn) {
-      const notes = notesBox ? notesBox.value : "";
+    async function handlePerfectClick(answerBoxes, extraNotesBox, btn) {
       const qaCardId = leftCardId;
       if (qaCardId === null) return;
       btn.disabled = true;
 
+      const answers = {};
+      Object.entries(answerBoxes || {}).forEach(([qid, box]) => {
+        answers[qid] = box.value;
+      });
+      const extra_notes = extraNotesBox ? extraNotesBox.value : "";
+
       const res = await fetch("/api/session/qa-complete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ card_id: qaCardId, notes }),
+        body: JSON.stringify({ card_id: qaCardId, answers, extra_notes }),
       });
       const result = await res.json();
 
@@ -1108,7 +1123,7 @@
         needs_github_login: event.needs_github_login,
         // QA-specific fields (present when phase === "qa_grilling")
         prd: event.prd || null,
-        checklist: event.checklist || null,
+        issues: event.issues || null,
       };
       cardSnapshots.set(cardId, snapshot);
 
@@ -1195,11 +1210,11 @@
           return;
         }
         currentLeftSession = { card_id: cardId, phase: "grilling", interview: event.interview };
-        const sections = event.interview.sections;
-        if ((!sections || sections.length === 0) && event.interview.preamble) {
-          renderReadyToProceed(event.interview.preamble);
+        const questions = event.interview.questions;
+        if ((!questions || questions.length === 0) && event.interview.header) {
+          renderReadyToProceed(event.interview.header);
         } else {
-          renderInterview({ preamble: event.interview.preamble, sections: event.interview.sections });
+          renderInterview(event.interview);
         }
         return;
       }
@@ -1442,107 +1457,147 @@
       interviewEl.appendChild(actions);
     }
 
-    function matchesRecommendation(optionText, recommendation) {
-      if (!recommendation) return false;
-      const opt = optionText.toLowerCase();
-      const rec = recommendation.toLowerCase();
-      return opt.includes(rec) || rec.includes(opt);
+    function renderTrailingNotesBox(labelText) {
+      const wrap = document.createElement("div");
+      wrap.className = "manual-reply";
+
+      const label = document.createElement("p");
+      label.className = "manual-reply-label";
+      label.textContent = labelText;
+      wrap.appendChild(label);
+
+      const textarea = document.createElement("textarea");
+      textarea.className = "answer-box";
+      textarea.placeholder = "Type here…";
+      textarea.addEventListener("input", () => autoGrow(textarea));
+      wrap.appendChild(textarea);
+
+      return { wrap, textarea };
     }
 
     function renderInterview(data) {
       interviewEl.innerHTML = "";
       const answers = {};
 
-      if (data.preamble) {
+      if (data.header) {
         const p = document.createElement("p");
         p.className = "preamble";
-        p.textContent = data.preamble;
+        p.textContent = data.header;
         interviewEl.appendChild(p);
       }
 
-      (data.sections || []).forEach((section) => {
-        if (section.heading) {
-          const h = document.createElement("h3");
-          h.className = "section-heading";
-          h.textContent = section.heading;
-          interviewEl.appendChild(h);
-        }
+      (data.questions || []).forEach((q) => {
+        const block = document.createElement("div");
+        block.className = "question-block";
+        let prefillTextarea = null;
 
-        section.questions.forEach((q) => {
-          const block = document.createElement("div");
-          block.className = "question-block";
+        const label = document.createElement("p");
+        label.className = "question-text";
+        label.textContent = q.text;
+        block.appendChild(label);
 
-          if (q.title) {
-            const titleLabel = document.createElement("p");
-            titleLabel.className = "question-title";
-            titleLabel.textContent = q.title;
-            block.appendChild(titleLabel);
-          }
+        if (q.kind === "single" || q.kind === "multi") {
+          const optWrap = document.createElement("div");
+          optWrap.className = "option-list";
+          const recommendedIndices = new Set(q.recommended || []);
+          const selectedIndices = new Set(recommendedIndices);
 
-          const label = document.createElement("p");
-          label.className = "question-text";
-          label.textContent = q.text;
-          block.appendChild(label);
+          const updateAnswer = () => {
+            const chosen = q.options.filter((_, i) => selectedIndices.has(i + 1));
+            answers[q.id] = q.kind === "multi" ? chosen.join(", ") : chosen[0] || "";
+          };
 
-          if (q.options) {
-            const optWrap = document.createElement("div");
-            optWrap.className = "option-list";
-            const recommendedOption = q.recommendation
-              ? q.options.find((opt) => matchesRecommendation(opt, q.recommendation))
-              : undefined;
-            q.options.forEach((opt) => {
-              const btn = document.createElement("button");
-              btn.type = "button";
-              btn.className = "option-btn";
-              btn.textContent = opt;
-              btn.addEventListener("click", () => {
-                answers[q.id] = opt;
+          q.options.forEach((opt, idx) => {
+            const n = idx + 1;
+            const btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "option-btn";
+            btn.textContent = opt;
+            if (selectedIndices.has(n)) btn.classList.add("selected");
+            if (recommendedIndices.has(n)) btn.classList.add("recommended");
+
+            btn.addEventListener("click", () => {
+              // Any click ends the "untouched default" state for this whole
+              // question -- the recommendation no longer describes what gets
+              // submitted, so it stops breathing everywhere in this group,
+              // not just on the button clicked.
+              optWrap.querySelectorAll(".option-btn.recommended").forEach((b) => b.classList.remove("recommended"));
+
+              if (q.kind === "multi") {
+                if (selectedIndices.has(n)) {
+                  selectedIndices.delete(n);
+                  btn.classList.remove("selected");
+                } else {
+                  selectedIndices.add(n);
+                  btn.classList.add("selected");
+                }
+              } else {
+                selectedIndices.clear();
+                selectedIndices.add(n);
                 optWrap.querySelectorAll(".option-btn").forEach((b) => b.classList.remove("selected"));
                 btn.classList.add("selected");
-              });
-              if (opt === recommendedOption) {
-                btn.classList.add("selected");
               }
-              optWrap.appendChild(btn);
+              updateAnswer();
             });
-            if (recommendedOption !== undefined) {
-              answers[q.id] = recommendedOption;
-            }
-            block.appendChild(optWrap);
-          } else {
-            const input = document.createElement("textarea");
-            input.className = "answer-box";
-            if (q.recommendation) {
-              input.value = q.recommendation;
-              answers[q.id] = q.recommendation;
-            }
-            input.addEventListener("input", () => {
-              answers[q.id] = input.value;
-              autoGrow(input);
-            });
-            block.appendChild(input);
-          }
 
-          interviewEl.appendChild(block);
-        });
+            optWrap.appendChild(btn);
+          });
+
+          updateAnswer();
+          block.appendChild(optWrap);
+        } else {
+          const input = document.createElement("textarea");
+          input.className = "answer-box";
+          if (q.recommended_text) {
+            input.value = q.recommended_text;
+            answers[q.id] = q.recommended_text;
+            prefillTextarea = input;
+          }
+          input.addEventListener("input", () => {
+            answers[q.id] = input.value;
+            autoGrow(input);
+          });
+          block.appendChild(input);
+        }
+
+        interviewEl.appendChild(block);
+        // scrollHeight is only measurable once the textarea is attached to
+        // the document, so a programmatic pre-fill can only be sized here,
+        // after the append -- not at the point the value was assigned above.
+        if (prefillTextarea) autoGrow(prefillTextarea);
       });
 
-      if (data.sections && data.sections.length) {
-        const continueBtn = document.createElement("button");
-        continueBtn.type = "button";
-        continueBtn.className = "glass-btn";
-        continueBtn.textContent = "Continue";
-        continueBtn.addEventListener("click", () => {
-          const orderedIds = data.sections.flatMap((s) => s.questions.map((q) => q.id));
-          const replyText = orderedIds
-            .map((id, i) => `${i + 1}. ${answers[id] || "(no answer)"}`)
-            .join("\n");
-          sendReply(replyText, continueBtn);
-        });
-        interviewEl.appendChild(continueBtn);
+      if (data.footer) {
+        const p = document.createElement("p");
+        p.className = "preamble";
+        p.textContent = data.footer;
+        interviewEl.appendChild(p);
       }
 
-      interviewEl.appendChild(renderManualReply(sendReply));
+      const { wrap: trailingWrap, textarea: trailingBox } = renderTrailingNotesBox("Anything else?");
+      interviewEl.appendChild(trailingWrap);
+
+      if (data.questions && data.questions.length) {
+        const submitBtn = document.createElement("button");
+        submitBtn.type = "button";
+        submitBtn.className = "glass-btn";
+        submitBtn.textContent = "Submit";
+        submitBtn.style.marginTop = "16px";
+        submitBtn.addEventListener("click", () => {
+          const lines = data.questions.map((q, i) => `${i + 1}. ${answers[q.id] || "(no answer)"}`);
+          if (trailingBox.value.trim()) lines.push(`Anything else: ${trailingBox.value.trim()}`);
+          sendReply(lines.join("\n"), submitBtn);
+        });
+        interviewEl.appendChild(submitBtn);
+      } else {
+        const sendBtn = document.createElement("button");
+        sendBtn.type = "button";
+        sendBtn.className = "glass-btn";
+        sendBtn.textContent = "Send";
+        sendBtn.style.marginTop = "16px";
+        sendBtn.addEventListener("click", () => sendReply(trailingBox.value, sendBtn));
+        interviewEl.appendChild(sendBtn);
+      }
     }
 
     function renderDetailsList(details) {
@@ -1589,7 +1644,7 @@
         startForm.style.display = "none";
         setHeading(headingForPhase("grilling"));
         showOnly(mainFlowEl);
-        renderInterview(session.interview || { preamble: "", sections: [] });
+        renderInterview(session.interview || { header: "", questions: [], footer: "" });
         return;
       }
 
@@ -1740,10 +1795,10 @@
         return;
       }
       leftCardId = data.card_id;
-      currentLeftSession = { card_id: data.card_id, phase: "grilling", interview: { preamble: "", sections: [] } };
+      currentLeftSession = { card_id: data.card_id, phase: "grilling", interview: { header: "", questions: [], footer: "" } };
       startForm.style.display = "none";
       setHeading(headingForPhase("grilling"));
-      renderInterview({ preamble: "", sections: [] });
+      renderInterview({ header: "", questions: [], footer: "" });
       connectStream(data.card_id);
     });
 
