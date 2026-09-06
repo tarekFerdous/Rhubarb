@@ -122,6 +122,8 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Protocol
 
+import pyte
+
 from rhubarb.cli_client import _clean_env, _effort_args, _plugin_args
 
 # Printed by the assistant (via --append-system-prompt, below) as the last
@@ -143,6 +145,38 @@ _MARKER_INSTRUCTION = (
 # Read chunk size for polling the PTY. Small enough not to over-buffer,
 # large enough that a normal turn doesn't need many round trips.
 _READ_CHUNK = 4096
+
+# Virtual screen size for `_render_terminal_text`'s terminal emulation --
+# deliberately far larger than any real terminal Claude Code itself would
+# have been given, so a normal turn's output is never truncated and never
+# forced to re-wrap differently than the source terminal already did.
+_VIRTUAL_SCREEN_COLUMNS = 200
+_VIRTUAL_SCREEN_LINES = 4000
+
+
+def _render_terminal_text(raw: str) -> str:
+    """Resolve `raw` -- true terminal-emulator input (ANSI escape codes,
+    cursor movement, and all), exactly as a real PTY produced it -- to the
+    plain text a person watching a real terminal would see once every
+    redraw/animation frame has settled to its final state.
+
+    Naively regex-stripping escape codes is not enough: an animated spinner
+    redrawing the same line in place would still concatenate every frame's
+    literal characters end-to-end. Feeding the raw bytes through a real
+    terminal emulator (`pyte`) and reading back the resolved screen content
+    is what correctly collapses that down to the final line, the same way
+    the live `xterm.js` terminal view already renders this same raw stream
+    correctly.
+
+    Only rows up to (and including) the one the cursor ended on are kept --
+    `pyte.Screen.display` always returns exactly `_VIRTUAL_SCREEN_LINES`
+    rows regardless of how much was actually written, and every row is
+    padded to `_VIRTUAL_SCREEN_COLUMNS` with spaces, so both are trimmed
+    back off to recover the real content and its original line count."""
+    screen = pyte.Screen(_VIRTUAL_SCREEN_COLUMNS, _VIRTUAL_SCREEN_LINES)
+    pyte.Stream(screen).feed(raw)
+    rows = screen.display[: screen.cursor.y + 1]
+    return "\n".join(row.rstrip() for row in rows)
 
 
 class PtyEngineError(RuntimeError):
@@ -379,12 +413,15 @@ class PtyEngine:
         accumulated output -- that is this turn's end-of-turn signal, since
         (unlike `-p`) the process never exits on its own. Text after the
         marker (there normally isn't any -- the instruction asks for it to
-        be the very last line) is dropped; text before it is exactly what
-        the caller sees as the turn's `result`, fenced-JSON markers like
-        `implement_blocked`/`qa_grilling` included, unmodified. (The
-        `terminal_output` chunks themselves are NOT stripped of the marker
-        text -- they mirror the real PTY stream byte-for-byte, marker line
-        included, same as a human watching the actual terminal would see.)
+        be the very last line) is dropped; text before it is resolved by
+        `_render_terminal_text` (ANSI escapes, cursor movement, and redraws
+        collapsed to their final rendered form) before becoming the turn's
+        `result`, fenced-JSON markers like `implement_blocked`/`qa_grilling`
+        included, readable exactly as a person watching the real terminal
+        would see them. (The `terminal_output` chunks themselves are NOT
+        touched by this -- they mirror the real PTY stream byte-for-byte,
+        marker line included, same as a human watching the actual terminal
+        would see, for the live-terminal-view consumer.)
 
         Crash/restart recovery (issue #86): if the process dies before
         printing the marker, this method automatically restarts it exactly
@@ -422,7 +459,8 @@ class PtyEngine:
                 ) from second_error
 
         text, _marker, _trailing = buffer.partition(TURN_COMPLETE_MARKER)
-        yield {"type": "result", "result": text, "session_id": self.claude_session_id, "is_error": False}
+        clean_text = _render_terminal_text(text)
+        yield {"type": "result", "result": clean_text, "session_id": self.claude_session_id, "is_error": False}
 
     def close(self) -> None:
         """Terminate the underlying PTY process, if one was started. Safe

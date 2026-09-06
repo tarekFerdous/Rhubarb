@@ -14,6 +14,9 @@ dependencies = [
     # Unix pty backend for `rhubarb.pty_engine`'s interactive session on
     # macOS/Linux (issue #85), mirroring the Windows-only gating above.
     "ptyprocess; platform_system != 'Windows'",
+    # Terminal emulator used to resolve a turn's raw PTY buffer (ANSI
+    # escapes, cursor movement, redraws) to its actual final rendered text.
+    "pyte",
 ]
 
 [project.optional-dependencies]

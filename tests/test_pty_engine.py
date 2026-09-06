@@ -257,13 +257,19 @@ def test_stream_turn_passes_through_fenced_json_marker_blocks_unmodified():
     """Rhubarb's existing markers (implement_blocked, qa_grilling -- see
     session_runner._parse_implement_blocked_block/_parse_qa_grilling_block)
     must survive unmangled inside the captured turn text; this engine only
-    ever looks for its own completion marker."""
+    ever looks for its own completion marker.
+
+    Line endings are real PTY output (`\\r\\n`), not bare `\\n` -- a PTY's
+    own line discipline performs that LF -> CRLF translation, so that's
+    what a real raw buffer actually contains, and it's what the terminal
+    emulation this engine now runs the buffer through (`_render_terminal_text`)
+    needs to correctly resolve column position across lines."""
     fenced_block = (
-        "Some preamble text.\n"
-        "```json\n"
-        '{"phase": "implement_blocked", "reason": "need a decision"}\n'
-        "```\n"
-        "Trailing text.\n"
+        "Some preamble text.\r\n"
+        "```json\r\n"
+        '{"phase": "implement_blocked", "reason": "need a decision"}\r\n'
+        "```\r\n"
+        "Trailing text.\r\n"
     )
     backend = FakePtyBackend([fenced_block + TURN_COMPLETE_MARKER + "\n"])
     factory, _ = _fake_factory(backend)
@@ -271,7 +277,115 @@ def test_stream_turn_passes_through_fenced_json_marker_blocks_unmodified():
 
     events = run(_collect(engine.stream_turn("go")))
 
-    assert fenced_block in events[-1]["result"]
+    assert (
+        'Some preamble text.\n```json\n{"phase": "implement_blocked", "reason": "need a decision"}\n```\nTrailing text.\n'
+        in events[-1]["result"]
+    )
+
+
+def test_stream_turn_resolves_ansi_color_codes_to_clean_text():
+    """A turn whose raw buffer includes 24-bit ANSI color codes must resolve
+    to plain, readable text in `result` -- no escape-sequence artifacts."""
+    raw = "\x1b[38;2;215;119;87mHello there.\x1b[0m\r\n"
+    backend = FakePtyBackend([raw + TURN_COMPLETE_MARKER + "\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("hi")))
+
+    assert events[-1]["result"] == "Hello there.\n"
+    assert "\x1b" not in events[-1]["result"]
+
+
+def test_stream_turn_resolves_cursor_positioning_sequences_to_clean_text():
+    """Cursor-positioning/erase-line escape sequences (used to redraw a
+    status line or the `>` prompt box in place) must resolve to the final
+    rendered text, not leak through as literal escape artifacts."""
+    raw = (
+        "\x1b[2J\x1b[H"  # clear screen, home cursor
+        "Line one.\r\n"
+        "\x1b[1;1H"  # reposition cursor back to the top row
+        "\x1b[2K"  # erase that line
+        "Replaced line one.\r\n"
+    )
+    backend = FakePtyBackend([raw + TURN_COMPLETE_MARKER + "\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("hi")))
+
+    result_text = events[-1]["result"]
+    assert "\x1b" not in result_text
+    assert "Replaced line one." in result_text
+    assert "Line one." not in result_text
+
+
+def test_stream_turn_collapses_an_animated_spinner_redraw_to_its_final_frame():
+    """An animated spinner (the same line redrawn in place via carriage
+    return + erase-line, as Claude Code's own 'thinking...' indicator does)
+    must collapse to its final settled frame, not concatenate every
+    intermediate frame's characters end-to-end -- reproducing this exact
+    bug's original failure mode (a manual copy of a spinner-redraw stream
+    shows every frame glued together)."""
+    raw = (
+        "\x1b[38;2;215;119;87mWorking\x1b[0m\r"
+        "\x1b[38;2;215;119;87mWorking.\x1b[0m\r"
+        "\x1b[38;2;215;119;87mWorking..\x1b[0m\r"
+        "\x1b[2K\rDone thinking.\r\n"
+        'Question 1: "Should this be Python or Node?"\r\n'
+    )
+    backend = FakePtyBackend([raw + TURN_COMPLETE_MARKER + "\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("hi")))
+
+    result_text = events[-1]["result"]
+    assert result_text == 'Done thinking.\nQuestion 1: "Should this be Python or Node?"\n'
+    assert "Working" not in result_text
+
+
+def test_stream_turn_terminal_output_events_still_carry_the_raw_unmodified_bytes():
+    """The live-terminal-view consumer must keep receiving the exact raw
+    PTY bytes, ANSI and all -- only the separate `result` text is resolved
+    through the terminal emulator."""
+    raw_chunk = "\x1b[38;2;215;119;87mHello there.\x1b[0m\r\n"
+    backend = FakePtyBackend([raw_chunk, TURN_COMPLETE_MARKER + "\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("hi")))
+
+    terminal_events = [e for e in events if e["type"] == "terminal_output"]
+    assert terminal_events[0]["data"] == raw_chunk
+    assert "\x1b[38;2;215;119;87m" in terminal_events[0]["data"]
+
+
+def test_stream_turn_extracts_fenced_json_markers_through_realistic_ansi_noise():
+    """implement_blocked/qa_grilling JSON markers must still be extractable
+    from the resolved `result` text even when real ANSI color/cursor noise
+    surrounds them -- not just plain text."""
+    from rhubarb.session_runner import _parse_implement_blocked_block
+
+    raw = (
+        "\x1b[38;2;215;119;87mSome preamble text.\x1b[0m\r\n"
+        "```json\r\n"
+        '{"phase": "implement_blocked", "issue": 8, "question": "Which provider?", "context": "ambiguous"}\r\n'
+        "```\r\n"
+    )
+    backend = FakePtyBackend([raw + TURN_COMPLETE_MARKER + "\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("go")))
+
+    blocked = _parse_implement_blocked_block(events[-1]["result"])
+    assert blocked == {
+        "phase": "implement_blocked",
+        "issue": 8,
+        "question": "Which provider?",
+        "context": "ambiguous",
+    }
 
 
 def test_stream_turn_raises_if_process_exits_before_printing_the_marker():
