@@ -764,11 +764,19 @@ textarea.prompt-box:focus {
   font-size: 0.85rem;
 }
 
+.session-card-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  width: 100%;
+}
+
 .session-card {
   display: flex;
   align-items: center;
   gap: 8px;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   text-align: left;
   padding: 10px 14px;
   border-radius: 14px;
@@ -781,6 +789,30 @@ textarea.prompt-box:focus {
 
 .session-card:hover {
   transform: translateY(-1px);
+}
+
+.session-card-close {
+  flex: 0 0 auto;
+  width: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 14px;
+  border: 1px solid var(--card-border);
+  background: transparent;
+  font-family: inherit;
+  color: var(--fg-muted);
+  font-size: 1.05rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: transform 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.session-card-close:hover {
+  transform: translateY(-1px);
+  background: rgba(220, 38, 38, 0.15);
+  color: #dc2626;
+  border-color: rgba(220, 38, 38, 0.45);
 }
 
 .session-card-dot {

@@ -357,8 +357,11 @@ def get_session(conn: sqlite3.Connection, session_row_id: int) -> sqlite3.Row | 
 
 
 def list_sessions_for_project(conn: sqlite3.Connection, project_id: int) -> list[sqlite3.Row]:
+    # A closed session (see `session_runner.close_session`) is excluded here
+    # so it can never be polled back into the frontend's session queue --
+    # closing is meant to be permanent, not just a phase label.
     return conn.execute(
-        "SELECT * FROM sessions WHERE project_id = ? ORDER BY created_at ASC",
+        "SELECT * FROM sessions WHERE project_id = ? AND phase != 'closed' ORDER BY created_at ASC",
         (project_id,),
     ).fetchall()
 

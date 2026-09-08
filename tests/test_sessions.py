@@ -221,6 +221,50 @@ def test_open_pty_tab_count_tracks_tabs_as_sessions_open_and_close(client, tmp_p
     assert session_runner.open_pty_tab_count() == 0
 
 
+def test_close_session_terminates_a_live_resident_engine(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    fake_class = _mock_engine(
+        monkeypatch,
+        lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")]),
+    )
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+    assert session_runner.open_pty_tab_count() == 1
+
+    session_runner.close_session(conn, row_id)
+
+    assert fake_class.instances[0].closed is True
+    assert session_runner.open_pty_tab_count() == 0
+
+
+def test_close_session_on_a_card_with_no_resident_engine_does_not_raise(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+
+    session_runner.close_session(conn, row_id)  # no PtyEngine was ever started for this card
+
+    assert db.get_session(conn, row_id)["phase"] == "closed"
+
+
+def test_close_session_marks_the_row_closed_and_publishes_a_terminal_event(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+
+    session_runner.close_session(conn, row_id)
+
+    assert db.get_session(conn, row_id)["phase"] == "closed"
+    events = live_stream._buffers.get(row_id, [])
+    assert {"type": "closed", "card_id": row_id} in events
+
+
 def test_two_sessions_advance_concurrently_without_cross_contamination(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)

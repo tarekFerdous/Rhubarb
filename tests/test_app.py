@@ -569,3 +569,33 @@ def test_sessions_list_blocked_is_none_when_not_blocked(client, tmp_path):
     sessions = client.get(f"/api/projects/{project_id}/sessions").json()["sessions"]
     [session] = [s for s in sessions if s["card_id"] == card_id]
     assert session["blocked"] is None
+
+
+def test_close_session_endpoint_marks_the_row_closed(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id)
+
+    resp = client.post(f"/api/sessions/{card_id}/close")
+    assert resp.json() == {"card_id": card_id}
+
+    row = db.get_session(conn, card_id)
+    assert row["phase"] == "closed"
+
+
+def test_close_session_endpoint_returns_error_for_unknown_session(client):
+    resp = client.post("/api/sessions/999999/close")
+    assert resp.json() == {"error": "Session not found"}
+
+
+def test_sessions_list_excludes_a_closed_session(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id)
+
+    client.post(f"/api/sessions/{card_id}/close")
+
+    sessions = client.get(f"/api/projects/{project_id}/sessions").json()["sessions"]
+    assert card_id not in [s["card_id"] for s in sessions]

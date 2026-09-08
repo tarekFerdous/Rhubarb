@@ -153,6 +153,25 @@ def _close_engine(card_id: int) -> None:
         engine.close()
 
 
+def close_session(conn, card_id: int) -> None:
+    """User-initiated permanent close of a session card (issue #121): tears
+    down this card's resident `PtyEngine` tab exactly like any other
+    engine-death path (`_close_engine` -- pop and terminate, safe no-op if
+    there isn't one), marks the row `phase="closed"` so
+    `db.list_sessions_for_project` excludes it from now on, and publishes a
+    terminal `closed` event so any live SSE stream for this card (foreground
+    or background) ends the same way a naturally-finished session's `done`
+    event does (see `stream_session` in `rhubarb/web/app.py`).
+
+    No literal `/clear` turn is sent into the PTY first -- the process is
+    destroyed directly, same rationale as `_spawn_fresh_engine`'s docstring:
+    the point is to end this conversation for good, not to round-trip a
+    slash command into a process that may itself be mid-turn."""
+    _close_engine(card_id)
+    db.update_session(conn, card_id, phase="closed")
+    publish(card_id, {"type": "closed", "card_id": card_id})
+
+
 def open_pty_tab_count() -> int:
     """How many `PtyEngine` "tabs" are currently resident (issue #88) --
     one per `card_id` with a live entry in `_pty_engines`, across every

@@ -222,6 +222,21 @@
     </div>
   </div>
 
+  <!-- Confirmation for the session-queue close button (issue #122): a
+       closed session's PtyEngine is killed outright, so this warns before
+       an irreversible action. -->
+  <div id="close-session-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 class="modal-heading">Close Session</h2>
+      <p id="close-session-label" class="modal-text"></p>
+      <p class="modal-text">This action will kill the terminal and the current session will not be retrievable.</p>
+      <div class="ready-to-proceed-actions">
+        <button id="close-session-cancel-btn" class="glass-btn" type="button">Cancel</button>
+        <button id="close-session-confirm-btn" class="glass-btn" type="button">Close Session</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     let activeProject = null;
     let leftCardId = null;
@@ -237,6 +252,12 @@
     let blockedTakeoverCardId = null;
     const rightCards = new Map();
     const backgroundSources = new Map();
+    // card_id's the user has closed via the session-queue close button --
+    // permanent for the life of the page, checked at the top of
+    // `handleStreamEvent` so a straggling in-flight SSE event for an
+    // already-closed card can never resurrect it in the queue.
+    const closedCardIds = new Set();
+    let closeSessionTargetCardId = null;
 
     const startForm = document.getElementById("start-form");
     const interviewEl = document.getElementById("interview");
@@ -265,6 +286,10 @@
     const ollamaGateRetryActionsEl = document.getElementById("ollama-gate-retry-actions");
     const ollamaGateRetryBtnEl = document.getElementById("ollama-gate-retry-btn");
     const ollamaGateSkipBtnEl = document.getElementById("ollama-gate-skip-btn");
+    const closeSessionModalEl = document.getElementById("close-session-modal");
+    const closeSessionLabelEl = document.getElementById("close-session-label");
+    const closeSessionCancelBtnEl = document.getElementById("close-session-cancel-btn");
+    const closeSessionConfirmBtnEl = document.getElementById("close-session-confirm-btn");
     const modelSelectCardEl = document.getElementById("model-select-card");
     const modelSelectSettingsEl = document.getElementById("model-select-settings");
     const modelChangeModalEl = document.getElementById("model-change-modal");
@@ -1219,6 +1244,27 @@
     }
 
     function handleStreamEvent(cardId, es, event) {
+      // A card the user has already closed never processes another event --
+      // guards against a straggling in-flight event (published right before
+      // the engine died) resurrecting it in the queue.
+      if (closedCardIds.has(cardId)) {
+        es.close();
+        if (eventSource === es) eventSource = null;
+        if (backgroundSources.get(cardId) === es) backgroundSources.delete(cardId);
+        return;
+      }
+
+      if (event.type === "closed") {
+        closedCardIds.add(cardId);
+        rightCards.delete(cardId);
+        cardSnapshots.delete(cardId);
+        es.close();
+        if (eventSource === es) eventSource = null;
+        if (backgroundSources.get(cardId) === es) backgroundSources.delete(cardId);
+        renderQueue();
+        return;
+      }
+
       // Bookkeeping events apply to `cardId` regardless of which card is
       // currently focused -- a minimized session keeps advancing in the
       // background and its snapshot must stay current for when it's refocused.
@@ -1869,6 +1915,12 @@
       sessionCountEl.textContent = total > 0 ? `(${total})` : "";
 
       rightCards.forEach((session) => {
+        // The card itself is the original single button, unchanged -- the
+        // close button is a same-height sibling to its right, not nested
+        // inside it, wrapped together in a row so they lay out as one unit.
+        const row = document.createElement("div");
+        row.className = "session-card-row";
+
         const card = document.createElement("button");
         card.type = "button";
         card.className = "session-card";
@@ -1895,9 +1947,49 @@
         }
 
         card.addEventListener("click", () => focusCard(session.card_id));
-        sessionQueueEl.appendChild(card);
+        row.appendChild(card);
+
+        const closeBtn = document.createElement("button");
+        closeBtn.type = "button";
+        closeBtn.className = "session-card-close";
+        closeBtn.textContent = "×";
+        closeBtn.setAttribute("aria-label", "Close session");
+        closeBtn.addEventListener("click", () => openCloseSessionModal(session.card_id));
+        row.appendChild(closeBtn);
+
+        sessionQueueEl.appendChild(row);
       });
     }
+
+    function openCloseSessionModal(cardId) {
+      const session = rightCards.get(cardId);
+      closeSessionTargetCardId = cardId;
+      closeSessionLabelEl.textContent = session ? queueLabelForSession(session) : "";
+      closeSessionModalEl.hidden = false;
+    }
+
+    function dismissCloseSessionModal() {
+      closeSessionModalEl.hidden = true;
+      closeSessionTargetCardId = null;
+    }
+
+    async function confirmCloseSession() {
+      const cardId = closeSessionTargetCardId;
+      if (cardId === null) return;
+      dismissCloseSessionModal();
+
+      await fetch(`/api/sessions/${cardId}/close`, { method: "POST" });
+
+      closedCardIds.add(cardId);
+      rightCards.delete(cardId);
+      cardSnapshots.delete(cardId);
+      const bgEs = backgroundSources.get(cardId);
+      if (bgEs) { bgEs.close(); backgroundSources.delete(cardId); }
+      renderQueue();
+    }
+
+    closeSessionCancelBtnEl.addEventListener("click", dismissCloseSessionModal);
+    closeSessionConfirmBtnEl.addEventListener("click", confirmCloseSession);
 
     function focusCard(cardId) {
       const session = rightCards.get(cardId);

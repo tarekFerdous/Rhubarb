@@ -389,12 +389,12 @@ async def stream_session(card_id: int):
         try:
             for event in history:
                 yield f"data: {json.dumps(event)}\n\n"
-            if history and history[-1].get("type") == "done":
+            if history and history[-1].get("type") in ("done", "closed"):
                 return
             while True:
                 event = await queue.get()
                 yield f"data: {json.dumps(event)}\n\n"
-                if event.get("type") == "done":
+                if event.get("type") in ("done", "closed"):
                     return
         finally:
             live_stream.unsubscribe(card_id, queue)
@@ -483,6 +483,17 @@ async def retry_session(card_id: int):
     cwd = _active_project_cwd()
     asyncio.create_task(session_runner.retry_session_job(card_id, cwd))
 
+    return {"card_id": card_id}
+
+
+@app.post("/api/sessions/{card_id}/close")
+def close_session(card_id: int):
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    if row is None:
+        return {"error": "Session not found"}
+
+    session_runner.close_session(conn, card_id)
     return {"card_id": card_id}
 
 
