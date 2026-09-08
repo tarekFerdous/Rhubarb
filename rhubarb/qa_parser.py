@@ -191,7 +191,7 @@ def _parse_grilling_question(lines: list[str]) -> dict:
 
 
 def parse_grilling_response(text: str) -> dict:
-    """Return {"header": str, "questions": [...], "footer": str}.
+    """Return {"header": str, "questions": [...], "footer": str, "source": "regex"}.
 
     Each question is
     {"id": str, "text": str, "kind": "single"|"multi"|"open",
@@ -201,13 +201,18 @@ def parse_grilling_response(text: str) -> dict:
     `header` is the free text before the first `Question N:` line; `footer`
     is the free text after the last question's own structured content. Both
     are `""` when absent. A response with no `Question N:` lines at all
-    returns `{"header": <all text>, "questions": [], "footer": ""}`.
+    returns `{"header": <all text>, "questions": [], "footer": "", "source": "regex"}`.
+
+    `source` is always `"regex"` here -- it distinguishes this deterministic
+    parse from `ollama_rescue.rescue_grilling_response`'s `"ollama_rescue"`,
+    so the frontend can flag a rescue-derived question set for the user to
+    double-check.
     """
     lines = _reflow(text).splitlines()
     header_indices = [i for i, line in enumerate(lines) if _GRILLING_Q_RE.match(line.strip())]
 
     if not header_indices:
-        return {"header": _join(lines), "questions": [], "footer": ""}
+        return {"header": _join(lines), "questions": [], "footer": "", "source": "regex"}
 
     header = _join(lines[: header_indices[0]])
 
@@ -218,11 +223,12 @@ def parse_grilling_response(text: str) -> dict:
 
     footer = _join(_footer_lines(lines[header_indices[-1] :]))
 
-    return {"header": header, "questions": questions, "footer": footer}
+    return {"header": header, "questions": questions, "footer": footer, "source": "regex"}
 
 
 def parse_qa_response(text: str) -> dict:
-    """Return {"prd": {"number": int, "title": str} | None, "issues": [...]}.
+    """Return {"prd": {"number": int, "title": str} | None, "issues": [...],
+    "source": "regex"}.
 
     Each issue is {"number": int, "title": str, "questions": [...]}, and each
     question is {"id": str, "text": str, "recommended_text": str | None} --
@@ -230,13 +236,14 @@ def parse_qa_response(text: str) -> dict:
     to the issue (`Question N:` numbering restarts per issue) but unique
     across the whole session, shaped `issue<issue_number>-q<n>`.
 
-    Returns `{"prd": None, "issues": []}` when the text doesn't contain a
-    `QA session for PRD N: "..."` header line.
+    Returns `{"prd": None, "issues": [], "source": "regex"}` when the text
+    doesn't contain a `QA session for PRD N: "..."` header line. `source` is
+    always `"regex"` here -- see `parse_grilling_response`'s docstring.
     """
     lines = _reflow(text).splitlines()
     prd_index = next((i for i, line in enumerate(lines) if _QA_HEADER_RE.match(line.strip())), None)
     if prd_index is None:
-        return {"prd": None, "issues": []}
+        return {"prd": None, "issues": [], "source": "regex"}
 
     prd_match = _QA_HEADER_RE.match(lines[prd_index].strip())
     prd = {"number": int(prd_match.group(1)), "title": prd_match.group(2)}
@@ -272,4 +279,4 @@ def parse_qa_response(text: str) -> dict:
 
         issues.append({"number": issue_number, "title": issue_title, "questions": questions})
 
-    return {"prd": prd, "issues": issues}
+    return {"prd": prd, "issues": issues, "source": "regex"}

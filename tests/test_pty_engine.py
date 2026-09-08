@@ -345,6 +345,94 @@ def test_stream_turn_collapses_an_animated_spinner_redraw_to_its_final_frame():
     assert "Working" not in result_text
 
 
+# ---------------------------------------------------------------------------
+# Character-level corruption fix (issue #117): pyte's CSI parser terminating
+# early on a `:`-delimited SGR subparameter, and pyte's `Screen.draw`
+# silently abandoning the rest of a draw call on a zero-width/format
+# character that isn't a combining mark.
+# ---------------------------------------------------------------------------
+
+
+def test_stream_turn_resolves_multibyte_unicode_adjacent_to_ansi_formatting_with_no_replacement_character():
+    """An em dash sitting directly against ANSI/control sequences on both
+    sides -- a bold SGR pair, and a colon-delimited SGR subparameter
+    sequence (`CSI 4:3 m`, the ISO-8613-6 curly-underline/24-bit-color
+    style some terminal UI libraries emit) -- must resolve to the exact
+    plain text, with no `�` replacement character and no bytes
+    dropped."""
+    raw = (
+        "before \x1b[1m—\x1b[0m after\r\n"
+        "styled \x1b[4:3m—\x1b[24m done\r\n"
+    )
+    backend = FakePtyBackend([raw + TURN_COMPLETE_MARKER + "\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("hi")))
+
+    result_text = events[-1]["result"]
+    assert result_text == "before — after\nstyled — done\n"
+    assert "�" not in result_text
+
+
+def test_stream_turn_resolves_ascii_adjacent_to_the_same_control_sequences_with_no_dropped_character():
+    """The same two control-sequence classes -- a bold SGR pair, and a
+    colon-delimited SGR subparameter sequence -- plus a zero-width joiner
+    sitting right next to plain text (a format character pyte's
+    `Screen.draw` otherwise chokes on, silently dropping everything after
+    it) -- must not drop or mangle any of the surrounding plain ASCII text.
+    The zero-width joiner itself carries no width and is dropped by design
+    (see `_strip_unadvancing_format_characters`) -- a real terminal's own
+    font shaping is what would otherwise fuse it with its neighbors into
+    one glyph, which this plain-text rendering never attempted anyway."""
+    raw = (
+        "before \x1b[1mgate\x1b[0m after\r\n"
+        "styled \x1b[4:3mgate\x1b[24m done\r\n"
+        "joined \U0001f9d1‍\U0001f4bb gate open\r\n"
+    )
+    backend = FakePtyBackend([raw + TURN_COMPLETE_MARKER + "\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("hi")))
+
+    result_text = events[-1]["result"]
+    assert result_text == (
+        "before gate after\n"
+        "styled gate done\n"
+        "joined \U0001f9d1\U0001f4bb gate open\n"
+    )
+
+
+def test_stream_turn_reproduces_the_production_corruption_pattern_gate_and_em_dash():
+    """Regression for the real corrupted `console_text` this issue was
+    filed from: a dropped character in the word "gate" (caused by a
+    zero-width joiner landing next to it -- see
+    `_strip_unadvancing_format_characters`), an em dash sitting against a
+    colon-delimited SGR subparameter sequence (see
+    `_desubparameterize_csi_sequences`), and a `Question 2:` header line
+    immediately after both -- all in the same surrounding multi-line,
+    ANSI-colored transcript a real interactive turn would produce. None of
+    the three may be corrupted or go missing."""
+    raw = (
+        "\x1b[38;2;215;119;87mPassing the next g​ate\x1b[0m requires review—\r\n"
+        "\x1b[4:3msign-off—\x1b[24m confirmed\r\n"
+        'Question 2: "Should this ship behind a flag?"\r\n'
+    )
+    backend = FakePtyBackend([raw + TURN_COMPLETE_MARKER + "\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("hi")))
+
+    result_text = events[-1]["result"]
+    assert "gate" in result_text
+    assert "g te" not in result_text
+    assert "�" not in result_text
+    assert "—" in result_text
+    assert 'Question 2: "Should this ship behind a flag?"' in result_text
+
+
 def test_stream_turn_terminal_output_events_still_carry_the_raw_unmodified_bytes():
     """The live-terminal-view consumer must keep receiving the exact raw
     PTY bytes, ANSI and all -- only the separate `result` text is resolved

@@ -529,6 +529,67 @@ def test_grilling_turn_falls_back_to_empty_result_when_ollama_rescue_returns_non
     assert interview["questions"] == []
 
 
+def test_grilling_turn_skips_ollama_rescue_when_declined(client, tmp_path, monkeypatch):
+    """Issue #119: with `ollama_declined` true, a turn whose regex parse is
+    empty and whose raw text contains the trigger substring must NOT invoke
+    the rescue function -- the toggle must actually gate the rescue call,
+    not just the install-gate modal's own display logic."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    malformed_text = 'Question 1: The quote never closes, so the regex parser finds nothing here.\n'
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_text)]))
+
+    def fake_rescue(raw_text):
+        raise AssertionError("rescue must not be called when ollama_declined is true")
+
+    monkeypatch.setattr(session_runner, "rescue_grilling_response", fake_rescue)
+
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, True)
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    interview = json.loads(row["interview_json"])
+    assert interview["questions"] == []
+
+
+def test_grilling_turn_uses_ollama_rescue_when_not_declined(client, tmp_path, monkeypatch):
+    """Issue #119: with `ollama_declined` explicitly false, the rescue call
+    still fires, unchanged from current behavior."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    malformed_text = 'Question 1: The quote never closes, so the regex parser finds nothing here.\n'
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_text)]))
+
+    rescued = {
+        "header": "",
+        "footer": "",
+        "questions": [
+            {
+                "id": "q1",
+                "text": "Rescued question text",
+                "kind": "open",
+                "options": None,
+                "recommended": None,
+                "recommended_text": None,
+            }
+        ],
+    }
+    monkeypatch.setattr(session_runner, "rescue_grilling_response", lambda raw_text: rescued)
+
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, False)
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    interview = json.loads(row["interview_json"])
+    assert interview == rescued
+
+
 def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, tmp_path, monkeypatch):
     """Issue #33: the explicit "Yes, proceed" path (confirm_advance=True)
     must go straight to /rhubarb:to-prd -> /rhubarb:to-issues -> details, resuming the
@@ -1608,6 +1669,93 @@ def test_start_implement_job_uses_ollama_rescue_when_qa_regex_parser_finds_nothi
     asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
 
     assert seen["raw_text"] == malformed_qa_text
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    qa_row = next(s for s in sessions if s["session_type"] == "qa")
+    qa_events = live_stream._buffers.get(qa_row["id"], [])
+    qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
+    assert qa_turn_events[0]["issues"] == rescued["issues"]
+
+
+def test_start_implement_job_skips_ollama_rescue_when_declined(client, tmp_path, monkeypatch):
+    """Issue #119: with `ollama_declined` true, a QA handoff turn whose free
+    text looks like it was trying to be a QA session but doesn't match the
+    strict regex format must NOT invoke the rescue function -- it falls back
+    to the parser's original (empty) issues, same as Ollama being unavailable."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    tracker = {
+        "prd": {"number": 7, "title": "Tracked PRD"},
+        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
+        "qa_changes": [],
+        "status": "implemented",
+    }
+    claude_dir = Path(cwd) / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+
+    malformed_qa_text = _QA_BLOCK + "\n\nQA session for PRD 7: this is malformed, no quoted title at all\n"
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_qa_text, session_id="qa-session-id")]))
+
+    def fake_rescue(raw_text):
+        raise AssertionError("rescue must not be called when ollama_declined is true")
+
+    monkeypatch.setattr(session_runner, "rescue_qa_response", fake_rescue)
+
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, True)
+    row_id = db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    qa_row = next(s for s in sessions if s["session_type"] == "qa")
+    qa_events = live_stream._buffers.get(qa_row["id"], [])
+    qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
+    assert qa_turn_events[0]["issues"] == []
+
+
+def test_start_implement_job_uses_ollama_rescue_when_not_declined(client, tmp_path, monkeypatch):
+    """Issue #119: with `ollama_declined` explicitly false, the QA rescue
+    call still fires, unchanged from current behavior."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    tracker = {
+        "prd": {"number": 7, "title": "Tracked PRD"},
+        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
+        "qa_changes": [],
+        "status": "implemented",
+    }
+    claude_dir = Path(cwd) / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+
+    malformed_qa_text = _QA_BLOCK + "\n\nQA session for PRD 7: this is malformed, no quoted title at all\n"
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_qa_text, session_id="qa-session-id")]))
+
+    rescued = {
+        "prd": {"number": 7, "title": "Tracked PRD"},
+        "issues": [
+            {"number": 8, "title": "Child", "questions": [{"id": "issue8-q1", "text": "Rescued question", "recommended_text": None}]}
+        ],
+    }
+    monkeypatch.setattr(session_runner, "rescue_qa_response", lambda raw_text: rescued)
+
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, False)
+    row_id = db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
 
     sessions = db.list_sessions_for_project(conn, project_id)
     qa_row = next(s for s in sessions if s["session_type"] == "qa")

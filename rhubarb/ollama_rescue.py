@@ -142,6 +142,7 @@ def _call_ollama(prompt: str, schema: dict, *, http_post=None):
     connection error, invalid JSON). Never raises."""
     http_post = http_post or _default_http_post
     body = {"model": OLLAMA_MODEL, "prompt": prompt, "format": schema, "stream": False}
+    print(prompt)
     try:
         result = http_post(f"{OLLAMA_BASE_URL}/api/generate", body, timeout=RESCUE_TIMEOUT_SECONDS)
         return json.loads(result["response"])
@@ -162,12 +163,28 @@ def _is_valid_grilling_shape(data) -> bool:
             return False
         if not isinstance(q.get("id"), str) or not isinstance(q.get("text"), str):
             return False
-        if q.get("kind") not in ("single", "multi", "open"):
+        if not q["text"].strip():
             return False
-        if q.get("options") is not None and not isinstance(q.get("options"), list):
+        kind = q.get("kind")
+        if kind not in ("single", "multi", "open"):
             return False
-        if q.get("recommended") is not None and not isinstance(q.get("recommended"), list):
+        options = q.get("options")
+        if options is not None:
+            if not isinstance(options, list) or not options:
+                return False
+        if kind == "open" and options is not None:
             return False
+        recommended = q.get("recommended")
+        if recommended is not None:
+            if not isinstance(recommended, list):
+                return False
+            # An index can only be checked against options that actually
+            # exist -- no options means no valid index at all.
+            if not options:
+                return False
+            for idx in recommended:
+                if not isinstance(idx, int) or isinstance(idx, bool) or not (1 <= idx <= len(options)):
+                    return False
         if q.get("recommended_text") is not None and not isinstance(q.get("recommended_text"), str):
             return False
     return True
@@ -188,6 +205,8 @@ def _is_valid_qa_shape(data) -> bool:
             return False
         if not isinstance(issue.get("number"), int) or not isinstance(issue.get("title"), str):
             return False
+        if not issue["title"].strip():
+            return False
         questions = issue.get("questions")
         if not isinstance(questions, list):
             return False
@@ -196,6 +215,8 @@ def _is_valid_qa_shape(data) -> bool:
                 return False
             if not isinstance(q.get("id"), str) or not isinstance(q.get("text"), str):
                 return False
+            if not q["text"].strip():
+                return False
             if q.get("recommended_text") is not None and not isinstance(q.get("recommended_text"), str):
                 return False
     return True
@@ -203,15 +224,25 @@ def _is_valid_qa_shape(data) -> bool:
 
 def rescue_grilling_response(raw_text: str, *, http_post=None) -> dict | None:
     """Attempt to rescue a grilling turn's raw text into the
-    `{header, questions, footer}` shape via Ollama. Returns `None` on any
-    failure -- callers fall back to the pre-rescue empty result."""
+    `{header, questions, footer, source}` shape via Ollama, with
+    `source: "ollama_rescue"` marking it as such (see `qa_parser.
+    parse_grilling_response`'s `"regex"` counterpart) so the frontend can
+    flag it for the user to double-check. Returns `None` on any failure --
+    callers fall back to the pre-rescue empty result."""
     data = _call_ollama(_GRILLING_PROMPT_TEMPLATE.format(text=raw_text), _GRILLING_SCHEMA, http_post=http_post)
-    return data if _is_valid_grilling_shape(data) else None
+    if not _is_valid_grilling_shape(data):
+        return None
+    data["source"] = "ollama_rescue"
+    return data
 
 
 def rescue_qa_response(raw_text: str, *, http_post=None) -> dict | None:
-    """Attempt to rescue a QA turn's raw text into the `{prd, issues}`
-    shape via Ollama. Returns `None` on any failure -- callers fall back
+    """Attempt to rescue a QA turn's raw text into the
+    `{prd, issues, source}` shape via Ollama, with `source: "ollama_rescue"`
+    marking it as such. Returns `None` on any failure -- callers fall back
     to the pre-rescue empty result."""
     data = _call_ollama(_QA_PROMPT_TEMPLATE.format(text=raw_text), _QA_SCHEMA, http_post=http_post)
-    return data if _is_valid_qa_shape(data) else None
+    if not _is_valid_qa_shape(data):
+        return None
+    data["source"] = "ollama_rescue"
+    return data

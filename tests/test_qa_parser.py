@@ -214,8 +214,8 @@ def test_qa_multiple_issues_multiple_questions_grouped_correctly():
 
 
 def test_qa_response_without_prd_header_returns_empty_result():
-    assert parse_qa_response("Implemented PRD #5, nothing to verify yet.") == {"prd": None, "issues": []}
-    assert parse_qa_response("") == {"prd": None, "issues": []}
+    assert parse_qa_response("Implemented PRD #5, nothing to verify yet.") == {"prd": None, "issues": [], "source": "regex"}
+    assert parse_qa_response("") == {"prd": None, "issues": [], "source": "regex"}
 
 
 # ---------------------------------------------------------------------------
@@ -324,3 +324,38 @@ def test_reflow_does_not_merge_across_a_blank_line_between_qa_issues():
     assert len(result["issues"]) == 2
     assert result["issues"][0]["number"] == 99
     assert result["issues"][1]["number"] == 100
+
+
+# ---------------------------------------------------------------------------
+# "source" key (issue #118) -- always "regex" for this module's parsers,
+# distinguishing their output from ollama_rescue.py's "ollama_rescue"
+# ---------------------------------------------------------------------------
+
+
+def test_parse_grilling_response_source_is_regex_with_questions_found():
+    text = 'Question 1: "Where should this run?"\n'
+
+    assert parse_grilling_response(text)["source"] == "regex"
+
+
+def test_parse_grilling_response_source_is_regex_when_no_questions_found():
+    result = parse_grilling_response("Thanks, that's everything I need.")
+
+    assert result == {"header": "Thanks, that's everything I need.", "questions": [], "footer": "", "source": "regex"}
+
+
+def test_parse_qa_response_source_is_regex_with_issues_found():
+    text = (
+        'QA session for PRD 98: "Structured question format"\n'
+        "\n"
+        'Issue 99: "Fix textarea auto-grow bug"\n'
+        'Question 1: "Does it resize?"\n'
+    )
+
+    assert parse_qa_response(text)["source"] == "regex"
+
+
+def test_parse_qa_response_source_is_regex_when_no_prd_header_found():
+    result = parse_qa_response("Implemented PRD #5, nothing to verify yet.")
+
+    assert result == {"prd": None, "issues": [], "source": "regex"}

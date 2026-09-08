@@ -441,12 +441,15 @@ async def _run_grilling_turn(
         return None
 
     parsed = parse_grilling_response(turn["result"])
-    if should_attempt_grilling_rescue(parsed, turn["result"]):
+    if should_attempt_grilling_rescue(parsed, turn["result"]) and not db.get_ollama_declined(conn):
         # The regex parser found nothing, but the text looks like it was
         # trying to be in the structured format -- give the local Ollama
         # rescue path (issue #114) a chance before giving up. A `None`
         # result (Ollama unavailable/invalid response/timeout) just keeps
         # `parsed` as the original empty result, same as before this existed.
+        # Skipped entirely when the user has declined Ollama-assisted
+        # parsing (issue #119) -- same empty-result fallback as if the
+        # rescue call had run and come back unavailable.
         rescued = await asyncio.to_thread(rescue_grilling_response, turn["result"])
         if rescued is not None:
             parsed = rescued
@@ -905,10 +908,11 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
         # fresh (reattached via --resume) on its own first turn.
         qa_prd = qa_data.get("prd")
         qa_parsed = parse_qa_response(turn["result"])
-        if should_attempt_qa_rescue(qa_parsed, turn["result"]):
+        if should_attempt_qa_rescue(qa_parsed, turn["result"]) and not db.get_ollama_declined(conn):
             # Same rescue path as grilling (issue #114) -- the regex parser
             # found nothing despite text that looks like it was trying to
-            # be a QA session.
+            # be a QA session. Skipped when Ollama-assisted parsing has been
+            # declined (issue #119) -- falls back to the empty parsed result.
             rescued = await asyncio.to_thread(rescue_qa_response, turn["result"])
             if rescued is not None:
                 qa_parsed = rescued

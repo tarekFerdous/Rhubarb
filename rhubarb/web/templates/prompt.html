@@ -1079,9 +1079,24 @@
       };
     }
 
+    // A rescued (Ollama-extracted) question set is schema-valid but never
+    // guaranteed content-correct (see ollama_rescue.py) -- flag it so the
+    // user knows to double-check it, same signal for both grilling and QA.
+    // Absent/undefined `source` (any session persisted before this existed)
+    // is treated the same as "regex": no badge.
+    function appendRescueBadge(container, source) {
+      if (source !== "ollama_rescue") return;
+      const badge = document.createElement("span");
+      badge.className = "rescue-source-badge";
+      badge.textContent = "AI-extracted -- verify";
+      container.appendChild(badge);
+    }
+
     function renderQaGrilling(data) {
       interviewEl.innerHTML = "";
       startForm.style.display = "none";
+
+      appendRescueBadge(interviewEl, data.interview && data.interview.source);
 
       if (data.prd && data.prd.title) {
         const p = document.createElement("p");
@@ -1629,6 +1644,8 @@
     function renderInterview(data) {
       interviewEl.innerHTML = "";
       const answers = {};
+
+      appendRescueBadge(interviewEl, data.source);
 
       if (data.header) {
         const p = document.createElement("p");

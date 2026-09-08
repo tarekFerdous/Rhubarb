@@ -118,11 +118,14 @@ docstring for the failure shape a future caller should key off of).
 
 import asyncio
 import platform
+import re
+import unicodedata
 import uuid
 from collections.abc import AsyncIterator
 from typing import Protocol
 
 import pyte
+from wcwidth import wcwidth
 
 from rhubarb.cli_client import _clean_env, _effort_args, _plugin_args
 
@@ -165,6 +168,65 @@ _PTY_ROWS = 50
 _PTY_COLUMNS = _VIRTUAL_SCREEN_COLUMNS
 
 
+# Matches a CSI parameter block (digits/semicolons/colons) immediately
+# followed by its final byte -- used by `_desubparameterize_csi_sequences`
+# below to rewrite colon-delimited SGR subparameters (`CSI 4:3 m`, the
+# ISO-8613-6 style some terminal UI libraries emit for e.g. curly
+# underlines, and 24-bit colors written `CSI 38:2::r:g:b m`) to the
+# semicolon-delimited form pyte's parser actually understands.
+_CSI_COLON_PARAMS_RE = re.compile(r"(\x1b\[[0-9:;]*):([0-9:;]*[A-Za-z])")
+
+
+def _desubparameterize_csi_sequences(raw: str) -> str:
+    """Rewrite `:`-delimited CSI parameters to the `;`-delimited form.
+
+    pyte's CSI parser (`pyte.streams.Stream._parser_fsm`) only recognizes
+    `;` as a parameter separator. On an unrecognized separator character --
+    which includes `:`, valid per ECMA-48/ISO-8613-6 and emitted by some
+    terminal UI libraries for SGR subparameters (curly-underline styles,
+    24-bit color `CSI 38:2::r:g:bm`) -- it treats that character as if it
+    were the sequence's OWN final byte: it dispatches immediately (to a
+    no-op debug handler, since e.g. `:` isn't a real CSI final byte) and
+    returns to plain-text mode. Every character after the `:` up to the
+    real final byte (`m`, etc.) is then read back out of CSI mode and drawn
+    onto the screen as literal, visible text -- e.g. `\\x1b[4:3mgate` renders
+    as `3mgate`, not `gate`. Repeated application handles more than one
+    colon-delimited sequence (and more than one colon within a single
+    sequence) in the same input."""
+    rewritten = _CSI_COLON_PARAMS_RE.sub(r"\1;\2", raw)
+    while rewritten != raw:
+        raw = rewritten
+        rewritten = _CSI_COLON_PARAMS_RE.sub(r"\1;\2", raw)
+    return rewritten
+
+
+def _strip_unadvancing_format_characters(raw: str) -> str:
+    """Drop Unicode format/zero-width characters (e.g. a variation
+    selector like U+FE0F completing an emoji, a zero-width joiner joining
+    two emoji into one, a zero-width space) that `pyte.Screen.draw` cannot
+    place on the screen.
+
+    `Screen.draw` advances the cursor by each character's `wcwidth()` and
+    only knows how to handle three cases: a normal (width 1 or 2) character,
+    or a *combining* (`unicodedata.combining(char)` truthy) zero-width
+    character, which it merges into the previous cell. Anything else with
+    zero or negative width -- a non-combining format character, or a
+    codepoint `wcwidth` doesn't recognize at all (-1) -- hits `draw`'s
+    `else: break`, which silently abandons the REST of that `draw()` call's
+    text, not just the offending character. Since a format character never
+    occupies a screen cell on a real terminal either, dropping it here
+    (rather than handing it to pyte) changes nothing about what a person
+    watching the real terminal would see, while avoiding that crash-stop.
+    Only codepoints above the C0/C1 control range are considered, so
+    control/escape bytes pyte's own parser (not `draw`) is responsible for
+    (`\\x1b`, `\\x9b`, etc.) are never touched here."""
+    return "".join(
+        char
+        for char in raw
+        if not (ord(char) > 0x9F and wcwidth(char) <= 0 and not unicodedata.combining(char))
+    )
+
+
 def _render_terminal_text(raw: str) -> str:
     """Resolve `raw` -- true terminal-emulator input (ANSI escape codes,
     cursor movement, and all), exactly as a real PTY produced it -- to the
@@ -183,7 +245,16 @@ def _render_terminal_text(raw: str) -> str:
     `pyte.Screen.display` always returns exactly `_VIRTUAL_SCREEN_LINES`
     rows regardless of how much was actually written, and every row is
     padded to `_VIRTUAL_SCREEN_COLUMNS` with spaces, so both are trimmed
-    back off to recover the real content and its original line count."""
+    back off to recover the real content and its original line count.
+
+    Before `raw` reaches pyte, two pyte parser/screen defects that
+    otherwise corrupt or drop ordinary text are worked around --
+    see `_desubparameterize_csi_sequences` and
+    `_strip_unadvancing_format_characters` for exactly what each one fixes
+    and why. Both are no-ops on input that doesn't trigger them, so
+    ordinary text/ANSI resolves exactly as already documented above."""
+    raw = _desubparameterize_csi_sequences(raw)
+    raw = _strip_unadvancing_format_characters(raw)
     screen = pyte.Screen(_VIRTUAL_SCREEN_COLUMNS, _VIRTUAL_SCREEN_LINES)
     pyte.Stream(screen).feed(raw)
     rows = screen.display[: screen.cursor.y + 1]

@@ -17,6 +17,11 @@ dependencies = [
     # Terminal emulator used to resolve a turn's raw PTY buffer (ANSI
     # escapes, cursor movement, redraws) to its actual final rendered text.
     "pyte",
+    # Character-width lookups used directly by `rhubarb.pty_engine` to work
+    # around a pyte `Screen.draw` defect (see `_strip_unadvancing_format_
+    # characters`) -- already an indirect dependency via pyte, declared
+    # explicitly here since pty_engine.py now imports it itself.
+    "wcwidth",
 ]
 
 [project.optional-dependencies]

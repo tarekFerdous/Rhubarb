@@ -630,6 +630,17 @@ textarea.prompt-box:focus {
   margin: 0 0 24px;
 }
 
+.rescue-source-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(217, 119, 6, 0.15);
+  color: #b45309;
+  font-size: 0.72rem;
+  font-variation-settings: "MONO" 0, "CASL" 0, "wght" 700, "slnt" 0, "CRSV" 0;
+  margin: 0 0 16px;
+}
+
 .ready-to-proceed-actions {
   display: flex;
   gap: 10px;
