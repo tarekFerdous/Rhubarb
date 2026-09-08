@@ -122,6 +122,12 @@
         Hide live terminal view
       </label>
 
+      <label class="modal-checkbox-label">
+        <input id="ollama-enabled-toggle" type="checkbox" class="modal-checkbox-input" />
+        Enable Ollama-assisted parsing
+      </label>
+      <p id="ollama-toggle-error" class="modal-warning-text" hidden></p>
+
       <label for="model-select-settings" class="modal-field-label">Model</label>
       <select id="model-select-settings" class="modal-select-input">
         <optgroup label="Sonnet">
@@ -192,6 +198,30 @@
     </div>
   </div>
 
+  <!-- First-run Ollama consent/install gate (issue #115): blocks the whole
+       app -- no dismiss-by-clicking-away, no [x] -- until the user installs,
+       declines, or (after a failure) explicitly skips for this session. -->
+  <div id="ollama-gate-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 class="modal-heading">Local AI-assisted parsing</h2>
+      <p class="modal-text">
+        Rhubarb wants to install Ollama and a small local model (~1.3GB) to rescue
+        questions its regular parser can't read. This runs fully offline and only
+        activates as a fallback for the rare case the regular parser fails.
+      </p>
+      <p id="ollama-gate-error" class="modal-warning-text" hidden></p>
+      <div id="ollama-gate-actions" class="ready-to-proceed-actions">
+        <button id="ollama-gate-install-btn" class="glass-btn" type="button">Install</button>
+        <button id="ollama-gate-decline-btn" class="glass-btn" type="button">No thanks</button>
+      </div>
+      <p id="ollama-gate-progress-text" class="modal-text" hidden>Installing… this can take a few minutes.</p>
+      <div id="ollama-gate-retry-actions" class="ready-to-proceed-actions" hidden>
+        <button id="ollama-gate-retry-btn" class="glass-btn" type="button">Retry</button>
+        <button id="ollama-gate-skip-btn" class="glass-btn" type="button">Skip for now</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     let activeProject = null;
     let leftCardId = null;
@@ -224,6 +254,17 @@
     const parallelImplementationWarningEl = document.getElementById("parallel-implementation-warning");
     const terminalViewHiddenToggleEl = document.getElementById("terminal-view-hidden-toggle");
     const terminalViewEl = document.getElementById("terminal-view");
+    const ollamaEnabledToggleEl = document.getElementById("ollama-enabled-toggle");
+    const ollamaToggleErrorEl = document.getElementById("ollama-toggle-error");
+    const ollamaGateModalEl = document.getElementById("ollama-gate-modal");
+    const ollamaGateErrorEl = document.getElementById("ollama-gate-error");
+    const ollamaGateActionsEl = document.getElementById("ollama-gate-actions");
+    const ollamaGateInstallBtnEl = document.getElementById("ollama-gate-install-btn");
+    const ollamaGateDeclineBtnEl = document.getElementById("ollama-gate-decline-btn");
+    const ollamaGateProgressTextEl = document.getElementById("ollama-gate-progress-text");
+    const ollamaGateRetryActionsEl = document.getElementById("ollama-gate-retry-actions");
+    const ollamaGateRetryBtnEl = document.getElementById("ollama-gate-retry-btn");
+    const ollamaGateSkipBtnEl = document.getElementById("ollama-gate-skip-btn");
     const modelSelectCardEl = document.getElementById("model-select-card");
     const modelSelectSettingsEl = document.getElementById("model-select-settings");
     const modelChangeModalEl = document.getElementById("model-change-modal");
@@ -262,6 +303,7 @@
     let knownAfkHours = null;
     let knownParallelImplementation = null;
     let knownTerminalViewHidden = null;
+    let knownOllamaDeclined = false;
     let knownModel = null;
     let knownEffort = null;
     // card_id's that have received at least one turn -- gates whether
@@ -751,6 +793,8 @@
       parallelImplementationToggleEl.checked = knownParallelImplementation ?? false;
       parallelImplementationWarningEl.hidden = !parallelImplementationToggleEl.checked;
       terminalViewHiddenToggleEl.checked = knownTerminalViewHidden ?? false;
+      ollamaEnabledToggleEl.checked = !knownOllamaDeclined;
+      ollamaToggleErrorEl.hidden = true;
       modelSelectSettingsEl.value = knownModel ?? "claude-sonnet-4-6";
       effortSelectSettingsEl.value = knownEffort ?? "auto";
       settingsModalEl.hidden = false;
@@ -759,6 +803,107 @@
     function closeSettingsModal() {
       settingsModalEl.hidden = true;
     }
+
+    // --- Ollama consent/install gate (issue #115) -------------------------
+
+    async function checkOllamaGate() {
+      const res = await fetch("/api/ollama-status");
+      const status = await res.json();
+      knownOllamaDeclined = status.declined;
+      if (!status.declined && status.presence !== "present_with_model") {
+        ollamaGateActionsEl.hidden = false;
+        ollamaGateErrorEl.hidden = true;
+        ollamaGateProgressTextEl.hidden = true;
+        ollamaGateRetryActionsEl.hidden = true;
+        ollamaGateModalEl.hidden = false;
+      }
+    }
+
+    async function runOllamaInstall() {
+      const res = await fetch("/api/ollama-install", { method: "POST" });
+      return res.json();
+    }
+
+    ollamaGateInstallBtnEl.addEventListener("click", async () => {
+      ollamaGateActionsEl.hidden = true;
+      ollamaGateErrorEl.hidden = true;
+      ollamaGateProgressTextEl.hidden = false;
+
+      const data = await runOllamaInstall();
+
+      ollamaGateProgressTextEl.hidden = true;
+      if (data.ok) {
+        ollamaGateModalEl.hidden = true;
+      } else {
+        ollamaGateErrorEl.textContent = `Install failed: ${data.error || "unknown error"}`;
+        ollamaGateErrorEl.hidden = false;
+        ollamaGateRetryActionsEl.hidden = false;
+      }
+    });
+
+    ollamaGateDeclineBtnEl.addEventListener("click", async () => {
+      await fetch("/api/settings/ollama-declined", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ollama_declined: true }),
+      });
+      knownOllamaDeclined = true;
+      ollamaGateModalEl.hidden = true;
+    });
+
+    ollamaGateRetryBtnEl.addEventListener("click", async () => {
+      ollamaGateRetryActionsEl.hidden = true;
+      ollamaGateErrorEl.hidden = true;
+      ollamaGateProgressTextEl.hidden = false;
+
+      const data = await runOllamaInstall();
+
+      ollamaGateProgressTextEl.hidden = true;
+      if (data.ok) {
+        ollamaGateModalEl.hidden = true;
+      } else {
+        ollamaGateErrorEl.textContent = `Install failed: ${data.error || "unknown error"}`;
+        ollamaGateErrorEl.hidden = false;
+        ollamaGateRetryActionsEl.hidden = false;
+      }
+    });
+
+    ollamaGateSkipBtnEl.addEventListener("click", () => {
+      // Deliberately NOT persisted -- this is "skip for now", not decline
+      // (issue #115): the gate is shown again on the next app startup.
+      ollamaGateModalEl.hidden = true;
+    });
+
+    ollamaEnabledToggleEl.addEventListener("change", async () => {
+      const enabled = ollamaEnabledToggleEl.checked;
+      ollamaToggleErrorEl.hidden = true;
+
+      await fetch("/api/settings/ollama-declined", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ollama_declined: !enabled }),
+      });
+      knownOllamaDeclined = !enabled;
+
+      if (!enabled) return;
+
+      const statusRes = await fetch("/api/ollama-status");
+      const status = await statusRes.json();
+      if (status.presence === "present_with_model") return;
+
+      ollamaEnabledToggleEl.disabled = true;
+      const data = await runOllamaInstall();
+      ollamaEnabledToggleEl.disabled = false;
+
+      if (!data.ok) {
+        ollamaEnabledToggleEl.checked = false;
+        ollamaToggleErrorEl.textContent = `Install failed: ${data.error || "unknown error"}. Still using regular parsing only.`;
+        ollamaToggleErrorEl.hidden = false;
+        // Left as not-declined (the toggle just reverted visually) so the
+        // next app startup's gate check offers to try again, rather than
+        // silently treating a transient install failure as a permanent no.
+      }
+    });
 
     async function updateAfkHours() {
       const hours = parseInt(afkHoursInputEl.value, 10);
@@ -901,7 +1046,13 @@
     // reused across sessions -- reset (not recreated) whenever the focused
     // card changes, same lifecycle as consoleOutputEl's plain-text log.
     // Visible by default (no `hidden` toggling anywhere on it).
-    const term = new Terminal({ convertEol: true, disableStdin: true, fontSize: 13 });
+    // cols/rows must match pty_engine.py's _PTY_COLUMNS/_PTY_ROWS exactly --
+    // the raw PTY stream this renders carries absolute cursor-positioning
+    // escape codes computed against THAT width. A narrower xterm.js buffer
+    // (its own untold default is ~80 cols) makes those positions land in
+    // the wrong place, corrupting the whole view (found in QA of #109/#110,
+    // which widened the PTY itself without updating this to match).
+    const term = new Terminal({ convertEol: true, disableStdin: true, fontSize: 13, cols: 200, rows: 50 });
     term.open(document.getElementById("terminal-view"));
 
     let eventSource = null;
@@ -1867,6 +2018,7 @@
     document.addEventListener("visibilitychange", updatePolls);
 
     loadAppState();
+    checkOllamaGate();
   </script>
 </body>
 </html>

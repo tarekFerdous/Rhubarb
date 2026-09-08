@@ -559,10 +559,11 @@ def test_spawn_unix_pty_uses_ptyprocess_unicode_spawn(monkeypatch):
 
     class FakePtyProcessUnicode:
         @classmethod
-        def spawn(cls, argv, cwd=None, env=None):
+        def spawn(cls, argv, cwd=None, env=None, dimensions=None):
             calls["argv"] = argv
             calls["cwd"] = cwd
             calls["env"] = env
+            calls["dimensions"] = dimensions
             return FakePtyBackend([])
 
     fake_module = types.SimpleNamespace(PtyProcessUnicode=FakePtyProcessUnicode)
@@ -574,6 +575,61 @@ def test_spawn_unix_pty_uses_ptyprocess_unicode_spawn(monkeypatch):
     assert calls["cwd"] == "/tmp"
     assert calls["env"] == {"A": "B"}
     assert isinstance(backend, FakePtyBackend)
+
+
+def test_spawn_unix_pty_passes_an_explicit_wide_dimensions_instead_of_the_80_column_default(monkeypatch):
+    """Issue #109/#110: `ptyprocess`'s own default is a narrow 80x24, which
+    is what causes Claude Code to word-wrap its question/option text across
+    multiple physical lines. `_spawn_unix_pty` must override that default
+    with an explicit, wide `dimensions=`, and its `cols` must be exactly
+    `_PTY_COLUMNS` (== `_VIRTUAL_SCREEN_COLUMNS`, the same width
+    `_render_terminal_text`'s virtual re-render screen uses) so the two
+    can never drift out of sync."""
+    import sys
+    import types
+
+    calls = {}
+
+    class FakePtyProcessUnicode:
+        @classmethod
+        def spawn(cls, argv, cwd=None, env=None, dimensions=None):
+            calls["dimensions"] = dimensions
+            return FakePtyBackend([])
+
+    fake_module = types.SimpleNamespace(PtyProcessUnicode=FakePtyProcessUnicode)
+    monkeypatch.setitem(sys.modules, "ptyprocess", fake_module)
+
+    pty_engine._spawn_unix_pty(["claude"], cwd=None, env={})
+
+    assert calls["dimensions"] == (pty_engine._PTY_ROWS, pty_engine._PTY_COLUMNS)
+    assert calls["dimensions"][1] == pty_engine._VIRTUAL_SCREEN_COLUMNS
+    assert calls["dimensions"] != (24, 80)
+
+
+def test_spawn_winpty_passes_an_explicit_wide_dimensions_instead_of_the_80_column_default(monkeypatch):
+    """Same as the `_spawn_unix_pty` case above, for the Windows backend:
+    `winpty.PtyProcess.spawn`'s own default is a narrow 80x24, which
+    `_spawn_winpty` must override with the same explicit, wide
+    `dimensions=` (`_PTY_ROWS`, `_PTY_COLUMNS`)."""
+    import sys
+    import types
+
+    calls = {}
+
+    class FakePtyProcess:
+        @classmethod
+        def spawn(cls, argv, cwd=None, env=None, dimensions=None, backend=None):
+            calls["dimensions"] = dimensions
+            return FakePtyBackend([])
+
+    fake_module = types.SimpleNamespace(PtyProcess=FakePtyProcess)
+    monkeypatch.setitem(sys.modules, "winpty", fake_module)
+
+    pty_engine._spawn_winpty(["claude"], cwd=None, env={})
+
+    assert calls["dimensions"] == (pty_engine._PTY_ROWS, pty_engine._PTY_COLUMNS)
+    assert calls["dimensions"][1] == pty_engine._VIRTUAL_SCREEN_COLUMNS
+    assert calls["dimensions"] != (24, 80)
 
 
 def test_unix_pty_backend_conforms_to_pty_backend_protocol_surface():

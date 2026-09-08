@@ -45,6 +45,11 @@ issue it verifies against:
 `_parse_implement_blocked_block`/`_parse_qa_grilling_block` in
 `session_runner.py` (the JSON handoff markers gating phase transitions) are a
 separate, unrelated mechanism -- not touched here.
+
+Both parsers run their input through `_reflow` first, which rejoins any
+field that a real terminal word-wrapped across multiple physical lines back
+into one logical line -- see its docstring. This is a no-op when everything
+already fits on one line, which is true for every example above.
 """
 
 import re
@@ -58,6 +63,52 @@ _RECOMMENDED_TEXT_RE = re.compile(r'^Recommended text:\s*"(.*)"\s*$', re.IGNOREC
 _QA_HEADER_RE = re.compile(r'^QA session for PRD\s+(\d+)\s*:\s*"(.*)"\s*$', re.IGNORECASE)
 _ISSUE_HEADER_RE = re.compile(r'^Issue\s+(\d+)\s*:\s*"(.*)"\s*$', re.IGNORECASE)
 _QA_Q_RE = re.compile(r'^Question\s+(\d+)\s*:\s*"(.*)"\s*$', re.IGNORECASE)
+
+# Matches the START of any recognised field across both formats -- used by
+# `_reflow` to tell a wrapped continuation line apart from the start of a
+# new field. Deliberately a union of every format's keywords rather than
+# split per-format: reflowing is a shared preprocessing step, applied
+# identically ahead of either parser.
+_LINE_START_RE = re.compile(
+    r"^("
+    r"Question\s+\d+"
+    r"|Options:"
+    r"|Option\s+\d+"
+    r"|Recommended:"
+    r"|Recommended text:"
+    r"|QA session for PRD\s+\d+"
+    r"|Issue\s+\d+"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _reflow(text: str) -> str:
+    """Undo terminal word-wrap before parsing. A real PTY-spawned terminal
+    (see `pty_engine.PtyEngine`) can still wrap a long line to fit its
+    window width, so a single logical field -- a `Question N: "..."`
+    header, an `Option N: "..."` line, etc. -- can arrive split across
+    several physical lines, with nothing distinguishing a wrap point from a
+    genuine line break.
+
+    Any physical line that doesn't itself start one of this module's
+    recognised fields (`_LINE_START_RE`) is treated as a wrapped
+    continuation of the previous non-blank line and rejoined onto it with a
+    single space. Blank lines -- genuine separators between header/footer
+    prose and questions, between issues, between rounds -- are never merged
+    across, so intentional structure survives untouched. A no-op when every
+    field already fits on one physical line."""
+    result: list[str] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            result.append("")
+            continue
+        if result and result[-1] and not _LINE_START_RE.match(stripped):
+            result[-1] = f"{result[-1]} {stripped}"
+        else:
+            result.append(stripped)
+    return "\n".join(result)
 
 
 def _join(lines: list[str]) -> str:
@@ -152,7 +203,7 @@ def parse_grilling_response(text: str) -> dict:
     are `""` when absent. A response with no `Question N:` lines at all
     returns `{"header": <all text>, "questions": [], "footer": ""}`.
     """
-    lines = text.splitlines()
+    lines = _reflow(text).splitlines()
     header_indices = [i for i, line in enumerate(lines) if _GRILLING_Q_RE.match(line.strip())]
 
     if not header_indices:
@@ -182,7 +233,7 @@ def parse_qa_response(text: str) -> dict:
     Returns `{"prd": None, "issues": []}` when the text doesn't contain a
     `QA session for PRD N: "..."` header line.
     """
-    lines = text.splitlines()
+    lines = _reflow(text).splitlines()
     prd_index = next((i for i, line in enumerate(lines) if _QA_HEADER_RE.match(line.strip())), None)
     if prd_index is None:
         return {"prd": None, "issues": []}

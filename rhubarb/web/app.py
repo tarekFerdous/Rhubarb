@@ -10,7 +10,7 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from rhubarb import afk_loop, db, live_stream, session_runner
+from rhubarb import afk_loop, db, live_stream, ollama_installer, session_runner
 from rhubarb.cli_client import ClaudeCLIError, get_auth_status
 from rhubarb.folder_picker import pick_folder
 from rhubarb.prd_list import compute_prd_list
@@ -197,6 +197,48 @@ def set_effort(body: dict):
     effort = body["effort"]
     db.set_effort(conn, effort)
     return {"effort": effort}
+
+
+@app.get("/api/ollama-status")
+def ollama_status():
+    """Polled by the first-run gate (and the Settings toggle) to decide
+    whether to show the install prompt. Not `async def`: FastAPI/Starlette
+    runs a plain `def` route in a worker thread automatically, so
+    `check_ollama_presence`'s blocking local HTTP call never blocks the
+    event loop -- same reasoning as `pick_folder_endpoint` above."""
+    conn = db.get_connection()
+    return {
+        "presence": ollama_installer.check_ollama_presence(),
+        "declined": db.get_ollama_declined(conn),
+    }
+
+
+@app.post("/api/ollama-install")
+def start_ollama_install():
+    """Runs the install/pull to completion and returns the result. A plain
+    `def` route, so FastAPI runs it in a worker thread automatically (same
+    as `pick_folder_endpoint`/`ollama_status` above) -- it never blocks the
+    event loop or other concurrent sessions, even though a real install can
+    take minutes. The gate UI shows a spinner for the duration of this one
+    request; no separate progress-polling endpoint is needed since the
+    result comes back directly in this response."""
+    try:
+        presence = ollama_installer.check_ollama_presence()
+        if presence == ollama_installer.PRESENCE_NOT_PRESENT:
+            ollama_installer.install_and_pull_model()
+        elif presence == ollama_installer.PRESENCE_WITHOUT_MODEL:
+            ollama_installer.pull_model()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/settings/ollama-declined")
+def set_ollama_declined(body: dict):
+    conn = db.get_connection()
+    declined = bool(body["ollama_declined"])
+    db.set_ollama_declined(conn, declined)
+    return {"ollama_declined": declined}
 
 
 @app.post("/api/projects/{project_id}/open")

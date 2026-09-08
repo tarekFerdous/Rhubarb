@@ -93,6 +93,10 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
         conn.execute(
             f"ALTER TABLE settings ADD COLUMN effort TEXT NOT NULL DEFAULT '{DEFAULT_EFFORT}'"
         )
+    if "ollama_declined" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE settings ADD COLUMN ollama_declined INTEGER NOT NULL DEFAULT 0"
+        )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS projects (
@@ -203,6 +207,27 @@ def set_terminal_view_hidden(conn: sqlite3.Connection, value: bool) -> None:
         """
         INSERT INTO settings (id, terminal_view_hidden) VALUES (1, ?)
         ON CONFLICT(id) DO UPDATE SET terminal_view_hidden = excluded.terminal_view_hidden
+        """,
+        (1 if value else 0,),
+    )
+    conn.commit()
+
+
+def get_ollama_declined(conn: sqlite3.Connection) -> bool:
+    """True once the user has explicitly declined the Ollama rescue-parser
+    install (the first-run gate, or later turning the Settings toggle off)
+    -- see issue #115. While true, the install gate is never shown again
+    and the rescue path (issue #114) is never attempted, even if Ollama
+    happens to already be installed."""
+    row = conn.execute("SELECT ollama_declined FROM settings WHERE id = 1").fetchone()
+    return bool(row["ollama_declined"]) if row else False
+
+
+def set_ollama_declined(conn: sqlite3.Connection, value: bool) -> None:
+    conn.execute(
+        """
+        INSERT INTO settings (id, ollama_declined) VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET ollama_declined = excluded.ollama_declined
         """,
         (1 if value else 0,),
     )

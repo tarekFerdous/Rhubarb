@@ -216,3 +216,111 @@ def test_qa_multiple_issues_multiple_questions_grouped_correctly():
 def test_qa_response_without_prd_header_returns_empty_result():
     assert parse_qa_response("Implemented PRD #5, nothing to verify yet.") == {"prd": None, "issues": []}
     assert parse_qa_response("") == {"prd": None, "issues": []}
+
+
+# ---------------------------------------------------------------------------
+# Reflow: tolerance for terminal word-wrap (issue #109/#111)
+# ---------------------------------------------------------------------------
+
+
+def test_grilling_question_header_wrapped_across_multiple_physical_lines_still_parses():
+    text = (
+        'Question 2: "The ~/.baton/db.py legacy path constant in rhubarb/db.py\n'
+        "(and its tests) is intentional backward-compat migration code, not\n"
+        'user-facing text. What should happen to it?"\n'
+        "Options:\n"
+        'Option 1: "Leave it untouched."\n'
+        'Option 2: "Rename/remove it anyway."\n'
+        "Recommended: [1]\n"
+    )
+
+    result = parse_grilling_response(text)
+
+    questions = result["questions"]
+    assert len(questions) == 1
+    q = questions[0]
+    assert q["id"] == "q2"
+    assert q["text"] == (
+        "The ~/.baton/db.py legacy path constant in rhubarb/db.py (and its tests) "
+        "is intentional backward-compat migration code, not user-facing text. "
+        "What should happen to it?"
+    )
+    assert q["options"] == ["Leave it untouched.", "Rename/remove it anyway."]
+    assert q["recommended"] == [1]
+
+
+def test_grilling_option_wrapped_across_multiple_physical_lines_still_parses():
+    text = (
+        'Question 1: "Should this be Python or Node?"\n'
+        "Options:\n"
+        'Option 1: "Leave it untouched — it\'s functional legacy-path handling,\n'
+        'correctly named for what it does."\n'
+        'Option 2: "Rename/remove it anyway as part of this cleanup."\n'
+        "Recommended: [1]\n"
+    )
+
+    result = parse_grilling_response(text)
+
+    q = result["questions"][0]
+    assert q["options"] == [
+        "Leave it untouched — it's functional legacy-path handling, correctly named for what it does.",
+        "Rename/remove it anyway as part of this cleanup.",
+    ]
+
+
+def test_reflow_does_not_merge_across_a_blank_line_boundary():
+    """A blank line between a round's footer prose and free-standing text
+    (or between two rounds/questions) is a genuine separator, not a wrap
+    artifact, and must survive the reflow pass untouched."""
+    text = (
+        'Question 1: "Should this be Python or Node?"\n'
+        "Options:\n"
+        'Option 1: "Python"\n'
+        'Option 2: "Node"\n'
+        "Recommended: [1]\n"
+        "\n"
+        "Based on your answers, a second wave might be needed.\n"
+    )
+
+    result = parse_grilling_response(text)
+
+    assert len(result["questions"]) == 1
+    assert result["footer"] == "Based on your answers, a second wave might be needed."
+
+
+def test_qa_question_wrapped_across_multiple_physical_lines_still_parses():
+    text = (
+        'QA session for PRD 98: "Structured question format"\n'
+        "\n"
+        'Issue 99: "Fix textarea auto-grow bug"\n'
+        'Question 1: "Does a pre-filled recommendation box resize immediately,\n'
+        'without requiring the user to touch it first?"\n'
+        'Recommended text: "Yes, confirmed in the browser after checking\n'
+        'multiple question kinds."\n'
+    )
+
+    result = parse_qa_response(text)
+
+    q = result["issues"][0]["questions"][0]
+    assert q["text"] == (
+        "Does a pre-filled recommendation box resize immediately, without requiring the user to touch it first?"
+    )
+    assert q["recommended_text"] == "Yes, confirmed in the browser after checking multiple question kinds."
+
+
+def test_reflow_does_not_merge_across_a_blank_line_between_qa_issues():
+    text = (
+        'QA session for PRD 98: "Structured question format"\n'
+        "\n"
+        'Issue 99: "Fix textarea auto-grow bug"\n'
+        'Question 1: "Does it resize?"\n'
+        "\n"
+        'Issue 100: "Rewrite qa_parser.py"\n'
+        'Question 1: "Do the new tests pass?"\n'
+    )
+
+    result = parse_qa_response(text)
+
+    assert len(result["issues"]) == 2
+    assert result["issues"][0]["number"] == 99
+    assert result["issues"][1]["number"] == 100

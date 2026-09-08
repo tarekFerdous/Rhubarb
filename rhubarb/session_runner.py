@@ -24,6 +24,12 @@ from rhubarb import db
 from rhubarb.cli_client import ClaudeCLIError
 from rhubarb.github_publisher import GithubPublishError, publish_draft
 from rhubarb.live_stream import publish
+from rhubarb.ollama_rescue import (
+    rescue_grilling_response,
+    rescue_qa_response,
+    should_attempt_grilling_rescue,
+    should_attempt_qa_rescue,
+)
 from rhubarb.pty_engine import PtyEngine, PtyEngineUnrecoverableError
 from rhubarb.qa_parser import parse_grilling_response, parse_qa_response
 from rhubarb.stream_translate import translate_event
@@ -435,6 +441,15 @@ async def _run_grilling_turn(
         return None
 
     parsed = parse_grilling_response(turn["result"])
+    if should_attempt_grilling_rescue(parsed, turn["result"]):
+        # The regex parser found nothing, but the text looks like it was
+        # trying to be in the structured format -- give the local Ollama
+        # rescue path (issue #114) a chance before giving up. A `None`
+        # result (Ollama unavailable/invalid response/timeout) just keeps
+        # `parsed` as the original empty result, same as before this existed.
+        rescued = await asyncio.to_thread(rescue_grilling_response, turn["result"])
+        if rescued is not None:
+            parsed = rescued
     console_text = row["console_text"] + "\n\n" + turn["result"] if row["console_text"] else turn["result"]
     db.update_session(
         conn,
@@ -889,7 +904,15 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
         # -- this card's own tab is done; the new QA row's own tab starts
         # fresh (reattached via --resume) on its own first turn.
         qa_prd = qa_data.get("prd")
-        qa_issues = parse_qa_response(turn["result"])["issues"]
+        qa_parsed = parse_qa_response(turn["result"])
+        if should_attempt_qa_rescue(qa_parsed, turn["result"]):
+            # Same rescue path as grilling (issue #114) -- the regex parser
+            # found nothing despite text that looks like it was trying to
+            # be a QA session.
+            rescued = await asyncio.to_thread(rescue_qa_response, turn["result"])
+            if rescued is not None:
+                qa_parsed = rescued
+        qa_issues = qa_parsed["issues"]
         qa_row_id = db.create_session(
             conn,
             row["project_id"],

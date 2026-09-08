@@ -153,6 +153,17 @@ _READ_CHUNK = 4096
 _VIRTUAL_SCREEN_COLUMNS = 200
 _VIRTUAL_SCREEN_LINES = 4000
 
+# Window size the real PTY itself is spawned with. `pywinpty`/`ptyprocess`
+# both default to a plain 80x24 if not told otherwise, which is narrow
+# enough that Claude Code word-wraps its own question/option text across
+# multiple physical lines -- breaking `qa_parser.py`'s single-line field
+# matching. `_PTY_COLUMNS` intentionally reuses `_VIRTUAL_SCREEN_COLUMNS`
+# (rather than a separately hardcoded number) so the real PTY's width and
+# `_render_terminal_text`'s virtual re-render screen width can never drift
+# out of sync with each other.
+_PTY_ROWS = 50
+_PTY_COLUMNS = _VIRTUAL_SCREEN_COLUMNS
+
 
 def _render_terminal_text(raw: str) -> str:
     """Resolve `raw` -- true terminal-emulator input (ANSI escape codes,
@@ -241,10 +252,14 @@ def _spawn_winpty(argv: list[str], *, cwd: str | None, env: dict) -> PtyBackend:
     Imported lazily so importing this module (e.g. for tests, which always
     inject a fake `pty_factory`) never requires `pywinpty` to be installed
     on non-Windows dev/CI machines.
+
+    Passes an explicit `dimensions=` (see `_PTY_ROWS`/`_PTY_COLUMNS`)
+    instead of relying on `winpty.PtyProcess.spawn`'s own 80x24 default --
+    see those constants' docstring for why.
     """
     import winpty
 
-    return winpty.PtyProcess.spawn(argv, cwd=cwd, env=env)
+    return winpty.PtyProcess.spawn(argv, cwd=cwd, env=env, dimensions=(_PTY_ROWS, _PTY_COLUMNS))
 
 
 def _spawn_unix_pty(argv: list[str], *, cwd: str | None, env: dict) -> PtyBackend:
@@ -260,10 +275,14 @@ def _spawn_unix_pty(argv: list[str], *, cwd: str | None, env: dict) -> PtyBacken
     inject a fake `pty_factory`) never requires `ptyprocess` to be installed
     on Windows dev/CI machines, and so this module stays importable there
     even though `ptyprocess` is a Unix-only package.
+
+    Passes an explicit `dimensions=` (see `_PTY_ROWS`/`_PTY_COLUMNS`)
+    instead of relying on `ptyprocess.PtyProcessUnicode.spawn`'s own 80x24
+    default -- see those constants' docstring for why.
     """
     import ptyprocess
 
-    return ptyprocess.PtyProcessUnicode.spawn(argv, cwd=cwd, env=env)
+    return ptyprocess.PtyProcessUnicode.spawn(argv, cwd=cwd, env=env, dimensions=(_PTY_ROWS, _PTY_COLUMNS))
 
 
 def _default_pty_factory():

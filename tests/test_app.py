@@ -1,7 +1,7 @@
 import json
 import subprocess
 
-from rhubarb import afk_loop, db, session_runner
+from rhubarb import afk_loop, db, ollama_installer, session_runner
 from rhubarb.web import app as app_module
 
 
@@ -57,6 +57,78 @@ def test_set_terminal_view_hidden_persists_and_reflects_in_app_state(client):
     resp = client.post("/api/settings/terminal-view-hidden", json={"terminal_view_hidden": False})
     assert resp.json() == {"terminal_view_hidden": False}
     assert client.get("/api/app-state").json()["terminal_view_hidden"] is False
+
+
+# ---------------------------------------------------------------------------
+# Ollama consent/install gate (issue #115)
+# ---------------------------------------------------------------------------
+
+
+def test_ollama_status_reports_presence_and_declined_state(client, monkeypatch):
+    monkeypatch.setattr(ollama_installer, "check_ollama_presence", lambda: ollama_installer.PRESENCE_NOT_PRESENT)
+
+    data = client.get("/api/ollama-status").json()
+
+    assert data == {"presence": "not_present", "declined": False}
+
+
+def test_set_ollama_declined_persists_and_reflects_in_status(client, monkeypatch):
+    monkeypatch.setattr(ollama_installer, "check_ollama_presence", lambda: ollama_installer.PRESENCE_WITH_MODEL)
+
+    resp = client.post("/api/settings/ollama-declined", json={"ollama_declined": True})
+    assert resp.json() == {"ollama_declined": True}
+    assert client.get("/api/ollama-status").json()["declined"] is True
+
+    resp = client.post("/api/settings/ollama-declined", json={"ollama_declined": False})
+    assert resp.json() == {"ollama_declined": False}
+    assert client.get("/api/ollama-status").json()["declined"] is False
+
+
+def test_ollama_install_is_a_noop_and_ok_when_already_present_with_model(client, monkeypatch):
+    monkeypatch.setattr(ollama_installer, "check_ollama_presence", lambda: ollama_installer.PRESENCE_WITH_MODEL)
+    monkeypatch.setattr(
+        ollama_installer, "install_and_pull_model", lambda: (_ for _ in ()).throw(AssertionError("should not install"))
+    )
+    monkeypatch.setattr(ollama_installer, "pull_model", lambda: (_ for _ in ()).throw(AssertionError("should not pull")))
+
+    resp = client.post("/api/ollama-install")
+
+    assert resp.json() == {"ok": True}
+
+
+def test_ollama_install_runs_full_install_when_not_present(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ollama_installer, "check_ollama_presence", lambda: ollama_installer.PRESENCE_NOT_PRESENT)
+    monkeypatch.setattr(ollama_installer, "install_and_pull_model", lambda: calls.append("install_and_pull"))
+
+    resp = client.post("/api/ollama-install")
+
+    assert resp.json() == {"ok": True}
+    assert calls == ["install_and_pull"]
+
+
+def test_ollama_install_only_pulls_when_present_without_model(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ollama_installer, "check_ollama_presence", lambda: ollama_installer.PRESENCE_WITHOUT_MODEL)
+    monkeypatch.setattr(ollama_installer, "pull_model", lambda: calls.append("pull"))
+
+    resp = client.post("/api/ollama-install")
+
+    assert resp.json() == {"ok": True}
+    assert calls == ["pull"]
+
+
+def test_ollama_install_reports_the_error_on_failure_instead_of_raising(client, monkeypatch):
+    monkeypatch.setattr(ollama_installer, "check_ollama_presence", lambda: ollama_installer.PRESENCE_NOT_PRESENT)
+
+    def failing_install():
+        raise RuntimeError("winget not found")
+
+    monkeypatch.setattr(ollama_installer, "install_and_pull_model", failing_install)
+
+    resp = client.post("/api/ollama-install")
+
+    assert resp.json() == {"ok": False, "error": "winget not found"}
 
 
 def test_app_state_defaults_model_to_claude_sonnet(client):

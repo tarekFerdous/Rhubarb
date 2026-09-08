@@ -112,6 +112,46 @@ def test_terminal_view_hidden_column_migrates_existing_db_defaulting_visible(tmp
     assert db.get_afk_hours(migrated) == 9
 
 
+def test_ollama_declined_round_trip(tmp_path):
+    db_path = tmp_path / "rhubarb.db"
+    conn = db.get_connection(db_path)
+    assert db.get_ollama_declined(conn) is False
+
+    db.set_ollama_declined(conn, True)
+    assert db.get_ollama_declined(conn) is True
+
+    reopened = db.get_connection(db_path)
+    assert db.get_ollama_declined(reopened) is True
+
+    db.set_ollama_declined(reopened, False)
+    assert db.get_ollama_declined(reopened) is False
+
+
+def test_ollama_declined_column_migrates_existing_db_defaulting_not_declined(tmp_path):
+    """A DB created before `settings.ollama_declined` existed must gain the
+    column defaulting to not-declined (so a first-run gate is offered),
+    and keep its other settings intact."""
+    db_path = tmp_path / "rhubarb.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            root_dir TEXT,
+            afk_hours INTEGER NOT NULL DEFAULT 6
+        )
+        """
+    )
+    conn.execute("INSERT INTO settings (id, root_dir, afk_hours) VALUES (1, '/some/root', 9)")
+    conn.commit()
+    conn.close()
+
+    migrated = db.get_connection(db_path)
+    assert db.get_ollama_declined(migrated) is False
+    assert db.get_root_dir(migrated) == "/some/root"
+    assert db.get_afk_hours(migrated) == 9
+
+
 def test_model_round_trip(tmp_path):
     db_path = tmp_path / "rhubarb.db"
     conn = db.get_connection(db_path)
