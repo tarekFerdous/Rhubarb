@@ -46,6 +46,15 @@ def _isolated_pty_engines(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_standby_engines(monkeypatch):
+    """Same story again, but for the pre-warmed standby-PtyEngine-per-project
+    registry (issue #136) -- project ids also restart at 1 in every test's
+    fresh tmp db, so a leftover (fake) standby from one test must never be
+    handed to an unrelated test's identically-numbered project."""
+    monkeypatch.setattr(session_runner, "_standby_engines", {})
+
+
+@pytest.fixture(autouse=True)
 def _isolated_afk_loop(monkeypatch):
     """Same story again, but for the AFK loop's per-project idle clock and
     its per-project undismissed-notification queue."""

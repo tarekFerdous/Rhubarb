@@ -111,6 +111,9 @@ def _make_fake_engine_class(handler, *, fresh_ids=None):
         def close(self):
             self.closed = True
 
+        def isalive(self):
+            return self.started and not self.closed
+
         async def stream_turn(self, prompt):
             yield {"type": "system", "subtype": "init", "session_id": self.claude_session_id}
             # `session_id` here mirrors the old `stream_prompt(prompt,
@@ -2492,7 +2495,7 @@ def test_engine_reattaches_via_resume_when_continuing_an_existing_session_id(cli
     assert fake_class.instances[0].resume_session_id == "pooled-session"
 
 
-def test_implement_tab_closes_when_the_session_is_pooled(client, tmp_path, monkeypatch):
+def test_implement_tab_closes_and_standby_is_kept_alive_when_pooled(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -2511,8 +2514,157 @@ def test_implement_tab_closes_when_the_session_is_pooled(client, tmp_path, monke
 
     assert db.get_session(conn, row_id)["available_for_reuse"] == 1
     assert row_id not in session_runner._pty_engines
-    # The turn's own engine, and the fresh one minted for pooling, were both closed.
-    assert all(instance.closed for instance in fake_class.instances)
+    # The turn's own engine is closed; the fresh one minted for pooling
+    # (issue #136) is kept alive as this project's standby instead of also
+    # being closed immediately -- it's what the next /do claims directly.
+    assert fake_class.instances[0].closed is True
+    assert fake_class.instances[1].closed is False
+    assert session_runner._standby_engines[project_id][0] is fake_class.instances[1]
+
+
+# ---------------------------------------------------------------------------
+# Pre-warmed standby PtyEngine (issue #136): a project keeps one unclaimed,
+# already-running engine ready so a new /do claims it directly instead of
+# paying spawn latency inline.
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_standby_engine_spawns_when_none_exists(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
+
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+
+    assert len(fake_class.instances) == 1
+    engine, model, effort = session_runner._standby_engines[project_id]
+    assert engine is fake_class.instances[0]
+    assert (model, effort) == ("claude-sonnet-5", "auto")
+
+
+def test_ensure_standby_engine_is_a_no_op_when_a_live_matching_one_exists(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
+
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+
+    assert len(fake_class.instances) == 1  # no second spawn
+
+
+def test_ensure_standby_engine_replaces_a_dead_one(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
+
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+    fake_class.instances[0].closed = True  # simulate a crash while unclaimed
+
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+
+    assert len(fake_class.instances) == 2
+    assert session_runner._standby_engines[project_id][0] is fake_class.instances[1]
+
+
+def test_claim_standby_engine_returns_it_on_a_match_and_removes_it(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+
+    claimed = session_runner.claim_standby_engine(project_id, model="claude-sonnet-5", effort="auto")
+
+    assert claimed is fake_class.instances[0]
+    assert claimed.closed is False
+    assert project_id not in session_runner._standby_engines
+
+
+def test_claim_standby_engine_returns_none_and_discards_on_model_mismatch(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+
+    claimed = session_runner.claim_standby_engine(project_id, model="claude-opus-5", effort="auto")
+
+    assert claimed is None
+    assert fake_class.instances[0].closed is True  # discarded, not left dangling
+    assert project_id not in session_runner._standby_engines
+
+
+def test_claim_standby_engine_returns_none_and_discards_on_effort_mismatch(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+
+    claimed = session_runner.claim_standby_engine(project_id, model="claude-sonnet-5", effort="high")
+
+    assert claimed is None
+    assert fake_class.instances[0].closed is True
+
+
+def test_claim_standby_engine_returns_none_when_dead(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+    fake_class.instances[0].closed = True
+
+    claimed = session_runner.claim_standby_engine(project_id, model="claude-sonnet-5", effort="auto")
+
+    assert claimed is None
+    assert project_id not in session_runner._standby_engines
+
+
+def test_claim_standby_engine_returns_none_when_none_exists(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+    assert session_runner.claim_standby_engine(project_id, model="claude-sonnet-5", effort="auto") is None
+
+
+def test_close_standby_engine_closes_and_discards_it(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+
+    session_runner.close_standby_engine(project_id)
+
+    assert fake_class.instances[0].closed is True
+    assert project_id not in session_runner._standby_engines
+
+
+def test_close_standby_engine_does_not_raise_when_none_exists(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+    session_runner.close_standby_engine(project_id)  # no-op, must not raise
+
+
+def test_open_pty_tab_count_includes_standby_engines(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
+
+    assert session_runner.open_pty_tab_count() == 0
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+    assert session_runner.open_pty_tab_count() == 1
+
+
+def test_register_engine_makes_get_or_create_engine_reuse_it_without_spawning(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("hi")]))
+
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+    claimed = session_runner.claim_standby_engine(project_id, model="claude-sonnet-5", effort="auto")
+    session_runner.register_engine(999, claimed)
+
+    engine = session_runner._get_or_create_engine(
+        999, cwd=cwd, model="claude-sonnet-5", effort="auto", resume_session_id=None
+    )
+
+    assert engine is claimed
+    assert len(fake_class.instances) == 1  # no second spawn triggered by _get_or_create_engine
 
 
 # ---------------------------------------------------------------------------

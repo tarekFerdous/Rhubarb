@@ -557,6 +557,18 @@ class PtyEngine:
         print(f"[pty result]\n{clean_text}")
         yield {"type": "result", "result": clean_text, "session_id": self.claude_session_id, "is_error": False}
 
+    def isalive(self) -> bool:
+        """Whether the underlying PTY process is still running -- False if
+        it was never started, already closed, or has died on its own (e.g.
+        a standby engine that crashed while sitting unclaimed; see issue
+        #136). Never raises."""
+        if self._proc is None:
+            return False
+        try:
+            return self._proc.isalive()
+        except Exception:
+            return False
+
     def close(self) -> None:
         """Terminate the underlying PTY process, if one was started. Safe
         to call more than once or when never started."""

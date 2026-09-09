@@ -374,6 +374,115 @@ def test_open_project_records_afk_activity(client, tmp_path, monkeypatch):
     assert calls == [project_id]
 
 
+def test_open_project_schedules_a_standby_prewarm(client, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "repo1", "https://github.com/x/repo1.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+
+    calls = []
+
+    async def _fake_ensure(pid, *, cwd, model, effort):
+        calls.append({"project_id": pid, "cwd": cwd, "model": model, "effort": effort})
+
+    monkeypatch.setattr(app_module.session_runner, "ensure_standby_engine", _fake_ensure)
+
+    client.post(f"/api/projects/{project_id}/open")
+
+    assert len(calls) == 1
+    assert calls[0]["project_id"] == project_id
+    assert calls[0]["effort"] == db.DEFAULT_EFFORT
+
+
+def test_close_project_closes_its_standby(client, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "repo1", "https://github.com/x/repo1.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+
+    calls = []
+    monkeypatch.setattr(app_module.session_runner, "close_standby_engine", lambda pid: calls.append(pid))
+
+    client.post(f"/api/projects/{project_id}/close", json={})
+
+    assert calls == [project_id]
+
+
+def test_session_start_claims_a_matching_standby_engine(client, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "repo1", "https://github.com/x/repo1.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+    client.post(f"/api/projects/{project_id}/open")
+
+    class FakeStandby:
+        claude_session_id = "standby-session-id"
+
+    fake_standby = FakeStandby()
+    claim_calls = []
+    register_calls = []
+
+    def fake_claim(pid, *, model, effort):
+        claim_calls.append({"project_id": pid, "model": model, "effort": effort})
+        return fake_standby
+
+    monkeypatch.setattr(app_module.session_runner, "claim_standby_engine", fake_claim)
+    monkeypatch.setattr(app_module.session_runner, "register_engine", lambda cid, eng: register_calls.append((cid, eng)))
+
+    async def _noop_job(card_id, prompt, *, cwd):
+        return None
+
+    monkeypatch.setattr(app_module.session_runner, "start_session_job", _noop_job)
+
+    called_claim_available = []
+    monkeypatch.setattr(app_module.db, "claim_available_session", lambda conn, pid: called_claim_available.append(pid) or None)
+
+    resp = client.post("/api/session/start", json={"prompt": "a feature"})
+    card_id = resp.json()["card_id"]
+
+    assert len(claim_calls) == 1
+    assert register_calls == [(card_id, fake_standby)]
+    assert called_claim_available == []  # DB-pool fallback never consulted when a standby matched
+
+    row = db.get_session(db.get_connection(), card_id)
+    assert row["claude_session_id"] == "standby-session-id"
+
+
+def test_session_start_falls_back_to_db_pool_when_no_standby_matches(client, tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "repo1", "https://github.com/x/repo1.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+    client.post(f"/api/projects/{project_id}/open")
+
+    monkeypatch.setattr(app_module.session_runner, "claim_standby_engine", lambda pid, *, model, effort: None)
+
+    register_calls = []
+    monkeypatch.setattr(app_module.session_runner, "register_engine", lambda cid, eng: register_calls.append((cid, eng)))
+
+    called_claim_available = []
+
+    def fake_claim_available(conn, pid):
+        called_claim_available.append(pid)
+        return None
+
+    monkeypatch.setattr(app_module.db, "claim_available_session", fake_claim_available)
+
+    async def _noop_job(card_id, prompt, *, cwd):
+        return None
+
+    monkeypatch.setattr(app_module.session_runner, "start_session_job", _noop_job)
+
+    client.post("/api/session/start", json={"prompt": "a feature"})
+
+    assert called_claim_available == [project_id]
+    assert register_calls == []
+
+
 def test_start_implement_records_afk_activity(client, tmp_path, monkeypatch):
     root = tmp_path / "root"
     root.mkdir()

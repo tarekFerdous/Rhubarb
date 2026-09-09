@@ -244,7 +244,7 @@ def set_ollama_declined(body: dict):
 
 
 @app.post("/api/projects/{project_id}/open")
-def open_project(project_id: int):
+async def open_project(project_id: int):
     global _active_project_id
     conn = db.get_connection()
     row = db.get_project(conn, project_id)
@@ -255,6 +255,15 @@ def open_project(project_id: int):
     _active_project_id = project_id
     afk_loop.record_activity(project_id)
     row = db.get_project(conn, project_id)
+
+    # Pre-warm a standby PtyEngine for this project (issue #136) so the
+    # first /do a user starts doesn't pay the "wait for claude to open"
+    # spawn cost inline -- fire-and-forget, never blocks this response.
+    asyncio.create_task(
+        session_runner.ensure_standby_engine(
+            project_id, cwd=row["path"], model=db.get_model(conn), effort=db.DEFAULT_EFFORT
+        )
+    )
 
     return {
         "project": _project_to_dict(row),
@@ -269,6 +278,7 @@ def close_project(project_id: int, body: dict):
     db.save_session_state(conn, project_id, body.get("session_state", {}))
     if _active_project_id == project_id:
         _active_project_id = None
+    session_runner.close_standby_engine(project_id)
     return {"closed": True}
 
 
@@ -431,15 +441,32 @@ async def start_session(body: dict):
         return {"error": "No active project"}
 
     conn = db.get_connection()
-    reused = db.claim_available_session(conn, project_id)
-    resume_id = reused["claude_session_id"] if reused is not None else None
 
     # `effort` in the body is the left-card dropdown's value at the moment
     # "Start" was clicked -- the common case for a per-session override,
     # covered without any race. Falls back to the global default (matching
     # `create_session`'s own fallback) when omitted.
     effort = body.get("effort")
-    row_id = db.create_session(conn, project_id, claude_session_id=resume_id, effort=effort)
+
+    # Try a pre-warmed standby first (issue #136) -- claiming it is only
+    # correct if its model/effort match exactly what this session will
+    # actually use, so this mirrors create_session's own effort resolution
+    # (`effort or DEFAULT_EFFORT`) and start_session_job's own model
+    # resolution (`db.get_model(conn)`) precisely, not this row's stored
+    # columns (which can differ -- see the comments in session_runner.py).
+    model = db.get_model(conn)
+    resolved_effort = effort or db.DEFAULT_EFFORT
+    standby = session_runner.claim_standby_engine(project_id, model=model, effort=resolved_effort)
+
+    if standby is not None:
+        row_id = db.create_session(
+            conn, project_id, claude_session_id=standby.claude_session_id, effort=effort
+        )
+        session_runner.register_engine(row_id, standby)
+    else:
+        reused = db.claim_available_session(conn, project_id)
+        resume_id = reused["claude_session_id"] if reused is not None else None
+        row_id = db.create_session(conn, project_id, claude_session_id=resume_id, effort=effort)
 
     asyncio.create_task(session_runner.start_session_job(row_id, body["prompt"], cwd=cwd))
 

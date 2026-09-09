@@ -151,6 +151,15 @@ def _get_or_create_engine(
     return engine
 
 
+def register_engine(card_id: int, engine: PtyEngine) -> None:
+    """Register an already-running engine as `card_id`'s resident tab
+    (issue #136) -- used when a brand-new session claims a pre-warmed
+    standby (`claim_standby_engine`) so `_get_or_create_engine`'s own
+    "already resident, don't spawn" check picks it up on the first turn,
+    exactly as if it had been spawned for this card_id from the start."""
+    _pty_engines[card_id] = engine
+
+
 def _close_engine(card_id: int) -> None:
     """Close and forget this card's resident tab, if any -- called whenever
     a card's tab finishes: pooled for reuse, fully done, handed off to a
@@ -184,11 +193,69 @@ def close_session(conn, card_id: int) -> None:
 def open_pty_tab_count() -> int:
     """How many `PtyEngine` "tabs" are currently resident (issue #88) --
     one per `card_id` with a live entry in `_pty_engines`, across every
-    active session regardless of phase. Backs the web UI's tab-count
-    indicator next to the "Sessions" label (`GET /api/pty-tabs/count` in
-    `rhubarb/web/app.py`); polled rather than pushed since it's a global
-    count, not scoped to any one card's SSE stream."""
-    return len(_pty_engines)
+    active session regardless of phase, plus any pre-warmed standby engines
+    (issue #136) -- both are real, live `claude` processes. Backs the web
+    UI's tab-count indicator next to the "Sessions" label (`GET
+    /api/pty-tabs/count` in `rhubarb/web/app.py`); polled rather than
+    pushed since it's a global count, not scoped to any one card's SSE
+    stream."""
+    return len(_pty_engines) + len(_standby_engines)
+
+
+# Pre-warmed, unclaimed PtyEngine per project (issue #136) -- kept ready so a
+# brand-new /do session can claim an already-running process directly
+# instead of paying the "wait for claude to open" spawn cost inline on its
+# first turn. Keyed by project_id (only one project is ever active at a
+# time -- see `_active_project_id` in `rhubarb/web/app.py`), not card_id: a
+# standby is never assigned to a card_id or run through a turn until
+# claimed. Stores the (model, effort) it was spawned with alongside the
+# engine so a claim attempt can tell a match from a stale one.
+_standby_engines: dict[int, tuple[PtyEngine, str | None, str | None]] = {}
+
+
+async def ensure_standby_engine(
+    project_id: int, *, cwd: str | None, model: str | None, effort: str | None
+) -> None:
+    """Make sure a live, matching standby exists for `project_id`, spawning
+    one if it doesn't (or replacing a dead one). A no-op when a live,
+    already-matching standby is already there -- never more than one
+    standby per project. Fire-and-forget: callers schedule this via
+    `asyncio.create_task` rather than awaiting it, since nothing should
+    block on a pre-warm."""
+    existing = _standby_engines.get(project_id)
+    if existing is not None:
+        engine, standby_model, standby_effort = existing
+        if engine.isalive() and standby_model == model and standby_effort == effort:
+            return
+        engine.close()
+        del _standby_engines[project_id]
+
+    engine = await asyncio.to_thread(_spawn_fresh_engine, cwd=cwd, model=model, effort=effort)
+    _standby_engines[project_id] = (engine, model, effort)
+
+
+def claim_standby_engine(project_id: int, *, model: str | None, effort: str | None) -> PtyEngine | None:
+    """Pop and return `project_id`'s standby if it's alive and its
+    model/effort match what's being requested; otherwise discard whatever
+    was there (dead or mismatched -- never left dangling) and return `None`
+    so the caller falls back to today's spawn-on-demand/DB-pool path."""
+    existing = _standby_engines.pop(project_id, None)
+    if existing is None:
+        return None
+    engine, standby_model, standby_effort = existing
+    if not engine.isalive() or standby_model != model or standby_effort != effort:
+        engine.close()
+        return None
+    return engine
+
+
+def close_standby_engine(project_id: int) -> None:
+    """Close and discard `project_id`'s standby, if any -- called when a
+    project is closed or switched away from, so a standby never leaks past
+    the project it was warmed for."""
+    existing = _standby_engines.pop(project_id, None)
+    if existing is not None:
+        existing[0].close()
 
 
 def _spawn_fresh_engine(*, cwd: str | None, model: str | None, effort: str | None) -> PtyEngine:
@@ -242,17 +309,30 @@ async def _maybe_clear_for_next_phase(card_id: int, conn, row, *, cwd: str | Non
     return new_session_id
 
 
-async def _clear_for_reuse(card_id: int, *, cwd: str | None, model: str | None, effort: str | None) -> str:
+async def _clear_for_reuse(
+    card_id: int, *, project_id: int, cwd: str | None, model: str | None, effort: str | None
+) -> str:
     """Reclaim context by starting a genuinely fresh conversation (see
     `_spawn_fresh_engine`), for a card whose row is about to be pooled
     (`db.mark_session_available`) for reuse under a *different*, future
     card_id -- this card's own tab is closed for good here, since nothing
-    will ever run another turn against this `card_id` again. The future
-    reuse constructs its own fresh tab, reattaching via `--resume` at
-    whatever id this returns."""
+    will ever run another turn against this `card_id` again.
+
+    Unlike before issue #136, the freshly-spawned engine is NOT immediately
+    closed after reading its id -- it's kept alive as `project_id`'s standby
+    (`ensure_standby_engine`'s registry), so the next `/do` for this project
+    can claim it directly with no spawn at all, instead of every pooling
+    cycle paying a full spawn just to throw the process away unused. The
+    returned id is still recorded via `db.mark_session_available` by every
+    caller, unchanged -- that DB-level pool remains the fallback path for
+    whenever this standby isn't claimed (mismatched model/effort, or a
+    different project became active first)."""
     _close_engine(card_id)
     engine = await asyncio.to_thread(_spawn_fresh_engine, cwd=cwd, model=model, effort=effort)
-    engine.close()
+    existing = _standby_engines.pop(project_id, None)
+    if existing is not None:
+        existing[0].close()
+    _standby_engines[project_id] = (engine, model, effort)
     return engine.claude_session_id
 
 
@@ -630,7 +710,13 @@ async def _auto_continue_implement_and_qa(card_id: int, conn, cwd: str | None) -
     prd = details.get("prd") if details else None
 
     if prd is None:
-        new_session_id = await _clear_for_reuse(card_id, cwd=cwd, model=row["model"], effort=row["effort"])
+        # model/effort here match a brand-new /do's own resolution (issue
+        # #136) -- db.get_model/DEFAULT_EFFORT, not this finishing session's
+        # own row -- so the standby _clear_for_reuse keeps alive actually
+        # matches what claim_standby_engine compares against later.
+        new_session_id = await _clear_for_reuse(
+            card_id, project_id=row["project_id"], cwd=cwd, model=db.get_model(conn), effort=db.DEFAULT_EFFORT
+        )
         db.mark_session_available(conn, card_id, new_session_id)
         publish(card_id, {"type": "done"})
         return
@@ -1002,7 +1088,12 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
         await _drain_implement_queue(row["project_id"], cwd)
         asyncio.create_task(start_qa_job(qa_row_id, qa_prd, qa_issues, cwd=cwd))
     else:
-        new_session_id = await _clear_for_reuse(card_id, cwd=cwd, model=model, effort=effort)
+        # See the matching comment in _auto_continue_implement_and_qa --
+        # model/effort here match a brand-new /do's own resolution, not
+        # this finishing implement session's own model/effort.
+        new_session_id = await _clear_for_reuse(
+            card_id, project_id=row["project_id"], cwd=cwd, model=db.get_model(conn), effort=db.DEFAULT_EFFORT
+        )
         db.mark_session_available(conn, card_id, new_session_id)
         publish(card_id, _turn_event(phase="implemented", details=details))
         publish(card_id, {"type": "done"})
@@ -1136,6 +1227,12 @@ async def continue_qa_job(card_id: int, answers: dict, extra_notes: str, *, cwd:
     # card_id's own fresh tab, not this one.
     if context_pct is None or context_pct < _QA_DONE_RECYCLE_CONTEXT_CUTOFF:
         db.mark_session_available(conn, card_id, turn["session_id"])
+        # Unlike the other two pooling sites, this one never spawns a fresh
+        # engine to reuse as a standby (it just recycles this card's own
+        # already-resident tab's id) -- ensure one gets warmed up separately.
+        asyncio.create_task(
+            ensure_standby_engine(row["project_id"], cwd=cwd, model=db.get_model(conn), effort=db.DEFAULT_EFFORT)
+        )
     _close_engine(card_id)
 
     publish(card_id, _turn_event(phase="qa_closing"))
