@@ -1179,6 +1179,21 @@
       term.options.disableStdin = true;
     }
 
+    // Issue #143: give button-driven reply submission immediate loading
+    // feedback that stays until the interview area is actually replaced by
+    // the next render, rather than re-enabling as soon as the fire-and-
+    // forget network call returns. Stashes the button's current label in
+    // `dataset.pendingLabel` (read back by showGrillingError to restore it
+    // on an error path) and swaps in a "Thinking…" state. Guards against the
+    // fake `{ disabled: false }` object the terminal's own Enter-key path
+    // passes as `triggerBtn` -- that path has no on-screen button to update.
+    function markButtonPending(btn) {
+      if (!(btn instanceof HTMLElement)) return;
+      btn.dataset.pendingLabel = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "Thinking…";
+    }
+
     // Issue #134: a reply submitted through the structured answer box (not
     // typed directly into the terminal) must still echo into the terminal
     // and close out its "awaiting your reply" state -- otherwise the
@@ -1191,6 +1206,7 @@
         term.write(text + "\r\n");
         disableTerminalReplyInput();
       }
+      markButtonPending(triggerBtn);
       sendFn(text, triggerBtn);
     }
 
@@ -1678,24 +1694,33 @@
         interviewEl.prepend(err);
       }
       err.textContent = message;
+
+      // Issue #143: restore any button-driven pending state within the
+      // interview area on an HTTP-level error, uniformly across every
+      // reply/advance path, so the user can retry.
+      interviewEl.querySelectorAll("[data-pending-label]").forEach((btn) => {
+        btn.disabled = false;
+        btn.textContent = btn.dataset.pendingLabel;
+        delete btn.dataset.pendingLabel;
+      });
     }
 
     async function sendReply(replyText, triggerBtn) {
       if (!replyText.trim() || leftCardId === null) return;
-      triggerBtn.disabled = true;
       const res = await fetch("/api/session/continue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ card_id: leftCardId, reply: replyText }),
       });
       const data = await res.json();
-      triggerBtn.disabled = false;
 
       if (data.error) {
         showGrillingError(data.error);
       }
       // Otherwise, the reply's effect (next questions, or hand-off to the next
-      // phase) arrives asynchronously over the already-open event stream.
+      // phase) arrives asynchronously over the already-open event stream, and
+      // the pending button is swept away with the rest of the stale
+      // interview DOM when the next render replaces it (issue #143).
     }
 
     function renderBlockedSession(snapshot) {
@@ -1722,26 +1747,26 @@
 
     async function sendImplementReply(replyText, triggerBtn) {
       if (!replyText.trim() || leftCardId === null) return;
-      triggerBtn.disabled = true;
       const res = await fetch(`/api/sessions/${leftCardId}/implement-reply`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reply: replyText }),
       });
       const data = await res.json();
-      triggerBtn.disabled = false;
 
       if (data.error) {
         showGrillingError(data.error);
       }
       // Otherwise, the reply's effect (re-blocked with a new question, or a
       // normal completion) arrives asynchronously over the already-open
-      // event stream, same as sendReply/sendConfirmAdvance.
+      // event stream, same as sendReply/sendConfirmAdvance -- and the
+      // pending button is swept away with the rest of the stale interview
+      // DOM when the next render replaces it (issue #143).
     }
 
     async function sendConfirmAdvance(triggerBtn) {
       if (leftCardId === null) return;
-      triggerBtn.disabled = true;
+      markButtonPending(triggerBtn);
       const res = await fetch("/api/session/continue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1750,12 +1775,12 @@
       const data = await res.json();
 
       if (data.error) {
-        triggerBtn.disabled = false;
         showGrillingError(data.error);
       }
       // Otherwise, the chain's effect (creating_prd, creating_issues, details)
       // arrives asynchronously over the already-open event stream, same as
-      // every other phase transition.
+      // every other phase transition -- and the pending button is swept
+      // away with the rest of the stale interview DOM (issue #143).
     }
 
     function renderReadyToProceed(preamble) {

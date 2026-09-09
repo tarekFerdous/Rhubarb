@@ -139,6 +139,56 @@ def _mock_engine(monkeypatch, handler, *, fresh_ids=None):
     return fake_class
 
 
+def _make_blocking_fake_engine_class(entered, release, enter_count, *, result_text, session_id=None):
+    """Build a fake stand-in for `PtyEngine` whose `stream_turn` genuinely
+    suspends mid-turn -- used by the issue #144 lock tests to put a turn
+    "in flight" on purpose and hold it there, so a second, overlapping call
+    for the same card_id can be made while the first has not yet finished.
+
+    `entered` (an `asyncio.Event`) is set the moment `stream_turn` is
+    actually entered -- a test awaits it to know the first call has reached
+    the engine before attempting the second, overlapping one. `enter_count`
+    (a `dict` with an `"n"` key) is incremented on every such entry, so a
+    test can assert how many of several concurrent calls actually reached
+    the engine (must always be exactly one -- the lock's whole point).
+    `release` (another `asyncio.Event`) gates the turn's completion -- the
+    fake only yields its final result event, and stream_turn only returns,
+    once the test sets it.
+    """
+
+    class BlockingFakeEngine:
+        instances: list["BlockingFakeEngine"] = []
+
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, pty_factory=None):
+            self.cwd = cwd
+            self.model = model
+            self.effort = effort
+            self.resume_session_id = resume_session_id
+            self.claude_session_id = resume_session_id or f"fresh-{len(BlockingFakeEngine.instances) + 1}"
+            self.started = False
+            self.closed = False
+            BlockingFakeEngine.instances.append(self)
+
+        def start(self):
+            self.started = True
+            return self
+
+        def close(self):
+            self.closed = True
+
+        def isalive(self):
+            return self.started and not self.closed
+
+        async def stream_turn(self, prompt):
+            enter_count["n"] += 1
+            entered.set()
+            yield {"type": "system", "subtype": "init", "session_id": self.claude_session_id}
+            await release.wait()
+            yield _result_event(result_text, session_id=session_id or self.claude_session_id)
+
+    return BlockingFakeEngine
+
+
 def test_start_session_job_publishes_usage_from_a_rate_limit_event(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
@@ -3032,3 +3082,164 @@ def test_dismiss_error_notifications_clears_the_project_queue(client, tmp_path):
 
     session_runner.dismiss_error_notifications(project_id)
     assert session_runner.get_error_notifications(project_id) == []
+
+
+# ---------------------------------------------------------------------------
+# Per-card_id turn lock (issue #144): a race condition where two overlapping
+# calls for the same card_id could both write to and read from the same
+# resident PtyEngine's stream_turn at once. `_run_turn` now checks a
+# per-card_id `asyncio.Lock` before doing anything else; a call made while
+# the lock is already held returns `None` immediately, touching neither the
+# engine nor anything else.
+# ---------------------------------------------------------------------------
+
+
+def test_run_turn_lock_rejects_a_concurrent_call_for_the_same_card_id(client, tmp_path, monkeypatch):
+    """The core invariant: of two overlapping `_run_turn` calls for the same
+    card_id, only the first ever reaches the engine's `stream_turn` -- the
+    second, made while the first is still mid-turn (blocked inside
+    `stream_turn` via a controlled `asyncio.Event`), returns `None`
+    immediately without constructing or touching the engine at all."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    enter_count = {"n": 0}
+    fake_class = _make_blocking_fake_engine_class(
+        entered, release, enter_count, result_text="❓ **Q1** - **Scope**: Only question?"
+    )
+    monkeypatch.setattr(session_runner, "PtyEngine", fake_class)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+
+    async def scenario():
+        first_task = asyncio.create_task(
+            session_runner._run_turn(row_id, "first prompt", session_id=None, cwd=cwd, model=None, effort=None)
+        )
+        await entered.wait()  # first call is now mid-turn, blocked inside stream_turn
+
+        # A second, overlapping call for the SAME card_id while the first
+        # is still in flight -- must be rejected outright.
+        second_result = await session_runner._run_turn(
+            row_id, "second prompt", session_id=None, cwd=cwd, model=None, effort=None
+        )
+        assert second_result is None
+
+        release.set()
+        return await first_task
+
+    first_result = asyncio.run(scenario())
+
+    # Only the first call's turn ever actually reached the engine.
+    assert enter_count["n"] == 1
+    assert len(fake_class.instances) == 1
+    assert first_result["session_id"] == fake_class.instances[0].claude_session_id
+
+
+def test_concurrent_start_implement_job_calls_only_one_reaches_the_engine(client, tmp_path, monkeypatch):
+    """End-to-end through a real turn-initiating function: two overlapping
+    `start_implement_job` calls for the same card_id (e.g. a double-clicked
+    "implement" action) must not both drive the same resident PtyEngine.
+    The second, made while the first is still mid-turn, is a silent no-op --
+    it never reaches the engine and never publishes the turn's completion
+    events, so exactly one `turn` and one `done` event reach the session's
+    live buffer, and the row lands in its normal single-turn end state."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    enter_count = {"n": 0}
+    fake_class = _make_blocking_fake_engine_class(entered, release, enter_count, result_text="Implemented PRD #5")
+    monkeypatch.setattr(session_runner, "PtyEngine", fake_class)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn,
+        project_id,
+        session_type="implement",
+        phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+
+    async def scenario():
+        first_task = asyncio.create_task(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+        await entered.wait()  # first call's turn is now mid-flight
+
+        # A second, overlapping call for the same card_id -- silent no-op.
+        await session_runner.start_implement_job(row_id, 5, cwd=cwd)
+
+        release.set()
+        await first_task
+
+    asyncio.run(scenario())
+
+    # Only one turn ever actually reached the engine's stream_turn.
+    assert enter_count["n"] == 1
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "implemented"
+    assert row["available_for_reuse"] == 1
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e["type"] == "turn"]
+    done_events = [e for e in events if e["type"] == "done"]
+    # Exactly the real turn's completion events -- the rejected duplicate
+    # published neither.
+    assert len(turn_events) == 1
+    assert len(done_events) == 1
+
+    # The engine the legitimate call used was closed exactly once (normal
+    # end-of-turn pooling), not disturbed or double-closed by the rejected
+    # duplicate.
+    turn_engine = fake_class.instances[0]
+    assert turn_engine.closed is True
+    assert row_id not in session_runner._pty_engines
+
+
+def test_turn_lock_is_released_after_the_turn_completes(client, tmp_path, monkeypatch):
+    """The lock must never be left stuck held after a turn finishes -- a
+    call for the same card_id made strictly after the first has completed
+    (not concurrently) must proceed normally, not be rejected."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(f"result for {prompt}", session_id="s1")]))
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+
+    async def scenario():
+        first = await session_runner._run_turn(row_id, "first", session_id=None, cwd=cwd, model=None, effort=None)
+        second = await session_runner._run_turn(
+            row_id, "second", session_id="s1", cwd=cwd, model=None, effort=None
+        )
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first is not None
+    assert second is not None
+    assert not session_runner._get_turn_lock(row_id).locked()
+
+
+def test_close_engine_removes_the_turn_lock(client, tmp_path, monkeypatch):
+    """`_close_engine` must pop the card's entry out of `_turn_locks` too,
+    alongside `_pty_engines` -- otherwise the lock registry grows
+    unboundedly over a long-running instance."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")]))
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    assert row_id in session_runner._turn_locks
+
+    session_runner._close_engine(row_id)
+
+    assert row_id not in session_runner._turn_locks

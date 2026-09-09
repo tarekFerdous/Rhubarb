@@ -132,6 +132,28 @@ def _context_window_pct(raw_result_event: dict) -> float | None:
 # shares this one mechanism instead -- see `_get_or_create_engine`.
 _pty_engines: dict[int, PtyEngine] = {}
 
+# Per-card_id lock guarding `_run_turn`'s actual PTY write/read against a
+# duplicate overlapping call for the same card_id (issue #144) -- a
+# confirmed race where two turn-initiating requests for the same session
+# (e.g. a double-clicked button, a retried request) could both reach the
+# same resident `PtyEngine`'s `stream_turn` at once, interleaving writes and
+# reads on a connection that only ever expects one turn in flight. Mirrors
+# `_pty_engines`'s own per-card_id lifecycle: created on first use by
+# `_get_turn_lock`, popped (and discarded) by `_close_engine` alongside the
+# engine itself so the registry never grows unboundedly over a long-running
+# instance.
+_turn_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_turn_lock(card_id: int) -> asyncio.Lock:
+    """Return this card's turn lock, creating one on first use -- mirrors
+    `_get_or_create_engine`'s "construct on first call, reuse after" shape."""
+    lock = _turn_locks.get(card_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _turn_locks[card_id] = lock
+    return lock
+
 
 def _get_or_create_engine(
     card_id: int, *, cwd: str | None, model: str | None, effort: str | None, resume_session_id: str | None
@@ -169,6 +191,7 @@ def _close_engine(card_id: int) -> None:
     engine = _pty_engines.pop(card_id, None)
     if engine is not None:
         engine.close()
+    _turn_locks.pop(card_id, None)
 
 
 def close_session(conn, card_id: int) -> None:
@@ -433,7 +456,7 @@ async def _run_turn(
     cwd: str | None,
     model: str | None = None,
     effort: str | None = None,
-) -> dict:
+) -> dict | None:
     """Run one turn against this card's resident `PtyEngine` tab (see
     `_get_or_create_engine` -- constructed and started on the first call for
     this `card_id`, reattached via `--resume session_id` if one is already
@@ -445,38 +468,54 @@ async def _run_turn(
     `PtyEngineUnrecoverableError` unwrapped -- callers route that into the
     blocked-card flow (see `_route_crash_to_blocked`) instead of treating it
     like a plain `ClaudeCLIError`.
+
+    Issue #144: guarded by this card's turn lock (`_get_turn_lock`) so two
+    overlapping calls for the same `card_id` can never both write to and
+    read from the same resident `PtyEngine` at once. If the lock is already
+    held -- a genuine in-flight turn for this card_id -- this call returns
+    `None` immediately, touching neither the engine nor anything else;
+    every caller must check for `None` and return early rather than treat
+    it as a normal completed (or failed) turn.
     """
-    holder: dict = {}
+    lock = _get_turn_lock(card_id)
+    if lock.locked():
+        return None
 
-    async def runner():
-        engine = _get_or_create_engine(card_id, cwd=cwd, model=model, effort=effort, resume_session_id=session_id)
-        async for raw_event in engine.stream_turn(prompt):
-            translated = translate_event(raw_event)
-            if translated is None:
-                continue
-            if translated["type"] == "turn":
-                translated["context_pct"] = _context_window_pct(raw_event)
-                holder["turn"] = translated
-                continue
-            publish(card_id, translated)
+    async with lock:
+        holder: dict = {}
 
-    try:
-        await runner()
-    except PtyEngineUnrecoverableError:
-        raise
-    except ClaudeCLIError as e:
-        holder["error"] = e
-    except Exception as e:
-        # Anything unexpected (a malformed raw event, a bug in translation)
-        # must still resolve into a recorded session error, not an
-        # unhandled exception on the fire-and-forget asyncio task -- that
-        # would leave the card stuck in its in-flight phase silently
-        # instead of surfacing the failure to the user.
-        holder["error"] = ClaudeCLIError(str(e))
+        async def runner():
+            engine = _get_or_create_engine(
+                card_id, cwd=cwd, model=model, effort=effort, resume_session_id=session_id
+            )
+            async for raw_event in engine.stream_turn(prompt):
+                translated = translate_event(raw_event)
+                if translated is None:
+                    continue
+                if translated["type"] == "turn":
+                    translated["context_pct"] = _context_window_pct(raw_event)
+                    holder["turn"] = translated
+                    continue
+                publish(card_id, translated)
 
-    if "error" in holder:
-        raise holder["error"]
-    return holder["turn"]
+        try:
+            await runner()
+        except PtyEngineUnrecoverableError:
+            raise
+        except ClaudeCLIError as e:
+            holder["error"] = e
+        except Exception as e:
+            # Anything unexpected (a malformed raw event, a bug in
+            # translation) must still resolve into a recorded session
+            # error, not an unhandled exception on the fire-and-forget
+            # asyncio task -- that would leave the card stuck in its
+            # in-flight phase silently instead of surfacing the failure to
+            # the user.
+            holder["error"] = ClaudeCLIError(str(e))
+
+        if "error" in holder:
+            raise holder["error"]
+        return holder["turn"]
 
 
 def _turn_event(
@@ -546,6 +585,13 @@ async def _run_grilling_turn(
             conn, card_id, model=model, effort=effort, error_text=message, needs_github_login=0
         )
         publish(card_id, _turn_event(phase="grilling", error=message, needs_github_login=False))
+        return None
+
+    if turn is None:
+        # Issue #144: a genuine turn for this card_id is already in flight
+        # (the lock was held) -- this duplicate call is a silent no-op, not
+        # an error: no DB update, no publish, and the in-flight turn's own
+        # engine is left completely untouched.
         return None
 
     file_text = read_question_file(cwd, _GRILLING_QUESTION_FILE)
@@ -620,6 +666,11 @@ async def _run_chain_step(
         db.update_session(conn, row["id"], error_text=message, needs_github_login=0)
         publish(card_id, _turn_event(phase=phase, error=message, needs_github_login=False))
         publish(card_id, {"type": "done"})
+        return False, None
+
+    if turn is None:
+        # Issue #144: a genuine turn for this card_id is already in flight
+        # -- silent no-op, no DB update, no publish, engine left untouched.
         return False, None
 
     db.update_session(
@@ -990,6 +1041,11 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
         await _drain_implement_queue(row["project_id"], cwd)
         return
 
+    if turn is None:
+        # Issue #144: a genuine turn for this card_id is already in flight
+        # -- silent no-op, no DB update, no publish, engine left untouched.
+        return
+
     await _finish_implement_turn(card_id, conn, row, turn, cwd=cwd, model=model, effort=effort)
 
 
@@ -1140,6 +1196,11 @@ async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -
         await _drain_implement_queue(row["project_id"], cwd)
         return
 
+    if turn is None:
+        # Issue #144: a genuine turn for this card_id is already in flight
+        # -- silent no-op, no DB update, no publish, engine left untouched.
+        return
+
     row = db.get_session(conn, card_id)
     await _finish_implement_turn(card_id, conn, row, turn, cwd=cwd, model=model, effort=effort)
 
@@ -1214,6 +1275,11 @@ async def continue_qa_job(card_id: int, answers: dict, extra_notes: str, *, cwd:
         publish(card_id, _turn_event(phase="qa_closing", error=message, needs_github_login=bool(needs_login)))
         publish(card_id, {"type": "done"})
         add_error_notification(row["project_id"], card_id, "qa_closing", message)
+        return
+
+    if turn is None:
+        # Issue #144: a genuine turn for this card_id is already in flight
+        # -- silent no-op, no DB update, no publish, engine left untouched.
         return
 
     context_pct = turn.get("context_pct")
