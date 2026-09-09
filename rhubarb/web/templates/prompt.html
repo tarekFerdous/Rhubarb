@@ -1179,6 +1179,21 @@
       term.options.disableStdin = true;
     }
 
+    // Issue #134: a reply submitted through the structured answer box (not
+    // typed directly into the terminal) must still echo into the terminal
+    // and close out its "awaiting your reply" state -- otherwise the
+    // terminal is left thinking a reply is still pending after one has, in
+    // fact, already been sent through the other channel. Every button click
+    // handler that submits a reply goes through this instead of calling
+    // sendReply/sendImplementReply directly.
+    function submitReplyFromButton(text, sendFn, triggerBtn) {
+      if (terminalReplySendFn) {
+        term.write(text + "\r\n");
+        disableTerminalReplyInput();
+      }
+      sendFn(text, triggerBtn);
+    }
+
     term.onData((data) => {
       if (!terminalReplySendFn) return;
 
@@ -1649,7 +1664,7 @@
       btn.className = "glass-btn";
       btn.textContent = "Send";
       btn.style.marginTop = "12px";
-      btn.addEventListener("click", () => onSend(box.value, btn));
+      btn.addEventListener("click", () => submitReplyFromButton(box.value, onSend, btn));
       wrap.appendChild(btn);
 
       return wrap;
@@ -1823,8 +1838,17 @@
           optWrap.className = "option-list";
           const recommendedIndices = new Set(q.recommended || []);
           const selectedIndices = new Set(recommendedIndices);
+          // Set once the "Something else?" box below is created -- declared
+          // here so updateAnswer's closure sees the same binding once it's
+          // assigned, even though it's referenced before that assignment
+          // happens further down.
+          let somethingElseInput = null;
 
           const updateAnswer = () => {
+            // A non-empty override always wins, regardless of which option
+            // is (still) visually selected -- an option click only updates
+            // the answer once the override has been cleared back to empty.
+            if (somethingElseInput && somethingElseInput.value.trim()) return;
             const chosen = q.options.filter((_, i) => selectedIndices.has(i + 1));
             answers[q.id] = q.kind === "multi" ? chosen.join(", ") : chosen[0] || "";
           };
@@ -1867,6 +1891,17 @@
 
           updateAnswer();
           block.appendChild(optWrap);
+
+          const { wrap: somethingElseWrap, textarea: somethingElseBox } = renderTrailingNotesBox("Something else?");
+          somethingElseInput = somethingElseBox;
+          somethingElseBox.addEventListener("input", () => {
+            if (somethingElseBox.value.trim()) {
+              answers[q.id] = somethingElseBox.value.trim();
+            } else {
+              updateAnswer();
+            }
+          });
+          block.appendChild(somethingElseWrap);
         } else {
           const input = document.createElement("textarea");
           input.className = "answer-box";
@@ -1908,7 +1943,7 @@
         submitBtn.addEventListener("click", () => {
           const lines = data.questions.map((q, i) => `${i + 1}. ${answers[q.id] || "(no answer)"}`);
           if (trailingBox.value.trim()) lines.push(`Anything else: ${trailingBox.value.trim()}`);
-          sendReply(lines.join("\n"), submitBtn);
+          submitReplyFromButton(lines.join("\n"), sendReply, submitBtn);
         });
         interviewEl.appendChild(submitBtn);
       } else {
@@ -1917,7 +1952,7 @@
         sendBtn.className = "glass-btn";
         sendBtn.textContent = "Send";
         sendBtn.style.marginTop = "16px";
-        sendBtn.addEventListener("click", () => sendReply(trailingBox.value, sendBtn));
+        sendBtn.addEventListener("click", () => submitReplyFromButton(trailingBox.value, sendReply, sendBtn));
         interviewEl.appendChild(sendBtn);
       }
 
