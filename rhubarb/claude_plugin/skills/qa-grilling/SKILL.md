@@ -27,6 +27,8 @@ Recommended text: "<a likely answer, if you have a reasonable guess>"
 - Every QA question is open-ended — there is no `Options:`/`Option N:` block for QA questions, ever.
 - `Recommended text: "<...>"` is optional per question: include it when you have a reasonable guess at the answer (e.g. from having just implemented it), omit it when you genuinely don't know.
 
+Before printing the session to chat, also write the exact same content (the `QA session for PRD N:` header through every `Issue N:`/`Question N:`/`Recommended text:` line) to a file at `.claude/rhubarb_qa.md` in the project directory (create it if it doesn't exist, overwrite it if it does) -- this is what Rhubarb actually reads to render the round on screen, more reliably than scraping it back out of your printed chat output. Still print the session to chat exactly as specified above; the file is additive, not a replacement.
+
 Rules:
 - Group every question by the issue it verifies against — never a flat list.
 - After the user answers, identify any gaps, failures, or uncertainties and surface them clearly.

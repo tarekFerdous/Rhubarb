@@ -32,6 +32,8 @@ Recommended text: "<your recommended free-text answer>"
 - A question with no `Options:` block is open-ended — give a `Recommended text: "<...>"` line instead of `Recommended:`, or omit it if you have no recommendation.
 - Ask the whole frontier in one round, one `Question N:` block per question, numbered sequentially within the round.
 
+Before printing a round to chat, also write the exact same `Question N:` blocks (no free-text framing, just the structured blocks themselves, one after another) to a file at `.claude/rhubarb_question.md` in the project directory (create it if it doesn't exist, overwrite it if it does) -- this is what Rhubarb actually reads to render the round on screen, more reliably than scraping it back out of your printed chat output. Still print the round to chat exactly as specified above; the file is additive, not a replacement.
+
 Each round the user answers reshapes the tree: settled decisions push the frontier outward and unblock questions that depended on them. Recompute the frontier and ask the next round. A question whose answer depends on another question still open in this round belongs to a _later_ round, not this one.
 
 Finding _facts_ is your job, never the user's. When a frontier question needs a fact from the environment (filesystem, tools, etc.), dispatch a sub-agent to find it; don't ask the user for anything you could look up yourself. Don't block on it: a running exploration is an unsettled prerequisite, so only the questions downstream of it wait for the sub-agent to report; ask the rest of the frontier now. The _decisions_ are the user's: put each to them and wait.

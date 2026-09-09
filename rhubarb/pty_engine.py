@@ -550,6 +550,11 @@ class PtyEngine:
 
         text, _marker, _trailing = buffer.partition(TURN_COMPLETE_MARKER)
         clean_text = _render_terminal_text(text)
+        # Debug visibility into this turn's rendered (not raw) PTY output --
+        # what a round of questions/options resolves to after
+        # `_render_terminal_text` collapses ANSI/cursor-movement redraws to
+        # their final plain text, same text `qa_parser.py` parses.
+        print(f"[pty result]\n{clean_text}")
         yield {"type": "result", "result": clean_text, "session_id": self.claude_session_id, "is_error": False}
 
     def close(self) -> None:

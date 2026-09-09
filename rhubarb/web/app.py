@@ -15,6 +15,8 @@ from rhubarb.cli_client import ClaudeCLIError, get_auth_status
 from rhubarb.folder_picker import pick_folder
 from rhubarb.prd_list import compute_prd_list
 from rhubarb.projects import scan_projects
+from rhubarb.qa_parser import parse_grilling_response
+from rhubarb.question_files import read_question_file
 from rhubarb.terminal import open_terminal_running
 
 BASE_DIR = Path(__file__).parent
@@ -339,6 +341,25 @@ def _session_to_dict(row) -> dict:
 def list_sessions(project_id: int):
     conn = db.get_connection()
     return {"sessions": [_session_to_dict(r) for r in db.list_sessions_for_project(conn, project_id)]}
+
+
+@app.get("/api/projects/{project_id}/rhubarb-question-file-preview")
+def preview_rhubarb_question_file(project_id: int):
+    """Debug tool (PRD #123 follow-up): read this project's pending
+    `.claude/rhubarb_question.md` right now, parse it exactly the way a real
+    grilling turn would, and hand back the resulting interview -- so the
+    parse/render path can be checked directly against the file, independent
+    of whether a live turn's own file-priority check is reaching it."""
+    conn = db.get_connection()
+    project = db.get_project(conn, project_id)
+    if project is None:
+        return {"found": False}
+
+    file_text = read_question_file(project["path"], "rhubarb_question.md")
+    if file_text is None:
+        return {"found": False}
+
+    return {"found": True, "interview": parse_grilling_response(file_text)}
 
 
 @app.get("/api/projects/{project_id}/afk-notifications")

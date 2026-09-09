@@ -367,6 +367,109 @@ def test_start_session_job_returns_card_with_grilling_questions(client, tmp_path
     assert any(e["type"] == "turn" and e["interview"] == interview for e in events)
 
 
+def _write_question_file(cwd, filename, content):
+    claude_dir = Path(cwd) / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / filename).write_text(content, encoding="utf-8")
+
+
+def test_start_session_job_prefers_rhubarb_question_file_over_terminal_text(client, tmp_path, monkeypatch):
+    """PRD #123: a turn whose rendered terminal text would parse to nothing
+    still produces a full interview when `.claude/rhubarb_question.md` is
+    present with valid content -- the file-based path this PRD adds."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _write_question_file(
+        cwd, "rhubarb_question.md",
+        'Question 1: "Python or Node?"\nOptions:\nOption 1: "Python"\nOption 2: "Node"\nRecommended: [1]\n',
+    )
+
+    # Terminal text alone has no recognizable Question block -- would parse empty.
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("Working on it, one moment.")]))
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a new feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    interview = json.loads(row["interview_json"])
+    assert interview["source"] == "regex"
+    assert len(interview["questions"]) == 1
+    assert interview["questions"][0]["options"] == ["Python", "Node"]
+    assert interview["questions"][0]["recommended"] == [1]
+
+
+def test_rhubarb_question_file_is_not_deleted_merely_by_being_read(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _write_question_file(cwd, "rhubarb_question.md", 'Question 1: "Python or Node?"')
+
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("irrelevant terminal text")]))
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a new feature", cwd=cwd))
+
+    assert (Path(cwd) / ".claude" / "rhubarb_question.md").exists()
+
+
+def test_continue_session_job_deletes_rhubarb_question_file_on_reply(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def handler(prompt, **kw):
+        return iter([_result_event('Question 1: "A follow-up?"')])
+
+    _mock_engine(monkeypatch, handler)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    _write_question_file(cwd, "rhubarb_question.md", 'Question 1: "First question?"')
+    asyncio.run(session_runner.continue_session_job(row_id, "my answer", cwd=cwd))
+
+    assert not (Path(cwd) / ".claude" / "rhubarb_question.md").exists()
+
+
+def test_confirm_advance_also_deletes_rhubarb_question_file(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def handler(prompt, **kw):
+        if prompt in ("/rhubarb:to-prd", "/rhubarb:to-issues"):
+            return iter([_result_event("done")])
+        return iter([_result_event("Thanks, that's everything I need.")])
+
+    _mock_engine(monkeypatch, handler)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    _write_question_file(cwd, "rhubarb_question.md", 'Question 1: "First question?"')
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
+    assert not (Path(cwd) / ".claude" / "rhubarb_question.md").exists()
+
+
+def test_malformed_rhubarb_question_file_is_deleted_and_falls_back_to_terminal_text(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _write_question_file(cwd, "rhubarb_question.md", "not a recognizable question format at all")
+
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event('Question 1: "From terminal text"')]))
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a new feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    interview = json.loads(row["interview_json"])
+    assert interview["questions"][0]["text"] == "From terminal text"
+    assert not (Path(cwd) / ".claude" / "rhubarb_question.md").exists()
+
+
 def test_start_session_job_publishes_interview_even_with_no_structured_questions(client, tmp_path, monkeypatch):
     """A real /rhubarb:do turn can reply with plain prose (no bullet/heading
     questions qa_parser recognizes as structured). The left card must still
@@ -1668,6 +1771,130 @@ def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(c
     ]
 
 
+def test_start_implement_job_prefers_rhubarb_qa_file_over_terminal_text(client, tmp_path, monkeypatch):
+    """PRD #123: a QA handoff turn whose terminal text has no recognizable
+    QA session block still produces a full issues/questions structure when
+    `.claude/rhubarb_qa.md` is present with valid content."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    tracker = {
+        "prd": {"number": 7, "title": "Tracked PRD"},
+        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
+        "qa_changes": [],
+        "status": "implemented",
+    }
+    claude_dir = Path(cwd) / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+    _write_question_file(
+        cwd, "rhubarb_qa.md",
+        'QA session for PRD 7: "Tracked PRD"\n\nIssue 8: "Child"\nQuestion 1: "Does it work?"\nRecommended text: "Yes."\n',
+    )
+
+    # Terminal text carries the handoff signal block but no recognizable QA session text.
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(_QA_BLOCK, session_id="qa-session-id")]))
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    qa_row = next(s for s in sessions if s["session_type"] == "qa")
+    qa_events = live_stream._buffers.get(qa_row["id"], [])
+    qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
+    assert qa_turn_events[0]["issues"] == [
+        {
+            "number": 8,
+            "title": "Child",
+            "questions": [{"id": "issue8-q1", "text": "Does it work?", "recommended_text": "Yes."}],
+        }
+    ]
+
+
+def test_rhubarb_qa_file_is_not_deleted_merely_by_being_read(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    tracker = {
+        "prd": {"number": 7, "title": "Tracked PRD"},
+        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
+        "qa_changes": [], "status": "implemented",
+    }
+    claude_dir = Path(cwd) / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+    _write_question_file(cwd, "rhubarb_qa.md", 'QA session for PRD 7: "Tracked PRD"\n\nIssue 8: "Child"\nQuestion 1: "Does it work?"\n')
+
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(_QA_BLOCK, session_id="qa-session-id")]))
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    assert (Path(cwd) / ".claude" / "rhubarb_qa.md").exists()
+
+
+def test_continue_qa_job_deletes_rhubarb_qa_file(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    qa_row_id = db.create_session(
+        conn, project_id, session_type="qa", phase="qa_grilling",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+    _write_question_file(cwd, "rhubarb_qa.md", 'QA session for PRD 7: "Tracked PRD"\n\nIssue 8: "Child"\nQuestion 1: "Does it work?"\n')
+
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("All good, PRD closed.")]))
+    asyncio.run(session_runner.continue_qa_job(qa_row_id, {}, "", cwd=cwd))
+
+    assert not (Path(cwd) / ".claude" / "rhubarb_qa.md").exists()
+
+
+def test_malformed_rhubarb_qa_file_is_deleted_and_falls_back_to_terminal_text(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    tracker = {
+        "prd": {"number": 7, "title": "Tracked PRD"},
+        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
+        "qa_changes": [], "status": "implemented",
+    }
+    claude_dir = Path(cwd) / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+    _write_question_file(cwd, "rhubarb_qa.md", "not a recognizable QA session format at all")
+
+    qa_turn_text = (
+        _QA_BLOCK + "\n\n"
+        'QA session for PRD 7: "Tracked PRD"\n\n'
+        'Issue 8: "Child"\n'
+        'Question 1: "From terminal text"\n'
+    )
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(qa_turn_text, session_id="qa-session-id")]))
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    qa_row = next(s for s in sessions if s["session_type"] == "qa")
+    qa_events = live_stream._buffers.get(qa_row["id"], [])
+    qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
+    assert qa_turn_events[0]["issues"][0]["questions"][0]["text"] == "From terminal text"
+    assert not (Path(cwd) / ".claude" / "rhubarb_qa.md").exists()
+
+
 def test_start_implement_job_uses_ollama_rescue_when_qa_regex_parser_finds_nothing(client, tmp_path, monkeypatch):
     """A QA handoff turn whose free text looks like it was trying to be a
     QA session (contains "QA session for PRD") but doesn't match the
@@ -2057,6 +2284,103 @@ def test_start_implement_job_suspends_as_blocked_when_result_contains_blocked_ma
 
     # Suspended, not finished -- the tab stays open for continue_implement_job.
     assert row_id in session_runner._pty_engines
+
+
+def test_start_implement_job_prefers_rhubarb_blocked_file_over_terminal_text(client, tmp_path, monkeypatch):
+    """PRD #123: a turn whose terminal text has no recognizable
+    `implement_blocked` block still suspends the session as blocked, with
+    the right question/context, when `.claude/rhubarb_blocked.json` is
+    present with valid content."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _write_question_file(
+        cwd, "rhubarb_blocked.json",
+        json.dumps({
+            "phase": "implement_blocked", "issue": 8,
+            "question": "Which auth provider should the login button use?",
+            "context": "The issue body doesn't specify Google vs GitHub OAuth.",
+        }),
+    )
+
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("Just plain prose, no marker.", session_id="impl-blocked")]))
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "blocked"
+    blocked = json.loads(row["blocked_json"])
+    assert blocked["question"] == "Which auth provider should the login button use?"
+    assert blocked["issue"] == 8
+
+
+def test_rhubarb_blocked_file_is_not_deleted_merely_by_being_read(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _write_question_file(
+        cwd, "rhubarb_blocked.json",
+        json.dumps({"phase": "implement_blocked", "issue": None, "question": "Which one?", "context": "..."}),
+    )
+
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("plain prose", session_id="impl-blocked")]))
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    assert (Path(cwd) / ".claude" / "rhubarb_blocked.json").exists()
+
+
+def test_continue_implement_job_deletes_rhubarb_blocked_file(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="blocked",
+        claude_session_id="impl-blocked",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    db.update_session(conn, row_id, blocked_json=json.dumps({"phase": "implement_blocked", "question": "Which?"}))
+    _write_question_file(
+        cwd, "rhubarb_blocked.json",
+        json.dumps({"phase": "implement_blocked", "issue": None, "question": "Which?", "context": "..."}),
+    )
+
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("Implemented, using GitHub OAuth.", session_id="impl-done")]))
+    asyncio.run(session_runner.continue_implement_job(row_id, "Use GitHub OAuth", cwd=cwd))
+
+    assert not (Path(cwd) / ".claude" / "rhubarb_blocked.json").exists()
+
+
+def test_malformed_rhubarb_blocked_file_is_deleted_and_falls_back_to_terminal_text(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _write_question_file(cwd, "rhubarb_blocked.json", "not valid json at all")
+
+    _mock_engine(
+        monkeypatch, lambda prompt, **kw: iter([_result_event(_IMPLEMENT_BLOCKED_BLOCK, session_id="impl-blocked")])
+    )
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "blocked"
+    blocked = json.loads(row["blocked_json"])
+    assert blocked["question"] == "Which auth provider should the login button use?"
+    assert not (Path(cwd) / ".claude" / "rhubarb_blocked.json").exists()
 
 
 def test_continue_implement_job_resolves_a_blocked_session(client, tmp_path, monkeypatch):

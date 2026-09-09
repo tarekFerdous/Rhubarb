@@ -299,6 +299,11 @@ textarea.prompt-box:focus {
   border-color: var(--glass-border);
 }
 
+#preview-question-file-btn {
+  right: 68px;
+  font-size: 0.95rem;
+}
+
 .active-project-line {
   display: flex;
   align-items: center;

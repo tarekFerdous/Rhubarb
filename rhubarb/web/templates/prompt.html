@@ -44,6 +44,7 @@
     </div>
     <div class="card left">
       <button id="settings-gear" class="gear-btn" type="button" title="Settings">&#9881;</button>
+      <button id="preview-question-file-btn" class="gear-btn" type="button" title="Preview .claude/rhubarb_question.md">&#128269;</button>
       <h1 class="brand" id="brand-heading">What are we doing?</h1>
       <p class="user-line">{{ email }}</p>
       <div id="active-project-line" class="active-project-line" hidden>
@@ -1046,6 +1047,22 @@
     }
 
     document.getElementById("settings-gear").addEventListener("click", openSettingsModal);
+    document.getElementById("preview-question-file-btn").addEventListener("click", async () => {
+      // Debug tool (PRD #123 follow-up): render the project's current
+      // .claude/rhubarb_question.md directly through the real renderInterview
+      // path, independent of a live turn -- isolates "the file doesn't parse/
+      // render right" from "a live turn isn't reaching the file."
+      if (!activeProject) return;
+      const res = await fetch(`/api/projects/${activeProject.id}/rhubarb-question-file-preview`);
+      const data = await res.json();
+      if (!data.found) {
+        alert("No .claude/rhubarb_question.md found for this project right now.");
+        return;
+      }
+      showOnly(mainFlowEl);
+      setHeading("Preview: rhubarb_question.md");
+      renderInterview(data.interview);
+    });
     document.getElementById("open-root-btn").addEventListener("click", openSettingsModal);
     document.getElementById("modal-close-btn").addEventListener("click", closeSettingsModal);
     document.getElementById("modal-pick-btn").addEventListener("click", pickRootDir);
@@ -2056,6 +2073,7 @@
       }
       leftCardId = data.card_id;
       currentLeftSession = { card_id: data.card_id, phase: "grilling", interview: { header: "", questions: [], footer: "" } };
+      lastRenderedQuestionFileContent = null;
       startForm.style.display = "none";
       setHeading(headingForPhase("grilling"));
       renderInterview({ header: "", questions: [], footer: "" });
@@ -2089,6 +2107,38 @@
     let usageIntervalId = null;
     let sessionQueueIntervalId = null;
     let ptyTabCountIntervalId = null;
+    let questionFileIntervalId = null;
+    // Content of the last `.claude/rhubarb_question.md` round actually
+    // rendered from the poll below -- `null` whenever no file is currently
+    // showing (reset the moment a poll tick finds none, e.g. right after the
+    // user answers and the backend deletes it). Compared by content, not by
+    // round number, so a tick that finds the SAME still-pending round is a
+    // no-op instead of rebuilding the DOM under the user's in-progress
+    // selections every second.
+    let lastRenderedQuestionFileContent = null;
+
+    async function pollQuestionFileTick() {
+      // PRD #123 follow-up: a live grilling turn's own file-priority check
+      // only runs once that turn's PTY marker is detected as complete --
+      // exactly the slow/fragile step this file was meant to route around.
+      // Polling the file directly, independent of turn completion, shows a
+      // round the moment the skill writes it, regardless of what the PTY
+      // stream is doing. Only active while the focused left card is actually
+      // in the grilling phase -- a no-op otherwise.
+      if (!activeProject || leftCardId === null || !currentLeftSession || currentLeftSession.phase !== "grilling") {
+        return;
+      }
+      const res = await fetch(`/api/projects/${activeProject.id}/rhubarb-question-file-preview`);
+      const data = await res.json();
+      if (!data.found) {
+        lastRenderedQuestionFileContent = null;
+        return;
+      }
+      const content = JSON.stringify(data.interview);
+      if (content === lastRenderedQuestionFileContent) return;
+      lastRenderedQuestionFileContent = content;
+      renderInterview(data.interview);
+    }
 
     function pollsShouldRun() {
       return Boolean(activeProject) && document.visibilityState === "visible";
@@ -2102,6 +2152,8 @@
       sessionQueueIntervalId = setInterval(pollSessionQueueFreshness, 4000);
       refreshPtyTabCount();
       ptyTabCountIntervalId = setInterval(refreshPtyTabCount, 3000);
+      pollQuestionFileTick();
+      questionFileIntervalId = setInterval(pollQuestionFileTick, 1000);
     }
 
     function stopPolls() {
@@ -2116,6 +2168,10 @@
       if (ptyTabCountIntervalId) {
         clearInterval(ptyTabCountIntervalId);
         ptyTabCountIntervalId = null;
+      }
+      if (questionFileIntervalId) {
+        clearInterval(questionFileIntervalId);
+        questionFileIntervalId = null;
       }
     }
 

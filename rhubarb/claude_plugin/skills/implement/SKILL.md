@@ -19,6 +19,8 @@ If you genuinely cannot proceed without information only the user has — not "w
 
 Rhubarb detects this marker and hands your question to the user through the app UI; your next turn will carry their reply as a normal message, resuming from here. Do not use this for anything a reasonable default would resolve — it exists for the rare case, not as a routine checkpoint.
 
+Before printing that marker to chat, also write the exact same JSON object to a file at `.claude/rhubarb_blocked.json` in the project directory (create it if it doesn't exist, overwrite it if it does) -- this is what Rhubarb actually reads to route this to the blocked-card UI, more reliably than scraping it back out of your printed chat output. Still print the marker to chat exactly as specified above; the file is additive, not a replacement.
+
 ---
 
 ## Phase 1 — PRD Selection

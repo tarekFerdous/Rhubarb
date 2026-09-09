@@ -32,7 +32,16 @@ from rhubarb.ollama_rescue import (
 )
 from rhubarb.pty_engine import PtyEngine, PtyEngineUnrecoverableError
 from rhubarb.qa_parser import parse_grilling_response, parse_qa_response
+from rhubarb.question_files import delete_question_file, read_question_file
 from rhubarb.stream_translate import translate_event
+
+# Filenames under `.claude/` a skill writes its structured question/blocked
+# output to (PRD #123) -- read here in preference to scraping the turn's
+# rendered terminal text, which is exposed to PTY capture-timing/terminal-
+# rendering risk the file write is not. See `rhubarb/question_files.py`.
+_GRILLING_QUESTION_FILE = "rhubarb_question.md"
+_QA_QUESTION_FILE = "rhubarb_qa.md"
+_IMPLEMENT_BLOCKED_FILE = "rhubarb_blocked.json"
 
 # The old broad pattern (`auth|login|not logged in|permission denied|401|403`)
 # matched any Claude CLI failure that happened to contain one of those common
@@ -459,7 +468,16 @@ async def _run_grilling_turn(
         publish(card_id, _turn_event(phase="grilling", error=message, needs_github_login=False))
         return None
 
-    parsed = parse_grilling_response(turn["result"])
+    file_text = read_question_file(cwd, _GRILLING_QUESTION_FILE)
+    parsed = parse_grilling_response(file_text) if file_text is not None else None
+    if file_text is not None and not parsed["questions"]:
+        # Present but unparseable -- never let a corrupt file wedge every
+        # future round; drop it and fall back to the terminal-text path
+        # below exactly as if it had never been written.
+        delete_question_file(cwd, _GRILLING_QUESTION_FILE)
+        parsed = None
+    if parsed is None:
+        parsed = parse_grilling_response(turn["result"])
     if should_attempt_grilling_rescue(parsed, turn["result"]) and not db.get_ollama_declined(conn):
         # The regex parser found nothing, but the text looks like it was
         # trying to be in the structured format -- give the local Ollama
@@ -695,7 +713,14 @@ async def continue_session_job(card_id: int, reply: str, *, cwd: str | None, con
     goes straight to `advance_past_grilling`, resuming the session's existing
     `claude_session_id` -- exactly like `retry_session_job` does for a
     `creating_prd` row. Both paths use the model already recorded on the row
-    -- this is a continuation of an existing session, not a fresh one."""
+    -- this is a continuation of an existing session, not a fresh one.
+
+    Either way, this is the round being answered -- delete its
+    `.claude/rhubarb_question.md` (PRD #123) if one is still there, now that
+    it's served its purpose, before the next turn (which writes a fresh one
+    of its own if it has another round to ask)."""
+    delete_question_file(cwd, _GRILLING_QUESTION_FILE)
+
     if confirm_advance:
         await advance_past_grilling(card_id, cwd)
         return
@@ -893,7 +918,22 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
     console_text = row["console_text"] + "\n\n" + turn["result"] if row["console_text"] else turn["result"]
     db.update_session(conn, card_id, console_text=console_text, context_pct=turn.get("context_pct"))
 
-    blocked = _parse_implement_blocked_block(turn["result"])
+    file_text = read_question_file(cwd, _IMPLEMENT_BLOCKED_FILE)
+    blocked = None
+    if file_text is not None:
+        try:
+            file_data = json.loads(file_text.strip())
+        except (json.JSONDecodeError, ValueError):
+            file_data = None
+        if isinstance(file_data, dict) and file_data.get("phase") == "implement_blocked":
+            blocked = file_data
+        else:
+            # Present but unparseable/wrong shape -- never let a corrupt
+            # file wedge future turns; drop it and fall back to the
+            # terminal-text scan below exactly as if it had never existed.
+            delete_question_file(cwd, _IMPLEMENT_BLOCKED_FILE)
+    if blocked is None:
+        blocked = _parse_implement_blocked_block(turn["result"])
     if blocked is not None:
         db.update_session(
             conn, card_id, claude_session_id=turn["session_id"], phase="blocked", blocked_json=json.dumps(blocked)
@@ -926,7 +966,16 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
         # -- this card's own tab is done; the new QA row's own tab starts
         # fresh (reattached via --resume) on its own first turn.
         qa_prd = qa_data.get("prd")
-        qa_parsed = parse_qa_response(turn["result"])
+        qa_file_text = read_question_file(cwd, _QA_QUESTION_FILE)
+        qa_parsed = parse_qa_response(qa_file_text) if qa_file_text is not None else None
+        if qa_file_text is not None and not qa_parsed["issues"]:
+            # Present but unparseable -- never let a corrupt file wedge
+            # every future round; drop it and fall back to the terminal-text
+            # path below exactly as if it had never been written.
+            delete_question_file(cwd, _QA_QUESTION_FILE)
+            qa_parsed = None
+        if qa_parsed is None:
+            qa_parsed = parse_qa_response(turn["result"])
         if should_attempt_qa_rescue(qa_parsed, turn["result"]) and not db.get_ollama_declined(conn):
             # Same rescue path as grilling (issue #114) -- the regex parser
             # found nothing despite text that looks like it was trying to
@@ -967,7 +1016,13 @@ async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -
     tail as the original turn -- if the reply doesn't fully unblock it, the
     result is another `implement_blocked` marker and the session stays
     suspended for another reply (a natural loop: each reply is an
-    independent call, nothing here needs an explicit loop construct)."""
+    independent call, nothing here needs an explicit loop construct).
+
+    This is the blocked question being answered -- delete its
+    `.claude/rhubarb_blocked.json` (PRD #123) if one is still there, now
+    that it's served its purpose."""
+    delete_question_file(cwd, _IMPLEMENT_BLOCKED_FILE)
+
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
     model = row["model"]
@@ -1023,7 +1078,12 @@ async def continue_qa_job(card_id: int, answers: dict, extra_notes: str, *, cwd:
     """Called from POST /api/session/qa-complete. Unblocks the QA session by
     running Phase 3+ with the user's per-question answers (keyed by question
     id, as published in start_qa_job's `issues`) and the trailing free-text
-    box's content forwarded as context."""
+    box's content forwarded as context.
+
+    This is the QA round being answered -- delete its `.claude/rhubarb_qa.md`
+    (PRD #123) if one is still there, now that it's served its purpose."""
+    delete_question_file(cwd, _QA_QUESTION_FILE)
+
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
     model = row["model"]
