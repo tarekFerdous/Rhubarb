@@ -86,9 +86,7 @@
     </div>
     </div>
     <div class="card middle">
-      <p class="console-title">Output</p>
-      <div class="scroll-wrap"><div id="console-output" class="console"></div></div>
-      <p class="console-title terminal-title">Live Terminal</p>
+      <p class="console-title">Live Terminal</p>
       <div id="terminal-view" class="terminal-view"></div>
     </div>
     <div class="card right">
@@ -303,7 +301,6 @@
     const effortChangeModalCloseBtn = document.getElementById("effort-change-modal-close-btn");
     const brandHeadingEl = document.getElementById("brand-heading");
     const sessionQueueEl = document.getElementById("session-queue");
-    const consoleOutputEl = document.getElementById("console-output");
     const sessionCountEl = document.getElementById("session-count");
     const ptyTabCountEl = document.getElementById("pty-tab-count");
     const usageIndicatorEl = document.getElementById("usage-indicator");
@@ -471,6 +468,11 @@
 
     function showOnly(el) {
       [emptyStateEl, projectPickerEl, mainFlowEl, sessionStatusEl].forEach((e) => (e.hidden = e !== el));
+      // Every state transition calls showOnly() -- disabling terminal reply
+      // input here by default means only renderInterview/renderBlockedSession
+      // (and the "keep discussing" manual-reply fallback), which each
+      // re-enable it at their own end, ever leave it on.
+      disableTerminalReplyInput();
     }
 
     function hueForCard(cardId) {
@@ -1086,8 +1088,9 @@
 
     // Embedded live terminal view (issue #88): one xterm.js instance,
     // reused across sessions -- reset (not recreated) whenever the focused
-    // card changes, same lifecycle as consoleOutputEl's plain-text log.
-    // Visible by default (no `hidden` toggling anywhere on it).
+    // card changes. Visible by default (no `hidden` toggling anywhere on
+    // it) -- it's the middle card's only content now that the separate
+    // plain-text Output panel has been removed (issue #131 QA follow-up).
     // cols/rows must match pty_engine.py's _PTY_COLUMNS/_PTY_ROWS exactly --
     // the raw PTY stream this renders carries absolute cursor-positioning
     // escape codes computed against THAT width. A narrower xterm.js buffer
@@ -1097,8 +1100,116 @@
     const term = new Terminal({ convertEol: true, disableStdin: true, fontSize: 13, cols: 200, rows: 50 });
     term.open(document.getElementById("terminal-view"));
 
+    // Responsive resize without touching the real terminal's size (issue
+    // #131): `cols`/`rows` above stay fixed at 200x50, matching the backend
+    // PTY exactly (see the comment above) -- no resize signal is ever sent
+    // to it. Instead, xterm's own `fontSize` option is shrunk so the fixed
+    // 200-column buffer still fits within `.terminal-view`'s current width,
+    // never clipping and never needing a horizontal scrollbar.
+    //
+    // A CSS `transform: scale()` on the rendered element was tried first and
+    // reverted (QA on #131): `scrollWidth` -- what that approach measured to
+    // compute its scale factor -- reflects whatever content currently
+    // happens to be rendered (it shrinks for short lines), not the
+    // terminal's true fixed 200-column width, so the computed scale was
+    // wrong (over-shrinking, and leaving `.xterm-viewport`'s native
+    // scrollbar stranded well short of the panel's actual right edge --
+    // "the scrollbar is in the middle of the terminal"). Adjusting the real
+    // `fontSize` instead sidesteps that entirely: xterm recomputes its own
+    // cell/viewport/scrollbar geometry from the new size, and native font
+    // rendering at a smaller size is measurably crisper than the same
+    // visual size produced by scaling an already-rasterized 13px render.
+    const TERMINAL_BASE_FONT_SIZE = 13;
+    let terminalBaseCellWidthPx = null;
+
+    function rescaleTerminalToFit() {
+      const panel = document.getElementById("terminal-view");
+
+      if (terminalBaseCellWidthPx === null) {
+        // `.xterm-char-measure-element` is xterm's own hidden element for
+        // measuring current font-metrics -- its width divided by its
+        // (fixed) character count gives the true per-column pixel width at
+        // the current font size, independent of whatever text has actually
+        // been written to the buffer. Measured once, while still at
+        // TERMINAL_BASE_FONT_SIZE (this function never runs before that,
+        // and only ever changes fontSize itself, so the first measurement
+        // is always at the base size); everything after this is pure
+        // proportional math, no remeasuring needed.
+        const measurer = document.querySelector("#terminal-view .xterm-char-measure-element");
+        if (!measurer || !measurer.textContent.length) return;
+        const cellWidthPx = measurer.getBoundingClientRect().width / measurer.textContent.length;
+        if (!cellWidthPx) return;
+        terminalBaseCellWidthPx = cellWidthPx;
+      }
+
+      const naturalWidth = terminalBaseCellWidthPx * 200; // cols
+      const paddingPx = 16; // .terminal-view's own 8px padding, both sides
+      const availableWidth = panel.clientWidth - paddingPx;
+      const scale = Math.min(1, availableWidth / naturalWidth);
+      term.options.fontSize = Math.max(4, TERMINAL_BASE_FONT_SIZE * scale);
+    }
+
+    new ResizeObserver(rescaleTerminalToFit).observe(document.getElementById("terminal-view"));
+
+    // Terminal-as-alternate-reply-input (issue #130): a local line editor
+    // layered on top of the read-only terminal, NOT a raw PTY passthrough --
+    // typed text is only ever submitted through the exact same reply
+    // functions the structured answer box already calls (sendReply /
+    // sendImplementReply). Enabled only while the focused left card is in
+    // one of those two single-flat-text-reply states (see
+    // enableTerminalReplyInput's callers); disabled at every other time via
+    // showOnly(), which every other state transition already calls -- so a
+    // turn actively streaming, QA grilling's structured per-question
+    // answers, or any other state never has stdin enabled here, keeping
+    // this from ever colliding with an in-flight turn's captured PTY output.
+    let terminalReplySendFn = null;
+    let terminalReplyBuffer = "";
+
+    function enableTerminalReplyInput(sendFn) {
+      terminalReplySendFn = sendFn;
+      terminalReplyBuffer = "";
+      term.options.disableStdin = false;
+      term.write("\r\n> ");
+    }
+
+    function disableTerminalReplyInput() {
+      if (!terminalReplySendFn) return;
+      terminalReplySendFn = null;
+      terminalReplyBuffer = "";
+      term.options.disableStdin = true;
+    }
+
+    term.onData((data) => {
+      if (!terminalReplySendFn) return;
+
+      if (data === "\r" || data === "\n") {
+        const text = terminalReplyBuffer;
+        const sendFn = terminalReplySendFn;
+        term.write("\r\n");
+        disableTerminalReplyInput();
+        if (text.trim()) sendFn(text, { disabled: false });
+        return;
+      }
+
+      if (data === "\x7f" || data === "\b") {
+        // Backspace/delete -- basic terminal actions only, no arrow-key or
+        // cursor-movement editing.
+        if (terminalReplyBuffer.length > 0) {
+          terminalReplyBuffer = terminalReplyBuffer.slice(0, -1);
+          term.write("\b \b");
+        }
+        return;
+      }
+
+      // Ignore other control characters and escape sequences (arrow keys,
+      // Ctrl+C, etc.) -- only printable characters are accepted.
+      if (data.length === 0 || data.charCodeAt(0) < 0x20 || data.startsWith("\x1b")) return;
+
+      terminalReplyBuffer += data;
+      term.write(data);
+    });
+
     let eventSource = null;
-    let currentTextEl = null;
     const cardSnapshots = new Map(); // card_id -> latest {phase, interview, details, error, needs_github_login}
     // The `turn` SSE event carries no session_type (it's static session
     // metadata, not turn-specific) -- track it here so a card's type survives
@@ -1237,19 +1348,8 @@
       renderQueue();
     }
 
-    function appendConsoleLine(text, className) {
-      const p = document.createElement("p");
-      if (className) p.className = className;
-      p.textContent = text;
-      consoleOutputEl.appendChild(p);
-      consoleOutputEl.scrollTop = consoleOutputEl.scrollHeight;
-      return p;
-    }
-
     function connectStream(cardId) {
       if (eventSource) eventSource.close();
-      consoleOutputEl.innerHTML = "";
-      currentTextEl = null;
       term.reset();
       const es = new EventSource(`/api/sessions/${cardId}/stream`);
       eventSource = es;
@@ -1320,28 +1420,17 @@
       }
 
       if (event.type === "phase") {
-        currentTextEl = null;
-        appendConsoleLine(headingForPhase(event.phase), "console-phase");
         setHeading(headingForPhase(event.phase));
         return;
       }
 
-      if (event.type === "text") {
-        if (!currentTextEl) currentTextEl = appendConsoleLine("", "console-text");
-        currentTextEl.textContent += event.text;
-        consoleOutputEl.scrollTop = consoleOutputEl.scrollHeight;
-        return;
-      }
-
-      if (event.type === "action") {
-        currentTextEl = null;
-        appendConsoleLine(event.summary, "console-action");
-      }
+      // "text"/"action" events used to feed the removed plain-text Output
+      // panel -- the Live Terminal (raw PTY stream) already shows the same
+      // content, so these are pure no-ops now.
     }
 
     function applyTurn(cardId, event) {
       cardsWithTurn.add(cardId);
-      if (cardId === leftCardId) currentTextEl = null;
       const snapshot = {
         card_id: cardId,
         session_type: cardSessionTypes.get(cardId) || "do",
@@ -1613,6 +1702,7 @@
       }
 
       interviewEl.appendChild(renderManualReply(sendImplementReply));
+      enableTerminalReplyInput(sendImplementReply);
     }
 
     async function sendImplementReply(replyText, triggerBtn) {
@@ -1680,6 +1770,7 @@
       noBtn.addEventListener("click", () => {
         actions.remove();
         interviewEl.appendChild(renderManualReply(sendReply));
+        enableTerminalReplyInput(sendReply);
       });
       actions.appendChild(noBtn);
 
@@ -1829,6 +1920,8 @@
         sendBtn.addEventListener("click", () => sendReply(trailingBox.value, sendBtn));
         interviewEl.appendChild(sendBtn);
       }
+
+      enableTerminalReplyInput(sendReply);
     }
 
     function renderDetailsList(details) {
