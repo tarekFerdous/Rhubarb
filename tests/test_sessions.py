@@ -1071,7 +1071,9 @@ def test_confirm_advance_runs_publishing_phase_with_no_extra_cli_calls(client, t
     assert chain_phases == ["creating_prd", "creating_issues", "publishing", "implementing"]
     assert events[-1] == {"type": "done"}
     assert any(e.get("type") == "turn" and e.get("phase") == "details" for e in events)
-    assert {"type": "minimize"} in events
+    # Issue #146: the do-to-implement handoff no longer auto-minimizes the
+    # left card -- the frontend shows a "Proceed" banner instead.
+    assert not any(e.get("type") == "minimize" for e in events)
 
 
 def test_publish_draft_failure_stops_chain_with_error_turn(client, tmp_path, monkeypatch):
@@ -3000,10 +3002,14 @@ def test_maybe_clear_for_next_phase_clears_when_over_cutoff(client, tmp_path, mo
     assert session_runner._pty_engines[row_id] is fake_class.instances[0]
 
 
-def test_finish_chain_publishes_minimize_before_the_implementing_phase(client, tmp_path, monkeypatch):
-    """The frontend frees the left card for a new /do on `minimize` -- it
-    must arrive before the session starts looking like an implement session
-    (phase:implementing), not after."""
+def test_finish_chain_does_not_publish_minimize_and_still_starts_implementing(client, tmp_path, monkeypatch):
+    """Issue #146: the do-to-implement handoff no longer auto-minimizes the
+    left card -- the frontend now shows a "Proceed" banner instead and only
+    minimizes on an explicit click. `/rhubarb:implement` must still start
+    immediately in the same tab/session regardless: the `implementing` phase
+    (and, since this mock engine completes synchronously, the resulting
+    `implement` session_type) must still show up, just with no `minimize`
+    event anywhere in the stream."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -3026,12 +3032,11 @@ def test_finish_chain_publishes_minimize_before_the_implementing_phase(client, t
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
     events = live_stream._buffers.get(row_id, [])
-    event_order = [
-        e["type"] if e.get("type") != "phase" else f"phase:{e['phase']}"
-        for e in events
-        if e.get("type") in ("minimize", "phase")
-    ]
-    assert event_order.index("minimize") < event_order.index("phase:implementing")
+    event_types = [e["type"] for e in events]
+    assert "minimize" not in event_types
+
+    phases = [e["phase"] for e in events if e.get("type") == "phase"]
+    assert "implementing" in phases
 
     row = db.get_session(conn, row_id)
     assert row["session_type"] == "implement"

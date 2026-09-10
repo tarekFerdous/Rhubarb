@@ -71,6 +71,10 @@
       </div>
 
       <div id="session-status" hidden>
+        <div id="implementing-banner" class="implementing-banner" hidden>
+          <p id="implementing-banner-text" class="implementing-banner-text"></p>
+          <button id="implementing-banner-proceed-btn" class="glass-btn implementing-banner-btn" type="button">Proceed</button>
+        </div>
         <p id="phase-label" class="phase-label"></p>
         <div class="scroll-wrap"><div id="details-view" class="details-list"></div></div>
         <p id="session-error" class="session-error" hidden></p>
@@ -265,6 +269,9 @@
     const projectListEl = document.getElementById("project-list");
     const mainFlowEl = document.getElementById("main-flow");
     const sessionStatusEl = document.getElementById("session-status");
+    const implementingBannerEl = document.getElementById("implementing-banner");
+    const implementingBannerTextEl = document.getElementById("implementing-banner-text");
+    const implementingBannerProceedBtn = document.getElementById("implementing-banner-proceed-btn");
     const activeProjectLineEl = document.getElementById("active-project-line");
     const activeProjectNameEl = document.getElementById("active-project-name");
     const settingsModalEl = document.getElementById("settings-modal");
@@ -1452,6 +1459,21 @@
 
       if (event.type === "phase") {
         setHeading(headingForPhase(event.phase));
+        // The do-to-implement handoff's own transition into "implementing"
+        // (session_runner.start_implement_job) arrives as this raw `phase`
+        // event, not a `turn` event carrying `details` -- so it never
+        // reaches applyTurn/renderSessionStatus on its own. Patch the
+        // already-known PRD details (from the earlier `details` turn
+        // snapshot) onto the phase so the banner can key off it (issue #146).
+        if (event.phase === "implementing") {
+          const snap = cardSnapshots.get(cardId);
+          if (snap) {
+            const updated = { ...snap, phase: "implementing" };
+            cardSnapshots.set(cardId, updated);
+            currentLeftSession = updated;
+            updateImplementingBanner(updated);
+          }
+        }
         return;
       }
 
@@ -1575,17 +1597,19 @@
     }
 
     function minimizeLeftCardToBackground(cardId, es) {
-      // A `/do` session that just reached `details` and is auto-continuing
-      // into /implement (see session_runner._auto_continue_implement_and_qa)
-      // -- move it to the right-side queue and free the left card for a new
-      // /do immediately, same shape as the QA-takes-over-left-card move in
-      // applyTurn, but without another session displacing it: nothing new
-      // occupies the left card here, it just goes back to the empty "What
-      // are we doing?" state, ready for the next /do.
+      // A `/do` session that auto-continued into /implement (see
+      // session_runner._auto_continue_implement_and_qa) and is now showing
+      // the "Proceed" banner (issue #146) -- move it to the right-side queue
+      // and free the left card for a new /do, same shape as the
+      // QA-takes-over-left-card move in applyTurn, but without another
+      // session displacing it: nothing new occupies the left card here, it
+      // just goes back to the empty "What are we doing?" state, ready for
+      // the next /do. Called from the banner's Proceed button click.
       if (leftCardId !== cardId) return;
 
       const snapshot = cardSnapshots.get(cardId);
       if (snapshot) rightCards.set(cardId, snapshot);
+      implementingBannerEl.hidden = true;
 
       if (eventSource === es) {
         backgroundSources.set(cardId, es);
@@ -1999,7 +2023,28 @@
       return wrap;
     }
 
+    // Issue #146: the do-to-implement handoff no longer auto-minimizes the
+    // left card the instant a PRD is found (see
+    // session_runner._auto_continue_implement_and_qa) -- instead the left
+    // card stays focused and shows this banner once its session's phase
+    // reaches "implementing" with a known PRD, letting the user watch it
+    // start before choosing to free the left card for a new /do. Purely
+    // derived from `session.phase`/`session.details.prd` -- no separate
+    // flag, so it naturally re-appears on reload/reconnect too.
+    function updateImplementingBanner(session) {
+      const prd = session && !session.error && session.phase === "implementing" ? session.details?.prd : null;
+      if (!prd) {
+        implementingBannerEl.hidden = true;
+        return;
+      }
+      implementingBannerTextEl.textContent =
+        `PRD #${prd.number}: ${prd.title} is currently being implemented. This session will keep ` +
+        `implementing in the background — click Proceed to start a new session now.`;
+      implementingBannerEl.hidden = false;
+    }
+
     function renderSessionStatus(session) {
+      updateImplementingBanner(session);
       detailsViewEl.innerHTML = "";
       sessionErrorEl.hidden = true;
       sessionErrorActionsEl.hidden = true;
@@ -2189,6 +2234,15 @@
     retryBtn.addEventListener("click", () => {
       if (leftCardId === null) return;
       retryCard(leftCardId);
+    });
+
+    implementingBannerProceedBtn.addEventListener("click", () => {
+      // Reuses the exact same minimize path an automatic `minimize` SSE
+      // event used to invoke -- just triggered by this click instead
+      // (issue #146). `leftCardId`/`eventSource` are the same module-level
+      // state handleStreamEvent/applyTurn already use for this card.
+      if (leftCardId === null) return;
+      minimizeLeftCardToBackground(leftCardId, eventSource);
     });
 
     githubLoginBtn.addEventListener("click", async () => {

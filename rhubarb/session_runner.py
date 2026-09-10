@@ -738,11 +738,12 @@ async def _auto_continue_implement_and_qa(card_id: int, conn, cwd: str | None) -
     unchanged here) instead of pooling the session for a later manual PRD
     click.
 
-    Publishes `minimize` before doing anything else so the frontend frees
-    the left card for a new `/do` immediately -- this session's `phase`/
-    `turn`/`done` events keep flowing exactly as they do for a manually
-    started `/implement`, so the existing right-side panel plumbing renders
-    it with no special case beyond handling `minimize` itself.
+    Does *not* publish `minimize` -- the left card stays focused on this
+    session as it transitions into `implementing`. The frontend shows a
+    "Proceed" banner once it sees the `implementing` phase with a PRD, and
+    only calls `minimizeLeftCardToBackground` when the user clicks it
+    (issue #146). This session's `phase`/`turn`/`done` events otherwise keep
+    flowing exactly as they do for a manually started `/implement`.
 
     Unlike the old subprocess-per-turn model, this card's resident tab (see
     `_pty_engines`) is left running across this transition when a PRD was
@@ -771,8 +772,6 @@ async def _auto_continue_implement_and_qa(card_id: int, conn, cwd: str | None) -
         db.mark_session_available(conn, card_id, new_session_id)
         publish(card_id, {"type": "done"})
         return
-
-    publish(card_id, {"type": "minimize"})
 
     session_id = await _maybe_clear_for_next_phase(
         card_id, conn, row, cwd=cwd, cutoff=_DO_TO_IMPLEMENT_CONTEXT_CUTOFF
