@@ -90,14 +90,24 @@ def test_stream_session_carries_terminal_output_events_verbatim(client):
 
 def test_pty_tab_count_endpoint_reflects_resident_engines(client, monkeypatch):
     """Backs the web UI's tab-count indicator (issue #88) -- the endpoint
-    just surfaces `session_runner.open_pty_tab_count()`."""
-    assert client.get("/api/pty-tabs/count").json() == {"count": 0}
+    just surfaces `session_runner.open_pty_tab_count()`, plus (issue #140)
+    the additive `"engines"` listing from `session_runner.list_live_engines`."""
 
-    monkeypatch.setitem(session_runner._pty_engines, 1, object())
-    assert client.get("/api/pty-tabs/count").json() == {"count": 1}
+    class _FakeEngine:
+        model = "claude-sonnet-5"
+        effort = "auto"
 
-    monkeypatch.setitem(session_runner._pty_engines, 2, object())
-    assert client.get("/api/pty-tabs/count").json() == {"count": 2}
+    assert client.get("/api/pty-tabs/count").json() == {"count": 0, "engines": []}
+
+    monkeypatch.setitem(session_runner._pty_engines, 1, _FakeEngine())
+    data = client.get("/api/pty-tabs/count").json()
+    assert data["count"] == 1
+    assert data["engines"] == [{"card_id": 1, "model": "claude-sonnet-5", "effort": "auto"}]
+
+    monkeypatch.setitem(session_runner._pty_engines, 2, _FakeEngine())
+    data = client.get("/api/pty-tabs/count").json()
+    assert data["count"] == 2
+    assert len(data["engines"]) == 2
 
 
 def test_usage_endpoint_returns_unknown_before_any_session_has_run(client):

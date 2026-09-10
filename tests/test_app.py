@@ -157,6 +157,76 @@ def test_set_effort_persists_and_reflects_in_app_state(client):
     assert state["effort"] == "high"
 
 
+# ---------------------------------------------------------------------------
+# Model/Effort card ground truth for the open Live Terminal (issue #139)
+# ---------------------------------------------------------------------------
+
+
+def test_app_state_returns_engine_ground_truth_for_a_card_with_a_live_engine(client, tmp_path):
+    client.post("/api/settings/model", json={"model": "claude-opus-4-8"})
+    client.post("/api/settings/effort", json={"effort": "high"})
+
+    project_id = _open_project(client, tmp_path, "proj")
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id, model="claude-opus-4-8", effort="high")
+
+    class _FakeEngine:
+        model = "claude-sonnet-5"
+        effort = "low"
+
+    session_runner._pty_engines[card_id] = _FakeEngine()
+    try:
+        state = client.get(f"/api/app-state?card_id={card_id}").json()
+        assert state["model"] == "claude-sonnet-5"
+        assert state["effort"] == "low"
+        assert state["session_model_effort_live"] is True
+    finally:
+        session_runner._pty_engines.pop(card_id, None)
+
+
+def test_app_state_falls_back_to_global_settings_when_card_has_no_live_engine(client, tmp_path):
+    client.post("/api/settings/model", json={"model": "claude-sonnet-4-6"})
+    client.post("/api/settings/effort", json={"effort": "auto"})
+
+    project_id = _open_project(client, tmp_path, "proj")
+    conn = db.get_connection()
+    # A pooled/finished session row with its own (different) recorded
+    # model/effort -- still must fall back to the *global* setting, not this
+    # row's own field, since there's no live engine to be ground truth for.
+    card_id = db.create_session(conn, project_id, model="claude-opus-4-8", effort="high")
+
+    assert card_id not in session_runner._pty_engines
+    state = client.get(f"/api/app-state?card_id={card_id}").json()
+    assert state["model"] == "claude-sonnet-4-6"
+    assert state["effort"] == "auto"
+    assert state["session_model_effort_live"] is False
+
+
+def test_app_state_without_card_id_is_unaffected_by_a_live_engine_elsewhere(client, tmp_path):
+    """No `card_id` passed (today's exact call shape) must behave exactly as
+    before this issue -- global settings only, `session_model_effort_live`
+    False -- even while some other card has a live resident engine."""
+    client.post("/api/settings/model", json={"model": "claude-sonnet-4-6"})
+    client.post("/api/settings/effort", json={"effort": "auto"})
+
+    project_id = _open_project(client, tmp_path, "proj")
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id)
+
+    class _FakeEngine:
+        model = "claude-sonnet-5"
+        effort = "low"
+
+    session_runner._pty_engines[card_id] = _FakeEngine()
+    try:
+        state = client.get("/api/app-state").json()
+        assert state["model"] == "claude-sonnet-4-6"
+        assert state["effort"] == "auto"
+        assert state["session_model_effort_live"] is False
+    finally:
+        session_runner._pty_engines.pop(card_id, None)
+
+
 def _open_project(client, tmp_path, name):
     root = tmp_path / name
     root.mkdir()
@@ -165,6 +235,76 @@ def _open_project(client, tmp_path, name):
     project_id = client.get("/api/app-state").json()["projects"][0]["id"]
     client.post(f"/api/projects/{project_id}/open")
     return project_id
+
+
+# ---------------------------------------------------------------------------
+# Background/other-tab model+effort visibility for resident and standby
+# engines (issue #140)
+# ---------------------------------------------------------------------------
+
+
+def test_pty_tab_count_lists_resident_and_standby_engines_with_model_effort(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id, model="claude-opus-4-8", effort="high")
+
+    class _FakeEngine:
+        model = "claude-sonnet-5"
+        effort = "low"
+
+    class _FakeStandbyEngine:
+        model = "claude-sonnet-4-6"
+        effort = "auto"
+
+    session_runner._pty_engines[card_id] = _FakeEngine()
+    session_runner._standby_engines[project_id] = (_FakeStandbyEngine(), "claude-sonnet-4-6", "auto")
+
+    data = client.get("/api/pty-tabs/count").json()
+
+    assert data["count"] == 2
+    engines = data["engines"]
+    assert len(engines) == 2
+    assert {"card_id": card_id, "model": "claude-sonnet-5", "effort": "low"} in engines
+    assert {"card_id": "standby", "model": "claude-sonnet-4-6", "effort": "auto"} in engines
+
+
+def test_pty_tab_count_contract_is_unaffected_when_no_engines_are_live(client, tmp_path):
+    """The pre-#140 `{"count": N}` shape must remain valid/unaffected: with
+    no live engines, `"count"` is 0 and the new `"engines"` field is an empty
+    list rather than missing or breaking anything an existing consumer that
+    only reads `"count"` relies on."""
+    _open_project(client, tmp_path, "proj")
+
+    data = client.get("/api/pty-tabs/count").json()
+
+    assert data["count"] == 0
+    assert data["engines"] == []
+
+
+def test_list_live_engines_combines_resident_and_standby_across_projects(client, tmp_path):
+    """Exercise `session_runner.list_live_engines` directly (not just through
+    the endpoint) with more than one resident engine plus a standby, to
+    confirm every live entry across both registries is represented."""
+    project_id = _open_project(client, tmp_path, "proj")
+    conn = db.get_connection()
+    card_a = db.create_session(conn, project_id, model="claude-opus-4-8", effort="high")
+    card_b = db.create_session(conn, project_id, model="claude-sonnet-5", effort="auto")
+
+    class _FakeEngine:
+        def __init__(self, model, effort):
+            self.model = model
+            self.effort = effort
+
+    session_runner._pty_engines[card_a] = _FakeEngine("claude-opus-4-8", "high")
+    session_runner._pty_engines[card_b] = _FakeEngine("claude-sonnet-5", "auto")
+    session_runner._standby_engines[project_id] = (_FakeEngine("claude-sonnet-4-6", "low"), "claude-sonnet-4-6", "low")
+
+    engines = session_runner.list_live_engines()
+
+    assert len(engines) == 3
+    assert {"card_id": card_a, "model": "claude-opus-4-8", "effort": "high"} in engines
+    assert {"card_id": card_b, "model": "claude-sonnet-5", "effort": "auto"} in engines
+    assert {"card_id": "standby", "model": "claude-sonnet-4-6", "effort": "low"} in engines
 
 
 def test_session_start_accepts_effort_and_seeds_the_session_row(client, tmp_path, monkeypatch):

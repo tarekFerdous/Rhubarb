@@ -5,10 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from rhubarb import db, live_stream, session_runner
+from rhubarb import db, live_stream, pty_engine, session_runner
 from rhubarb.cli_client import ClaudeCLIError
 from rhubarb.github_publisher import GithubPublishError
 from rhubarb.pty_engine import PtyEngineUnrecoverableError
+from rhubarb.web import app as app_module
 
 
 def _init_repo(path, remote_url):
@@ -924,43 +925,136 @@ def test_chain_steps_use_the_model_the_session_was_created_with(client, tmp_path
     ]
 
 
-def test_in_flight_session_keeps_its_original_model_after_setting_changes_mid_session(client, tmp_path, monkeypatch):
-    """A session already grilling must keep using the model it started with,
-    even if `settings.model` is changed before its later turns run."""
+def test_model_selector_change_respawns_only_the_open_cards_engine(client, tmp_path, monkeypatch):
+    """Issue #141: changing the model selector for the currently-open card
+    must tear down that card's live resident engine and replace it with a
+    fresh, unresumed one under the new model -- a different card's engine,
+    and the project's pre-warmed standby engine, must be completely
+    untouched by that same change. (Before #141, an in-flight session simply
+    kept its original model forever -- that behavior is superseded by this
+    respawn; see git history for the old assertion.)"""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     conn = db.get_connection()
     db.set_model(conn, "claude-opus-4-8")
 
-    seen_models = []
-
     def handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
-        if prompt == "/rhubarb:do a feature":
-            return iter([_result_event("- First question?")])
-        seen_models.append(model)
-        return iter([_result_event("Thanks, that's everything I need.")])
+        return iter([_result_event("- First question?")])
 
     _mock_engine(monkeypatch, handler)
+
+    # The card under test -- already has a live resident engine (its first
+    # turn already ran).
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+    original_engine = session_runner._pty_engines[row_id]
+    assert original_engine.model == "claude-opus-4-8"
+    assert original_engine.effort == "auto"
 
-    # Setting changes mid-session -- this row must not pick it up.
-    db.set_model(conn, "claude-sonnet-4-6")
+    # A different card, also with a live resident engine -- must be left
+    # completely untouched below.
+    other_row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(other_row_id, "another feature", cwd=cwd))
+    other_engine = session_runner._pty_engines[other_row_id]
 
-    asyncio.run(session_runner.continue_session_job(row_id, "a reply", cwd=cwd))
-
-    assert all(m == "claude-opus-4-8" for m in seen_models)
-
-    # A brand-new session started after the change picks up the new setting.
-    new_row_id = db.create_session(conn, project_id)
-    seen_models.clear()
-    _mock_engine(
-        monkeypatch,
-        lambda prompt, **kw: (seen_models.append(kw.get("model")), iter([_result_event("- Q?")]))[1],
+    # The project's pre-warmed standby engine -- also must be left
+    # completely untouched below.
+    asyncio.run(
+        session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-opus-4-8", effort=db.DEFAULT_EFFORT)
     )
-    asyncio.run(session_runner.start_session_job(new_row_id, "another feature", cwd=cwd))
-    assert seen_models == ["claude-sonnet-4-6"]
+    standby_engine, _, _ = session_runner._standby_engines[project_id]
+
+    resp = client.post("/api/settings/model", json={"model": "claude-sonnet-4-6", "card_id": row_id})
+    assert resp.json() == {"model": "claude-sonnet-4-6", "respawned": True}
+
+    # (a) The open card's engine was torn down and replaced with a fresh,
+    # unresumed one under the new model (effort carried over unchanged).
+    assert original_engine.closed is True
+    new_engine = session_runner._pty_engines[row_id]
+    assert new_engine is not original_engine
+    assert new_engine.model == "claude-sonnet-4-6"
+    assert new_engine.effort == "auto"
+    assert new_engine.resume_session_id is None
+
+    row = db.get_session(conn, row_id)
+    assert row["model"] == "claude-sonnet-4-6"
+    assert row["claude_session_id"] == new_engine.claude_session_id
+
+    # The ground-truth indicator from #139 confirms the Live Terminal now
+    # reflects the respawned engine's fresh conversation.
+    state = client.get(f"/api/app-state?card_id={row_id}").json()
+    assert state["model"] == "claude-sonnet-4-6"
+    assert state["effort"] == "auto"
+    assert state["session_model_effort_live"] is True
+
+    # (b) A different card's engine, and the project's standby engine, are
+    # provably untouched.
+    assert session_runner._pty_engines[other_row_id] is other_engine
+    assert other_engine.closed is False
+    assert other_engine.model == "claude-opus-4-8"
+
+    assert session_runner._standby_engines[project_id][0] is standby_engine
+    assert standby_engine.closed is False
+    assert standby_engine.model == "claude-opus-4-8"
+
+
+def test_effort_selector_change_respawns_only_the_open_cards_engine(client, tmp_path, monkeypatch):
+    """Symmetric to `test_model_selector_change_respawns_only_the_open_cards_engine`
+    above, for the effort equivalent (`POST /api/settings/effort`) -- both
+    endpoints are independently capable of triggering a respawn."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_model(conn, "claude-opus-4-8")
+
+    def handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
+        return iter([_result_event("- First question?")])
+
+    _mock_engine(monkeypatch, handler)
+
+    row_id = db.create_session(conn, project_id, effort="low")
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+    original_engine = session_runner._pty_engines[row_id]
+    assert original_engine.effort == "low"
+
+    other_row_id = db.create_session(conn, project_id, effort="low")
+    asyncio.run(session_runner.start_session_job(other_row_id, "another feature", cwd=cwd))
+    other_engine = session_runner._pty_engines[other_row_id]
+
+    resp = client.post("/api/settings/effort", json={"effort": "high", "card_id": row_id})
+    assert resp.json() == {"effort": "high", "respawned": True}
+
+    new_engine = session_runner._pty_engines[row_id]
+    assert new_engine is not original_engine
+    assert original_engine.closed is True
+    assert new_engine.model == "claude-opus-4-8"
+    assert new_engine.effort == "high"
+    assert new_engine.resume_session_id is None
+
+    assert session_runner._pty_engines[other_row_id] is other_engine
+    assert other_engine.closed is False
+    assert other_engine.effort == "low"
+
+
+def test_settings_change_with_no_live_engine_for_the_card_only_updates_the_global_setting(
+    client, tmp_path, monkeypatch
+):
+    """A `card_id` naming a card with no live resident engine (never
+    started, already finished/pooled) must behave exactly like passing no
+    `card_id` at all -- global setting update only, no engine spawned."""
+    project_id = _open_project(client, tmp_path, "proj")
+    conn = db.get_connection()
+
+    # A row that exists but was never given a live engine.
+    row_id = db.create_session(conn, project_id)
+    assert row_id not in session_runner._pty_engines
+
+    resp = client.post("/api/settings/model", json={"model": "claude-opus-4-8", "card_id": row_id})
+    assert resp.json() == {"model": "claude-opus-4-8", "respawned": False}
+    assert row_id not in session_runner._pty_engines
+    assert db.get_model(conn) == "claude-opus-4-8"
 
 
 def test_continue_session_job_advances_through_prd_and_issues_to_details(client, tmp_path, monkeypatch):
@@ -2717,6 +2811,205 @@ def test_register_engine_makes_get_or_create_engine_reuse_it_without_spawning(cl
 
     assert engine is claimed
     assert len(fake_class.instances) == 1  # no second spawn triggered by _get_or_create_engine
+
+
+# ---------------------------------------------------------------------------
+# Argv-level end-to-end coverage (issue #138): every test above (and every
+# other test in this file) mocks `session_runner.PtyEngine` wholesale with a
+# fake that never runs `_build_args()` at all -- it only ever proves the
+# right Python kwarg (`model=`/`effort=`) reached the constructor. These
+# tests instead leave the REAL `PtyEngine` class in place and fake out only
+# the OS-level pty spawn (`pty_engine._default_pty_factory`, the same
+# injection seam `tests/test_pty_engine.py` uses directly), so the actual
+# argv handed to "the subprocess" is captured and can be asserted on -- all
+# the way through `/api/session/start`'s real endpoint logic (app.py) and
+# `start_session_job` (session_runner.py). This is what catches a
+# discrepancy the Python-kwarg-level mock structurally cannot.
+# ---------------------------------------------------------------------------
+
+
+class _ArgvCapturingBackend:
+    """Minimal real-shaped `PtyBackend`: `read()` hands back a canned
+    turn-complete response on its first call (ending `stream_turn` in one
+    round trip) and never needs to be read again."""
+
+    def __init__(self, result_text="- Only question?"):
+        from rhubarb.pty_engine import TURN_COMPLETE_MARKER
+
+        self._text = f"{result_text}\n{TURN_COMPLETE_MARKER}\n"
+        self._served = False
+
+    def write(self, data):
+        return len(data)
+
+    def read(self, size=4096):
+        if not self._served:
+            self._served = True
+            return self._text
+        raise EOFError
+
+    def isalive(self):
+        return not self._served
+
+    def terminate(self, force=False):
+        pass
+
+
+def _capture_real_pty_spawns(monkeypatch):
+    """Replace `pty_engine._default_pty_factory` (the seam every real,
+    non-test `PtyEngine()` construction resolves its `pty_factory` through)
+    with one that records every spawn's argv and hands back a
+    `_ArgvCapturingBackend` instead of a real OS process. Returns the list of
+    captured argvs, appended to in spawn order."""
+    spawns = []
+
+    def fake_factory(argv, *, cwd, env):
+        spawns.append(argv)
+        return _ArgvCapturingBackend()
+
+    monkeypatch.setattr(pty_engine, "_default_pty_factory", lambda: fake_factory)
+    return spawns
+
+
+def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_standby_claim(
+    client, tmp_path, monkeypatch
+):
+    """Issue #138's reported repro: pick a model in the UI, then start what
+    looks like a brand-new session -- the Live Terminal must actually spawn
+    `claude` with THAT model, not a stale one left over from a pre-warmed
+    standby engine warmed under the model that was configured before the
+    switch. Goes through the real `/api/session/start` endpoint logic
+    (`app_module.start_session`) and `start_session_job`, with only the
+    OS-level pty spawn faked -- so this exercises the real
+    `claim_standby_engine`/`register_engine` reuse path and the real
+    `PtyEngine._build_args()`, not a Python-kwarg-level mock."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    conn = db.get_connection()
+    spawns = _capture_real_pty_spawns(monkeypatch)
+
+    # A standby was pre-warmed (e.g. by `open_project`) under the model that
+    # was configured at the time.
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-4-6", effort="auto"))
+    assert len(spawns) == 1
+    idx = spawns[0].index("--model")
+    assert spawns[0][idx + 1] == "claude-sonnet-4-6"
+
+    # The user now picks a different model in the UI.
+    client.post("/api/settings/model", json={"model": "claude-opus-4-8"})
+
+    # A brand-new session, started right after.
+    result = asyncio.run(
+        _run_and_drain(app_module.start_session({"prompt": "a feature", "effort": "auto"}))
+    )
+    card_id = result["card_id"]
+
+    # The stale standby must be discarded (model mismatch), not adopted --
+    # a genuinely fresh engine is spawned for this card instead.
+    assert len(spawns) == 2
+    new_argv = spawns[-1]
+    assert "--model" in new_argv
+    idx = new_argv.index("--model")
+    assert new_argv[idx + 1] == "claude-opus-4-8"
+    assert session_runner._pty_engines[card_id].model == "claude-opus-4-8"
+
+
+def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_standby_match(
+    client, tmp_path, monkeypatch
+):
+    """The mirror-image case: the standby's model still matches what's
+    currently configured (no change happened, or the user picked the SAME
+    model again) -- it must be adopted (`register_engine`) rather than
+    discarded, and the argv it was ALREADY spawned with (captured back when
+    the standby was warmed) must carry that same model. Confirms
+    `claim_standby_engine`'s reuse path itself is argv-correct, not just its
+    discard path."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    spawns = _capture_real_pty_spawns(monkeypatch)
+
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-opus-4-8", effort="auto"))
+    assert len(spawns) == 1
+    standby_argv = spawns[0]
+    idx = standby_argv.index("--model")
+    assert standby_argv[idx + 1] == "claude-opus-4-8"
+
+    client.post("/api/settings/model", json={"model": "claude-opus-4-8"})  # same model, re-selected
+
+    result = asyncio.run(
+        _run_and_drain(app_module.start_session({"prompt": "a feature", "effort": "auto"}))
+    )
+    card_id = result["card_id"]
+
+    # No second real spawn -- the standby (already carrying the right
+    # --model) was adopted directly.
+    assert len(spawns) == 1
+    assert session_runner._pty_engines[card_id].model == "claude-opus-4-8"
+
+
+def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_pooled_resume(
+    client, tmp_path, monkeypatch
+):
+    """No standby is involved here at all -- a previously pooled session
+    (from an earlier project's finished do->implement->qa chain) is reused
+    via `db.claim_available_session`, carrying its own old
+    `claude_session_id` to `--resume`. The model actually spawned with must
+    still be the one just selected in the UI, fresh off `db.get_model`, not
+    whatever model that old pooled conversation last ran under."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    conn = db.get_connection()
+    spawns = _capture_real_pty_spawns(monkeypatch)
+
+    pooled_row_id = db.create_session(
+        conn, project_id, claude_session_id="pooled-conversation-1", model="claude-sonnet-4-6", effort="auto"
+    )
+    db.mark_session_available(conn, pooled_row_id, "pooled-conversation-1")
+
+    client.post("/api/settings/model", json={"model": "claude-opus-4-8"})
+
+    result = asyncio.run(
+        _run_and_drain(app_module.start_session({"prompt": "a feature", "effort": "auto"}))
+    )
+    card_id = result["card_id"]
+
+    assert len(spawns) == 1
+    new_argv = spawns[-1]
+    assert "--resume" in new_argv
+    idx = new_argv.index("--resume")
+    assert new_argv[idx + 1] == "pooled-conversation-1"
+    assert "--model" in new_argv
+    idx = new_argv.index("--model")
+    assert new_argv[idx + 1] == "claude-opus-4-8"
+    assert session_runner._pty_engines[card_id].model == "claude-opus-4-8"
+
+
+def test_standby_is_still_claimed_when_the_request_omits_effort_entirely(client, tmp_path, monkeypatch):
+    """Targeted check for a `effort=None` (omitted from the request body) vs.
+    `db.DEFAULT_EFFORT` ("auto", what every standby is always pre-warmed
+    with -- see `open_project`/`_clear_for_reuse`/`continue_qa_job`)
+    semantically-equal-but-not-identical mismatch: `/api/session/start`
+    resolves a missing `effort` via `effort or db.DEFAULT_EFFORT` before
+    comparing against the standby's stored effort, so `None` must still
+    match a standby stored as `"auto"` -- not be treated as a mismatch and
+    wastefully discard a perfectly matching standby (or, worse, the other
+    way around: adopt one it shouldn't)."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    spawns = _capture_real_pty_spawns(monkeypatch)
+
+    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-4-6", effort="auto"))
+    assert len(spawns) == 1
+
+    # Body omits "effort" entirely, exactly like a request built without the
+    # dropdown's value ever being set.
+    result = asyncio.run(_run_and_drain(app_module.start_session({"prompt": "a feature"})))
+    card_id = result["card_id"]
+
+    # The standby matched (no mismatch-triggered discard-and-respawn).
+    assert len(spawns) == 1
+    assert session_runner._pty_engines[card_id] is not None
+    assert session_runner._pty_engines[card_id].effort == "auto"
 
 
 # ---------------------------------------------------------------------------

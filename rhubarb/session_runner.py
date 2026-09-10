@@ -213,6 +213,83 @@ def close_session(conn, card_id: int) -> None:
     publish(card_id, {"type": "closed", "card_id": card_id})
 
 
+def get_engine_model_effort(card_id: int) -> tuple[str | None, str | None] | None:
+    """Return the `(model, effort)` this card's resident `PtyEngine` was
+    actually constructed with (issue #139) -- ground truth for the live
+    process's own argv (see `PtyEngine._build_args`), as opposed to
+    `db.get_model`/`db.get_effort`'s global "what the next new session will
+    use" setting. Returns `None` if there's no live resident engine for
+    `card_id` (mirrors `open_pty_tab_count`'s style of small accessor) --
+    callers fall back to the global settings in that case."""
+    engine = _pty_engines.get(card_id)
+    if engine is None:
+        return None
+    return engine.model, engine.effort
+
+
+def _maybe_respawn_for_settings_change(
+    conn, card_id: int, *, cwd: str | None, model: str | None, effort: str | None
+) -> bool:
+    """Shared tail for `respawn_engine_for_model_change`/
+    `respawn_engine_for_effort_change` below -- tear down `card_id`'s live
+    resident engine and replace it with a fresh, unresumed one (see
+    `_spawn_fresh_engine`) under `model`/`effort`, keeping the row in sync
+    (`claude_session_id`/`model`/`effort`/`context_pct`, mirroring
+    `_maybe_clear_for_next_phase`'s own respawn bookkeeping -- a fresh
+    conversation has a new session id and nothing yet measured for
+    `context_pct`). Only ever touches `_pty_engines[card_id]` -- no other
+    card's engine, and no project's standby engine, is read or written here.
+    Always returns True; callers only call this once they've already
+    confirmed (via `get_engine_model_effort`) that `card_id` has a live
+    engine to replace."""
+    _close_engine(card_id)
+    engine = _spawn_fresh_engine(cwd=cwd, model=model, effort=effort)
+    _pty_engines[card_id] = engine
+    db.update_session(
+        conn, card_id, claude_session_id=engine.claude_session_id, model=model, effort=effort, context_pct=None
+    )
+    return True
+
+
+def respawn_engine_for_model_change(conn, card_id: int | None, *, cwd: str | None, model: str | None) -> bool:
+    """Called from `POST /api/settings/model` (issue #141) with `card_id`
+    naming the currently-open/visible session card, if any -- the frontend's
+    `leftCardId` at the moment the model selector changed. When that card
+    has a live resident engine, tears it down and spawns a fresh, unresumed
+    one under the new `model`; `effort` is read straight off the live
+    engine's own ground truth (`get_engine_model_effort`) rather than the
+    global setting, so a model-only change never silently also changes
+    effort.
+
+    Returns False (a pure no-op -- touches no engine, no row) when `card_id`
+    is None or names a card with no live engine: the caller's global
+    `db.set_model` write already happened either way and is unaffected by
+    this function's return value. This is exactly today's behavior for
+    every existing caller that doesn't pass a `card_id`."""
+    if card_id is None:
+        return False
+    engine_model_effort = get_engine_model_effort(card_id)
+    if engine_model_effort is None:
+        return False
+    _, current_effort = engine_model_effort
+    return _maybe_respawn_for_settings_change(conn, card_id, cwd=cwd, model=model, effort=current_effort)
+
+
+def respawn_engine_for_effort_change(conn, card_id: int | None, *, cwd: str | None, effort: str | None) -> bool:
+    """Symmetric to `respawn_engine_for_model_change` above, for `POST
+    /api/settings/effort` -- `model` is read off the live engine's own
+    ground truth instead of the global setting, so an effort-only change
+    never silently also changes model. See that function's docstring for
+    the no-op/return-value contract, which is identical here."""
+    if card_id is None:
+        return False
+    engine_model_effort = get_engine_model_effort(card_id)
+    if engine_model_effort is None:
+        return False
+    current_model, _ = engine_model_effort
+    return _maybe_respawn_for_settings_change(conn, card_id, cwd=cwd, model=current_model, effort=effort)
+
+
 def open_pty_tab_count() -> int:
     """How many `PtyEngine` "tabs" are currently resident (issue #88) --
     one per `card_id` with a live entry in `_pty_engines`, across every
@@ -223,6 +300,32 @@ def open_pty_tab_count() -> int:
     pushed since it's a global count, not scoped to any one card's SSE
     stream."""
     return len(_pty_engines) + len(_standby_engines)
+
+
+def list_live_engines() -> list[dict]:
+    """One record per live `PtyEngine` "tab" across both `_pty_engines` and
+    `_standby_engines` (issue #140), each shaped
+    `{"card_id": int | "standby", "model": str | None, "effort": str | None}`
+    -- ground truth `(model, effort)` read straight off the resident
+    engine's own attributes for a card (same source `get_engine_model_effort`
+    already uses), or off the stored tuple for a standby (never touched
+    beyond what `ensure_standby_engine`/`claim_standby_engine` already
+    track). A standby's `card_id` is the literal string `"standby"` -- it
+    has no card yet, and at most one exists per project, so no further
+    disambiguation (e.g. project_id) is included here.
+
+    Backs `GET /api/pty-tabs/count`'s additive `"engines"` field -- purely a
+    read-only listing for the background-visibility UI; does not stream, or
+    otherwise touch, any engine."""
+    engines = [
+        {"card_id": card_id, "model": engine.model, "effort": engine.effort}
+        for card_id, engine in _pty_engines.items()
+    ]
+    engines.extend(
+        {"card_id": "standby", "model": model, "effort": effort}
+        for engine, model, effort in _standby_engines.values()
+    )
+    return engines
 
 
 # Pre-warmed, unclaimed PtyEngine per project (issue #136) -- kept ready so a

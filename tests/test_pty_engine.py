@@ -176,6 +176,119 @@ def test_resume_reattaches_with_the_given_session_id_against_a_fresh_pty():
 
 
 # ---------------------------------------------------------------------------
+# --model/--effort argv-level coverage (issue #138): every prior test only
+# asserted a Python-level kwarg made it to `PtyEngine(...)` (see
+# tests/test_sessions.py's `_mock_engine`) -- nothing exercised what actually
+# lands in the argv list handed to the real subprocess spawn. These assert
+# directly against `_build_args()`'s output (via the injected `pty_factory`,
+# exactly like the --resume/--session-id tests above) for a fresh spawn, a
+# --resume spawn, and a death-triggered restart-respawn.
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_spawn_passes_the_configured_model_flag():
+    backend = FakePtyBackend([])
+    factory, captured = _fake_factory(backend)
+
+    PtyEngine(model="claude-opus-4-8", pty_factory=factory).start()
+
+    assert "--model" in captured["argv"]
+    idx = captured["argv"].index("--model")
+    assert captured["argv"][idx + 1] == "claude-opus-4-8"
+
+
+def test_fresh_spawn_omits_model_flag_when_none_configured():
+    backend = FakePtyBackend([])
+    factory, captured = _fake_factory(backend)
+
+    PtyEngine(model=None, pty_factory=factory).start()
+
+    assert "--model" not in captured["argv"]
+
+
+def test_resume_spawn_passes_the_configured_model_flag():
+    backend = FakePtyBackend([])
+    factory, captured = _fake_factory(backend)
+
+    PtyEngine(model="claude-opus-4-8", resume_session_id="existing-session-123", pty_factory=factory).start()
+
+    assert "--resume" in captured["argv"]
+    assert "--model" in captured["argv"]
+    idx = captured["argv"].index("--model")
+    assert captured["argv"][idx + 1] == "claude-opus-4-8"
+
+
+def test_restart_respawn_passes_the_same_model_flag_as_the_original_spawn():
+    """A mid-turn death respawns via `_restart_after_death` (see the
+    crash/restart recovery tests further below) -- the model this engine was
+    constructed with must still be passed on the retried spawn, not silently
+    dropped just because that spawn takes the --resume branch instead of the
+    original --session-id one."""
+    dead_backend = FakePtyBackend(["the process dies before the marker\n"], eof_after=True)
+    healthy_backend = FakePtyBackend([f"all good now\n{TURN_COMPLETE_MARKER}\n"])
+    factory, calls = _sequenced_factory([dead_backend, healthy_backend])
+
+    engine = PtyEngine(model="claude-opus-4-8", pty_factory=factory)
+
+    run(_collect(engine.stream_turn("what is 2+2?")))
+
+    assert len(calls) == 2
+    for call in calls:
+        assert "--model" in call["argv"]
+        idx = call["argv"].index("--model")
+        assert call["argv"][idx + 1] == "claude-opus-4-8"
+
+
+def test_fresh_spawn_passes_the_effort_flag_when_a_real_value_is_configured():
+    backend = FakePtyBackend([])
+    factory, captured = _fake_factory(backend)
+
+    PtyEngine(effort="high", pty_factory=factory).start()
+
+    assert "--effort" in captured["argv"]
+    idx = captured["argv"].index("--effort")
+    assert captured["argv"][idx + 1] == "high"
+
+
+@pytest.mark.parametrize("effort", [None, "auto"])
+def test_fresh_spawn_omits_the_effort_flag_for_none_or_auto(effort):
+    backend = FakePtyBackend([])
+    factory, captured = _fake_factory(backend)
+
+    PtyEngine(effort=effort, pty_factory=factory).start()
+
+    assert "--effort" not in captured["argv"]
+
+
+def test_resume_spawn_passes_the_effort_flag_when_a_real_value_is_configured():
+    backend = FakePtyBackend([])
+    factory, captured = _fake_factory(backend)
+
+    PtyEngine(effort="high", resume_session_id="existing-session-123", pty_factory=factory).start()
+
+    assert "--resume" in captured["argv"]
+    assert "--effort" in captured["argv"]
+    idx = captured["argv"].index("--effort")
+    assert captured["argv"][idx + 1] == "high"
+
+
+def test_restart_respawn_passes_the_same_effort_flag_as_the_original_spawn():
+    dead_backend = FakePtyBackend(["the process dies before the marker\n"], eof_after=True)
+    healthy_backend = FakePtyBackend([f"all good now\n{TURN_COMPLETE_MARKER}\n"])
+    factory, calls = _sequenced_factory([dead_backend, healthy_backend])
+
+    engine = PtyEngine(effort="high", pty_factory=factory)
+
+    run(_collect(engine.stream_turn("what is 2+2?")))
+
+    assert len(calls) == 2
+    for call in calls:
+        assert "--effort" in call["argv"]
+        idx = call["argv"].index("--effort")
+        assert call["argv"][idx + 1] == "high"
+
+
+# ---------------------------------------------------------------------------
 # Turn-event contract + marker detection
 # ---------------------------------------------------------------------------
 

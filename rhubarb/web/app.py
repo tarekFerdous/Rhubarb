@@ -102,7 +102,16 @@ def prompt_page(request: Request):
 
 
 @app.get("/api/app-state")
-def app_state():
+def app_state(card_id: int | None = None):
+    """`card_id` is an optional hint (issue #139) naming the currently-open
+    session card, if any -- the frontend's Model/Effort card passes its
+    `leftCardId` here so it can show that card's live `PtyEngine`'s actual
+    `(model, effort)` (ground truth for the process actually running)
+    instead of always showing the global "next new session" setting. Omitted
+    (or naming a card with no live resident engine -- finished/pooled/never
+    started) falls back to `db.get_model`/`db.get_effort` exactly as before
+    this param existed; `settings.model`/`settings.effort` themselves are
+    never read from or written to differently based on this param."""
     conn = db.get_connection()
     root_dir = db.get_root_dir(conn)
     afk_hours = db.get_afk_hours(conn)
@@ -110,6 +119,13 @@ def app_state():
     terminal_view_hidden = db.get_terminal_view_hidden(conn)
     model = db.get_model(conn)
     effort = db.get_effort(conn)
+
+    session_model_effort_live = False
+    if card_id is not None:
+        engine_model_effort = session_runner.get_engine_model_effort(card_id)
+        if engine_model_effort is not None:
+            model, effort = engine_model_effort
+            session_model_effort_live = True
 
     active_project = None
     if _active_project_id is not None:
@@ -129,6 +145,7 @@ def app_state():
         "terminal_view_hidden": terminal_view_hidden,
         "model": model,
         "effort": effort,
+        "session_model_effort_live": session_model_effort_live,
         "active_project": active_project,
         "projects": projects,
     }
@@ -187,17 +204,45 @@ def set_terminal_view_hidden(body: dict):
 
 @app.post("/api/settings/model")
 def set_model(body: dict):
+    """`card_id` is an optional hint (issue #141), analogous to `GET
+    /api/app-state`'s own `card_id` param (#139) -- the frontend's Model/
+    Effort card passes its `leftCardId` here so that, if that card has a
+    live resident engine, this same request also tears it down and spawns a
+    fresh, unresumed one under the new model (see
+    `session_runner.respawn_engine_for_model_change`) instead of leaving the
+    open Live Terminal running under its old model until some future
+    session. Omitted (or naming a card with no live engine) leaves behavior
+    exactly as before this param existed -- global setting only, no engine
+    touched. `respawned` is only present in the response when `card_id` was
+    given, so a caller that never passes it (every existing caller) sees the
+    exact same response shape as before."""
     conn = db.get_connection()
     model = body["model"]
     db.set_model(conn, model)
+
+    card_id = body.get("card_id")
+    respawned = session_runner.respawn_engine_for_model_change(
+        conn, card_id, cwd=_active_project_cwd(), model=model
+    )
+    if card_id is not None:
+        return {"model": model, "respawned": respawned}
     return {"model": model}
 
 
 @app.post("/api/settings/effort")
 def set_effort(body: dict):
+    """Symmetric to `set_model` above, for effort -- see its docstring for
+    the `card_id`/`respawned` contract, identical here."""
     conn = db.get_connection()
     effort = body["effort"]
     db.set_effort(conn, effort)
+
+    card_id = body.get("card_id")
+    respawned = session_runner.respawn_engine_for_effort_change(
+        conn, card_id, cwd=_active_project_cwd(), effort=effort
+    )
+    if card_id is not None:
+        return {"effort": effort, "respawned": respawned}
     return {"effort": effort}
 
 
@@ -407,8 +452,16 @@ def get_pty_tab_count():
     """How many `PtyEngine` tabs are currently resident across every active
     session (issue #88) -- backs the tab-count indicator next to the
     "Sessions" label in the web UI. Polled rather than pushed over any one
-    card's SSE stream since the count is global, not scoped to a card."""
-    return {"count": session_runner.open_pty_tab_count()}
+    card's SSE stream since the count is global, not scoped to a card.
+
+    `"engines"` (issue #140) is an additive per-engine listing alongside the
+    plain `"count"` -- one record per live entry across both resident
+    (`_pty_engines`) and pre-warmed standby (`_standby_engines`) engines,
+    each carrying its actual `(model, effort)` and a distinguishing
+    `card_id` (an int, or the literal string `"standby"`) -- see
+    `session_runner.list_live_engines`. Existing consumers that only read
+    `"count"` are unaffected."""
+    return {"count": session_runner.open_pty_tab_count(), "engines": session_runner.list_live_engines()}
 
 
 @app.get("/api/sessions/{card_id}/stream")

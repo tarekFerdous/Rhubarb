@@ -161,10 +161,7 @@
   <div id="model-change-modal" class="modal-overlay" hidden>
     <div class="modal">
       <h2 class="modal-heading">Model Updated</h2>
-      <p class="model-change-text">
-        This change takes effect starting with your next new session. Any
-        session already in progress keeps using the model it started with.
-      </p>
+      <p id="model-change-text" class="model-change-text"></p>
       <button id="model-change-modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
     </div>
   </div>
@@ -299,6 +296,7 @@
     const modelSelectCardEl = document.getElementById("model-select-card");
     const modelSelectSettingsEl = document.getElementById("model-select-settings");
     const modelChangeModalEl = document.getElementById("model-change-modal");
+    const modelChangeTextEl = document.getElementById("model-change-text");
     const modelChangeModalCloseBtn = document.getElementById("model-change-modal-close-btn");
     const effortSelectCardEl = document.getElementById("effort-select-card");
     const effortSelectSettingsEl = document.getElementById("effort-select-settings");
@@ -525,6 +523,7 @@
       leftCardId = null;
       currentLeftSession = null;
       preQaLeftSession = null;
+      refreshModelEffortCard();
       rightCards.clear();
       backgroundSources.forEach((es) => es.close());
       backgroundSources.clear();
@@ -822,6 +821,25 @@
       showOnly(projectPickerEl);
     }
 
+    // Issue #139: show the currently-open card's live `PtyEngine`'s actual
+    // (model, effort) in the Model/Effort card instead of always the global
+    // setting, whenever `leftCardId` names a card with one. Passing
+    // `card_id` here never changes `/api/app-state`'s `root_dir`/`projects`/
+    // etc. fields, and never touches `knownModel`/`knownEffort` (those stay
+    // the global setting, used by the Settings modal) -- only the two card
+    // <select>s' displayed value changes here. Issue #141: these selects are
+    // no longer disabled while showing engine ground truth -- changing
+    // either one now respawns that live engine under the new value (see
+    // `updateModel`/`updateEffort`), so this just re-reads the fresh
+    // ground truth once that respawn (or global-only change) is done.
+    async function refreshModelEffortCard() {
+      const url = leftCardId !== null ? `/api/app-state?card_id=${leftCardId}` : "/api/app-state";
+      const res = await fetch(url);
+      const state = await res.json();
+      modelSelectCardEl.value = state.model;
+      effortSelectCardEl.value = state.effort;
+    }
+
     function openSettingsModal() {
       currentRootDirEl.textContent = knownRootDir || "No directory set.";
       afkHoursInputEl.value = knownAfkHours ?? 6;
@@ -990,35 +1008,63 @@
       applyTerminalViewVisibility();
     }
 
-    async function updateModel(model) {
+    // `cardId` (issue #141): pass `leftCardId` when a card is currently
+    // open so the backend can respawn that card's live resident engine
+    // under the new model, if it has one (see
+    // `session_runner.respawn_engine_for_model_change`) -- omitted (the
+    // Settings modal's own select, `modelSelectSettingsEl`, never passes
+    // this) leaves behavior exactly as before this param existed: a pure
+    // global-setting update, no engine touched.
+    async function updateModel(model, cardId = null) {
+      const body = cardId !== null ? { model, card_id: cardId } : { model };
       const res = await fetch("/api/settings/model", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model }),
+        body: JSON.stringify(body),
       });
       const data = await res.json();
       knownModel = data.model;
       modelSelectCardEl.value = knownModel;
       modelSelectSettingsEl.value = knownModel;
+
+      if (data.respawned) {
+        modelChangeTextEl.textContent =
+          "Applied immediately -- your current session's Live Terminal was restarted with the new model.";
+        // The respawned engine is now this card's ground truth -- refresh
+        // right away so the card's selects (and a later re-render) show it.
+        await refreshModelEffortCard();
+      } else {
+        modelChangeTextEl.textContent =
+          "This change takes effect starting with your next new session. Any session already in progress keeps using the model it started with.";
+      }
       modelChangeModalEl.hidden = false;
     }
 
-    async function updateEffort(effort) {
+    // Symmetric to `updateModel` above -- see its comment for the `cardId`
+    // contract, identical here.
+    async function updateEffort(effort, cardId = null) {
+      const body = cardId !== null ? { effort, card_id: cardId } : { effort };
       const res = await fetch("/api/settings/effort", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ effort }),
+        body: JSON.stringify(body),
       });
       const data = await res.json();
       knownEffort = data.effort;
       effortSelectCardEl.value = knownEffort;
       effortSelectSettingsEl.value = knownEffort;
 
-      // A left-card session that exists but hasn't received its first turn
-      // yet gets patched directly so that still-pending first turn picks up
-      // the new value; anything further along only gets the new global
-      // default, applied starting with the next session.
-      if (leftCardId !== null && !cardsWithTurn.has(leftCardId)) {
+      if (data.respawned) {
+        // Issue #141: the open card already had a live engine, which was
+        // just torn down and respawned under the new effort.
+        effortChangeTextEl.textContent =
+          "Applied immediately -- your current session's Live Terminal was restarted with the new effort.";
+        await refreshModelEffortCard();
+      } else if (leftCardId !== null && !cardsWithTurn.has(leftCardId)) {
+        // A left-card session that exists but hasn't received its first
+        // turn yet (so has no live engine for the backend to have
+        // respawned above) gets patched directly so that still-pending
+        // first turn picks up the new value.
         await fetch(`/api/sessions/${leftCardId}/effort`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1082,12 +1128,12 @@
     afkModalCloseBtn.addEventListener("click", dismissAfkNotifications);
     sessionErrorNotificationCloseBtn.addEventListener("click", dismissSessionErrorNotifications);
     qaModalCloseBtnEl.addEventListener("click", () => { qaNotificationModalEl.hidden = true; });
-    modelSelectCardEl.addEventListener("change", () => updateModel(modelSelectCardEl.value));
+    modelSelectCardEl.addEventListener("change", () => updateModel(modelSelectCardEl.value, leftCardId));
     modelSelectSettingsEl.addEventListener("change", () => updateModel(modelSelectSettingsEl.value));
     modelChangeModalCloseBtn.addEventListener("click", () => {
       modelChangeModalEl.hidden = true;
     });
-    effortSelectCardEl.addEventListener("change", () => updateEffort(effortSelectCardEl.value));
+    effortSelectCardEl.addEventListener("change", () => updateEffort(effortSelectCardEl.value, leftCardId));
     effortSelectSettingsEl.addEventListener("change", () => updateEffort(effortSelectSettingsEl.value));
     effortChangeModalCloseBtn.addEventListener("click", () => {
       effortChangeModalEl.hidden = true;
@@ -1369,6 +1415,7 @@
       if (qaSnapshot) rightCards.set(qaCardId, qaSnapshot);
       leftCardId = null;
       currentLeftSession = null;
+      refreshModelEffortCard();
       resetPromptBox();
       startForm.style.display = "";
       interviewEl.innerHTML = "";
@@ -1534,6 +1581,7 @@
 
           leftCardId = cardId;
           currentLeftSession = snapshot;
+          refreshModelEffortCard();
           startForm.style.display = "none";
           setHeading(`QA — PRD #${event.prd?.number || ""}`);
           showOnly(mainFlowEl);
@@ -1565,6 +1613,7 @@
         blockedTakeoverCardId = cardId;
         leftCardId = cardId;
         currentLeftSession = snapshot;
+        refreshModelEffortCard();
         startForm.style.display = "none";
         setHeading("Blocked — needs your input");
         showOnly(mainFlowEl);
@@ -1623,6 +1672,7 @@
 
       leftCardId = null;
       currentLeftSession = null;
+      refreshModelEffortCard();
       resetPromptBox();
       startForm.style.display = "";
       interviewEl.innerHTML = "";
@@ -1644,6 +1694,7 @@
       if (leftCardId === cardId) {
         leftCardId = null;
         currentLeftSession = null;
+        refreshModelEffortCard();
         resetPromptBox();
         startForm.style.display = "";
         interviewEl.innerHTML = "";
@@ -2068,6 +2119,7 @@
     function renderLeftSession(session) {
       currentLeftSession = session;
       leftCardId = session.card_id;
+      refreshModelEffortCard();
 
       if (session.phase === "grilling") {
         startForm.style.display = "none";
@@ -2280,6 +2332,7 @@
       }
       leftCardId = data.card_id;
       currentLeftSession = { card_id: data.card_id, phase: "grilling", interview: { header: "", questions: [], footer: "" } };
+      refreshModelEffortCard();
       lastRenderedQuestionFileContent = null;
       startForm.style.display = "none";
       setHeading(headingForPhase("grilling"));
@@ -2309,6 +2362,19 @@
       const data = await res.json();
       const count = data.count || 0;
       ptyTabCountEl.textContent = count > 0 ? `· ${count} tab${count === 1 ? "" : "s"}` : "";
+
+      // Issue #140: surface each live engine's actual model/effort (resident
+      // per-card_id tabs, plus any pre-warmed standby) as a tooltip on the
+      // same indicator -- a minimal, read-only listing, not a live viewer.
+      const engines = data.engines || [];
+      ptyTabCountEl.title = engines.length
+        ? engines
+            .map((e) => {
+              const label = e.card_id === "standby" ? "Standby" : `Card ${e.card_id}`;
+              return `${label}: ${e.model || "default"} / ${e.effort || "auto"}`;
+            })
+            .join("\n")
+        : "Open PTY tabs";
     }
 
     let usageIntervalId = null;
