@@ -507,6 +507,61 @@ textarea.prompt-box:focus {
   border-color: var(--card-border);
 }
 
+/* Error Logs modal (issue #156) -- wider than the default 400px modal so
+   the filter row and log rows have room to breathe. */
+.error-logs-modal-content {
+  width: min(640px, calc(100% - 32px));
+  text-align: left;
+}
+
+.error-logs-modal-content .modal-heading {
+  text-align: center;
+}
+
+.error-logs-range-row {
+  display: flex;
+  gap: 12px;
+}
+
+.error-logs-range-row > div {
+  flex: 1;
+  min-width: 0;
+}
+
+.error-logs-empty-state {
+  color: var(--fg-muted);
+  font-size: 0.85rem;
+  text-align: center;
+  margin: 12px 0 20px;
+}
+
+.error-logs-list {
+  max-height: 40vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0 0 20px;
+}
+
+.error-logs-row {
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  padding: 10px 12px;
+}
+
+.error-logs-row-meta {
+  margin: 0 0 4px;
+  font-size: 0.75rem;
+  color: var(--fg-muted);
+}
+
+.error-logs-row-message {
+  margin: 0;
+  font-size: 0.85rem;
+  word-break: break-word;
+}
+
 #afk-notification-lines {
   margin: 0 0 20px;
 }
@@ -724,6 +779,17 @@ textarea.prompt-box:focus {
   font-size: 0.85rem;
 }
 
+/* Error Logs button (issue #156) -- sits below the session-queue
+   scroll-wrap as a sibling inside `.card.right`. That scroll-wrap is
+   `flex: 1` in the card's flex column, so this button naturally lands
+   pinned at the bottom of the card with no extra positioning needed. */
+.error-logs-btn {
+  flex: 0 0 auto;
+  margin-top: 12px;
+  padding: 10px 20px;
+  font-size: 0.85rem;
+}
+
 .session-card-row {
   display: flex;
   align-items: stretch;
@@ -863,6 +929,13 @@ textarea.prompt-box:focus {
   font-size: 1rem;
   color: var(--fg-muted);
   margin: 0 0 20px;
+}
+
+.phase-status-message {
+  font-size: 0.85rem;
+  color: var(--fg-muted);
+  margin: -12px 0 20px;
+  overflow-wrap: anywhere;
 }
 
 .implementing-banner {

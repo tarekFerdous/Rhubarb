@@ -7,6 +7,8 @@ description: Break a plan, spec, or PRD into independently-grabbable issues on t
 
 Break a plan into independently-grabbable issues using vertical slices (tracer bullets).
 
+Rhubarb-managed sessions publish to GitHub as a separate, external step that runs after this skill finishes — it reads a local draft file rather than the CLI turn calling GitHub directly. Write to that draft file as instructed below. Do NOT run `gh issue create` or any other GitHub CLI command from this skill.
+
 ## Process
 
 ### 1. Gather context
@@ -47,11 +49,24 @@ Ask the user:
 
 Iterate until the user approves the breakdown.
 
-### 5. Publish the issues to the issue tracker
+### 5. Write the issues to `.claude/prd_draft.json`
 
-For each approved slice, publish a new issue to the issue tracker. Use the issue body template below. These issues are considered ready for AFK agents, so publish them with the correct triage label unless instructed otherwise.
+For each approved slice, do NOT publish it to GitHub yourself — instead read the existing `.claude/prd_draft.json` at the project root (already written by `/rhubarb:to-prd` with the `prd` key) and add an `issues` array to it, preserving the existing `prd` key:
 
-Publish issues in dependency order (blockers first) so you can reference real issue identifiers in the "Blocked by" field.
+```json
+{
+  "issues": [
+    { "title": "...", "body": "...", "labels": ["..."] }
+  ]
+}
+```
+
+**Ordering matters and stands in for real issue numbers.** No real GitHub issue numbers exist yet at this point — they're only assigned once `rhubarb/github_publisher.py` actually creates the issues. So:
+
+- List `issues` in the array in dependency order (blockers first). The external publisher creates them in that same order and resolves each entry's real issue number as it goes.
+- In each issue's `body`, write the "Blocked by" section using the *title* of the blocking slice (not a `#N` reference, since no number exists yet) — e.g. "Blocked by: the slice titled '<title>'" or "None - can start immediately". Do not fabricate placeholder issue numbers.
+
+Use the issue body template below for each entry's `body`. This file follows a fixed schema shared with `/rhubarb:to-prd` (which writes the `prd` key) and with `rhubarb/github_publisher.py`, the Python module that later reads this file and actually creates the GitHub issues in order, resolving real `#N` references as it creates each one. Keep the shape exactly as shown above so that reader can parse it without any special-casing.
 
 <issue-template>
 ## Parent
@@ -72,7 +87,7 @@ Avoid specific file paths or code snippets — they go stale fast. Exception: if
 
 ## Blocked by
 
-- A reference to the blocking ticket (if any)
+- The title of the blocking slice (real issue numbers don't exist yet — the external publisher resolves these when it creates the issues in order)
 
 Or "None - can start immediately" if no blockers.
 

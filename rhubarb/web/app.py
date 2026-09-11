@@ -10,7 +10,7 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from rhubarb import afk_loop, db, live_stream, ollama_installer, session_runner
+from rhubarb import afk_loop, db, error_log, live_stream, ollama_installer, session_runner
 from rhubarb.cli_client import ClaudeCLIError, get_auth_status
 from rhubarb.folder_picker import pick_folder
 from rhubarb.prd_list import compute_prd_list
@@ -437,6 +437,22 @@ def get_session_error_notifications(project_id: int):
 def dismiss_session_error_notifications(project_id: int):
     session_runner.dismiss_error_notifications(project_id)
     return {"dismissed": True}
+
+
+@app.get("/api/projects/{project_id}/errors")
+def get_project_errors(
+    project_id: int,
+    phase: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    card_id: int | None = None,
+    q: str | None = None,
+):
+    return {
+        "errors": error_log.query_errors(
+            project_id, phase=phase, since=since, until=until, card_id=card_id, q=q
+        )
+    }
 
 
 @app.get("/api/usage")

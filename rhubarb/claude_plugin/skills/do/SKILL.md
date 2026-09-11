@@ -28,7 +28,7 @@ Run the full grilling session until you have a clear, stable picture of what is 
 
 Invoke `/rhubarb:to-prd`.
 
-**Override the default `/rhubarb:to-prd` behaviour**: do NOT pause to ask the user whether the seams look correct. Proceed directly through all steps and publish the PRD as a GitHub issue using `gh issue create`. Apply both the `ready-for-agent` and `prd` triage labels.
+**Override the default `/rhubarb:to-prd` behaviour**: do NOT pause to ask the user whether the seams look correct. Proceed directly through all steps, writing the PRD to `.claude/prd_draft.json` as `/rhubarb:to-prd` normally does (do NOT run `gh issue create`). The `ready-for-agent` and `prd` labels are already applied via that file's `labels` array.
 
 ---
 
@@ -36,7 +36,7 @@ Invoke `/rhubarb:to-prd`.
 
 Invoke `/rhubarb:to-issues`.
 
-**Override the default `/rhubarb:to-issues` behaviour**: do NOT run the "Quiz the user" step. Do not ask whether granularity or dependencies look right. Proceed directly to publishing all slices as individual GitHub issues via `gh issue create`, in dependency order (blockers first).
+**Override the default `/rhubarb:to-issues` behaviour**: do NOT run the "Quiz the user" step. Do not ask whether granularity or dependencies look right. Proceed directly to writing all slices into the `issues` array of `.claude/prd_draft.json`, in dependency order (blockers first), as `/rhubarb:to-issues` normally does (do NOT run `gh issue create`).
 
 ---
 

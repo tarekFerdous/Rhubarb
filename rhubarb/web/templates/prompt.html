@@ -76,6 +76,7 @@
           <button id="implementing-banner-proceed-btn" class="glass-btn implementing-banner-btn" type="button">Proceed</button>
         </div>
         <p id="phase-label" class="phase-label"></p>
+        <p id="phase-status-message" class="phase-status-message" hidden></p>
         <div class="scroll-wrap"><div id="details-view" class="details-list"></div></div>
         <p id="session-error" class="session-error" hidden></p>
         <div id="session-error-actions" class="session-error-actions" hidden>
@@ -100,6 +101,7 @@
       </p>
       <p id="usage-indicator" class="usage-indicator"></p>
       <div class="scroll-wrap"><div id="session-queue" class="session-queue"></div></div>
+      <button id="error-logs-btn" class="glass-btn error-logs-btn" type="button">Error Logs</button>
     </div>
   </div>
 
@@ -155,6 +157,60 @@
       </select>
 
       <button id="modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
+    </div>
+  </div>
+
+  <!-- Error Logs modal (issue #156): scoped to whichever project is
+       currently active (no manual project selector inside it -- reads
+       `activeProject.id` the same way every other per-project fetch in this
+       file does) and backed by the read-only `/api/projects/{id}/errors`
+       endpoint from issue #155. Follows the exact same manually-triggered
+       hidden-attribute modal convention as `settings-modal` above: opened
+       by a plain button click via `el.hidden = false`, closed the same way
+       via the `.modal-dismiss` Close button -- no `<dialog>`, no separate
+       "open" CSS class. -->
+  <div id="error-logs-modal" class="modal-overlay" hidden>
+    <div class="modal error-logs-modal-content">
+      <h2 class="modal-heading">Error Logs</h2>
+
+      <label for="error-logs-phase-select" class="modal-field-label">Phase</label>
+      <select id="error-logs-phase-select" class="modal-select-input">
+        <option value="">All phases</option>
+        <option value="grilling">Grilling</option>
+        <option value="creating_prd">Creating PRD</option>
+        <option value="creating_issues">Creating Issues</option>
+        <option value="publishing">Publishing</option>
+        <option value="details">Details</option>
+        <option value="implementing">Implementing</option>
+        <option value="implemented">Implemented</option>
+        <option value="qa_grilling">QA Grilling</option>
+        <option value="qa_closing">QA Closing</option>
+        <option value="blocked">Blocked</option>
+      </select>
+
+      <div class="error-logs-range-row">
+        <div>
+          <label for="error-logs-since-input" class="modal-field-label">Since</label>
+          <input id="error-logs-since-input" class="modal-number-input" type="datetime-local" />
+        </div>
+        <div>
+          <label for="error-logs-until-input" class="modal-field-label">Until</label>
+          <input id="error-logs-until-input" class="modal-number-input" type="datetime-local" />
+        </div>
+      </div>
+
+      <label for="error-logs-card-id-input" class="modal-field-label">Card / session ID</label>
+      <input id="error-logs-card-id-input" class="modal-number-input" type="number" min="1" step="1" placeholder="Any" />
+
+      <label for="error-logs-search-input" class="modal-field-label">Search message text</label>
+      <input id="error-logs-search-input" class="modal-number-input" type="text" placeholder="Search…" />
+
+      <button id="error-logs-apply-btn" class="glass-btn" type="button">Apply Filters</button>
+
+      <p id="error-logs-empty-state" class="error-logs-empty-state" hidden></p>
+      <div id="error-logs-list" class="error-logs-list"></div>
+
+      <button id="error-logs-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
     </div>
   </div>
 
@@ -310,6 +366,7 @@
     const ptyTabCountEl = document.getElementById("pty-tab-count");
     const usageIndicatorEl = document.getElementById("usage-indicator");
     const phaseLabelEl = document.getElementById("phase-label");
+    const phaseStatusMessageEl = document.getElementById("phase-status-message");
     const detailsViewEl = document.getElementById("details-view");
     const sessionErrorEl = document.getElementById("session-error");
     const sessionErrorActionsEl = document.getElementById("session-error-actions");
@@ -326,6 +383,17 @@
     const qaNotificationModalEl = document.getElementById("qa-notification-modal");
     const qaNotificationHeadingEl = document.getElementById("qa-notification-heading");
     const qaModalCloseBtnEl = document.getElementById("qa-modal-close-btn");
+    const errorLogsBtnEl = document.getElementById("error-logs-btn");
+    const errorLogsModalEl = document.getElementById("error-logs-modal");
+    const errorLogsPhaseSelectEl = document.getElementById("error-logs-phase-select");
+    const errorLogsSinceInputEl = document.getElementById("error-logs-since-input");
+    const errorLogsUntilInputEl = document.getElementById("error-logs-until-input");
+    const errorLogsCardIdInputEl = document.getElementById("error-logs-card-id-input");
+    const errorLogsSearchInputEl = document.getElementById("error-logs-search-input");
+    const errorLogsApplyBtnEl = document.getElementById("error-logs-apply-btn");
+    const errorLogsEmptyStateEl = document.getElementById("error-logs-empty-state");
+    const errorLogsListEl = document.getElementById("error-logs-list");
+    const errorLogsCloseBtnEl = document.getElementById("error-logs-close-btn");
 
     let knownRootDir = null;
     let knownAfkHours = null;
@@ -445,6 +513,7 @@
           grilling: "Ongoing Grilling Session...",
           creating_prd: "Creating PRD...",
           creating_issues: "Creating Issues...",
+          publishing: "Publishing to GitHub...",
           details: "Details",
           implementing: "Implementing...",
           implemented: "Implemented",
@@ -461,6 +530,7 @@
           grilling: "Ongoing Grilling Session...",
           creating_prd: "Creating PRD...",
           creating_issues: "Creating Issues...",
+          publishing: "Publishing to GitHub...",
           details: "Done",
           implementing: "Implementing...",
           implemented: "Implemented",
@@ -857,6 +927,82 @@
       settingsModalEl.hidden = true;
     }
 
+    // --- Error Logs modal (issue #156) ------------------------------------
+    // Opened/closed the same way as the Settings modal above (plain
+    // `.hidden` boolean toggling on the `.modal-overlay`, no `<dialog>`, no
+    // separate "open" CSS class). Always scoped to `activeProject` -- there
+    // is no project picker inside the modal; it just reads the same
+    // `activeProject` used by every other per-project fetch in this file.
+
+    function buildErrorLogsQuery() {
+      const params = new URLSearchParams();
+      const phase = errorLogsPhaseSelectEl.value;
+      if (phase) params.set("phase", phase);
+      // datetime-local's value has no timezone -- new Date(...) parses it
+      // as local time, and toISOString() converts that to the UTC ISO
+      // string query_errors()/_parse_iso() expect.
+      const since = errorLogsSinceInputEl.value;
+      if (since) params.set("since", new Date(since).toISOString());
+      const until = errorLogsUntilInputEl.value;
+      if (until) params.set("until", new Date(until).toISOString());
+      const cardId = errorLogsCardIdInputEl.value.trim();
+      if (cardId) params.set("card_id", cardId);
+      const q = errorLogsSearchInputEl.value.trim();
+      if (q) params.set("q", q);
+      return params;
+    }
+
+    function renderErrorLogsList(errors) {
+      errorLogsListEl.innerHTML = "";
+      if (!errors || errors.length === 0) {
+        errorLogsEmptyStateEl.textContent = "No errors found.";
+        errorLogsEmptyStateEl.hidden = false;
+        return;
+      }
+      errorLogsEmptyStateEl.hidden = true;
+      errors.forEach((err) => {
+        const row = document.createElement("div");
+        row.className = "error-logs-row";
+
+        const meta = document.createElement("p");
+        meta.className = "error-logs-row-meta";
+        const cardPart = err.card_id != null ? `card ${err.card_id}` : "no card";
+        meta.textContent = `${err.timestamp || ""} · ${err.phase || "unknown phase"} · ${cardPart}`;
+        row.appendChild(meta);
+
+        const msg = document.createElement("p");
+        msg.className = "error-logs-row-message";
+        msg.textContent = err.message || "";
+        row.appendChild(msg);
+
+        errorLogsListEl.appendChild(row);
+      });
+    }
+
+    async function fetchAndRenderErrorLogs() {
+      // Degrade sensibly with no active project yet -- an empty state
+      // instead of a fetch against an undefined project id.
+      if (!activeProject) {
+        errorLogsListEl.innerHTML = "";
+        errorLogsEmptyStateEl.textContent = "No active project yet.";
+        errorLogsEmptyStateEl.hidden = false;
+        return;
+      }
+      const qs = buildErrorLogsQuery().toString();
+      const res = await fetch(`/api/projects/${activeProject.id}/errors${qs ? `?${qs}` : ""}`);
+      const data = await res.json();
+      renderErrorLogsList(data.errors || []);
+    }
+
+    function openErrorLogsModal() {
+      errorLogsModalEl.hidden = false;
+      fetchAndRenderErrorLogs();
+    }
+
+    function closeErrorLogsModal() {
+      errorLogsModalEl.hidden = true;
+    }
+
     // --- Ollama consent/install gate (issue #115) -------------------------
 
     async function checkOllamaGate() {
@@ -1121,6 +1267,20 @@
     document.getElementById("open-root-btn").addEventListener("click", openSettingsModal);
     document.getElementById("modal-close-btn").addEventListener("click", closeSettingsModal);
     document.getElementById("modal-pick-btn").addEventListener("click", pickRootDir);
+    errorLogsBtnEl.addEventListener("click", openErrorLogsModal);
+    errorLogsCloseBtnEl.addEventListener("click", closeErrorLogsModal);
+    errorLogsApplyBtnEl.addEventListener("click", fetchAndRenderErrorLogs);
+    errorLogsPhaseSelectEl.addEventListener("change", fetchAndRenderErrorLogs);
+    errorLogsSinceInputEl.addEventListener("change", fetchAndRenderErrorLogs);
+    errorLogsUntilInputEl.addEventListener("change", fetchAndRenderErrorLogs);
+    [errorLogsCardIdInputEl, errorLogsSearchInputEl].forEach((el) => {
+      el.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          fetchAndRenderErrorLogs();
+        }
+      });
+    });
     afkHoursInputEl.addEventListener("change", updateAfkHours);
     parallelImplementationToggleEl.addEventListener("change", updateParallelImplementation);
     terminalViewHiddenToggleEl.addEventListener("change", updateTerminalViewHidden);
@@ -1605,6 +1765,10 @@
         details: event.details,
         error: event.error,
         needs_github_login: event.needs_github_login,
+        // Issue #154: a short line of live progress for creating_prd/
+        // creating_issues/publishing -- rendered by renderSessionStatus,
+        // the same area that already shows the phase label.
+        status_message: event.status_message || null,
         // QA-specific fields (present when phase === "qa_grilling")
         prd: event.prd || null,
         issues: event.issues || null,
@@ -2176,11 +2340,22 @@
       phaseLabelEl.textContent = session.error ? "Error" : phaseLabelText(session.phase);
 
       if (session.error) {
+        phaseStatusMessageEl.hidden = true;
         sessionErrorEl.hidden = false;
         sessionErrorEl.textContent = session.error;
         sessionErrorActionsEl.hidden = false;
         githubLoginBtn.hidden = !session.needs_github_login;
         return;
+      }
+
+      // Issue #154: live progress for creating_prd/creating_issues/publishing
+      // ("PRD draft written.", "Created issue #6", ...), reusing this same
+      // status area rather than a new display surface.
+      if (session.status_message) {
+        phaseStatusMessageEl.textContent = session.status_message;
+        phaseStatusMessageEl.hidden = false;
+      } else {
+        phaseStatusMessageEl.hidden = true;
       }
 
       if ((session.phase === "details" || session.phase === "implemented") && session.details) {

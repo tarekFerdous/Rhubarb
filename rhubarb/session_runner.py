@@ -20,7 +20,7 @@ from pathlib import Path
 
 _FENCED_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```")
 
-from rhubarb import db
+from rhubarb import db, error_log
 from rhubarb.cli_client import ClaudeCLIError
 from rhubarb.github_publisher import GithubPublishError, publish_draft
 from rhubarb.live_stream import publish
@@ -589,12 +589,19 @@ async def _run_turn(
     """
     lock = _get_turn_lock(card_id)
     if lock.locked():
+        # No `conn`/`row` in scope on this path (unlike every other
+        # `_turn_event(error=...)` call site) -- look up just the
+        # `project_id` this log line needs.
+        lookup_conn = db.get_connection()
+        lookup_row = db.get_session(lookup_conn, card_id)
         publish(
             card_id,
             _turn_event(
                 phase=phase,
                 error="Another turn for this session is already in progress -- please wait for it to finish.",
                 needs_github_login=False,
+                card_id=card_id,
+                project_id=lookup_row["project_id"] if lookup_row is not None else None,
             ),
         )
         return None
@@ -637,8 +644,34 @@ async def _run_turn(
 
 
 def _turn_event(
-    *, phase: str, interview=None, details=None, error=None, needs_github_login=False, blocked=None
+    *,
+    phase: str,
+    interview=None,
+    details=None,
+    error=None,
+    needs_github_login=False,
+    blocked=None,
+    status_message: str | None = None,
+    card_id: int | None = None,
+    project_id: int | None = None,
 ) -> dict:
+    """Build the `turn` event every phase publishes on a session's live
+    stream. `card_id`/`project_id` are only used here -- not part of the
+    published event shape -- to feed issue #153's app-wide error log: every
+    caller that reports an error (`error is not None`) already goes through
+    this one function, so logging here (rather than at each of the many call
+    sites) covers every current and future error `turn` event automatically.
+
+    `status_message` (issue #154) carries a short, human-readable line of
+    live progress -- e.g. "PRD draft written.", "PRD published as #5",
+    "Created issue #6" -- for phases (`creating_prd`, `creating_issues`,
+    `publishing`) that otherwise give no feedback until the chain's final
+    `details` turn. The frontend renders it via the same `renderSessionStatus`
+    path that already shows the phase label (see `prompt.html`), rather than
+    a new display surface.
+    """
+    if error is not None:
+        error_log.log_error(project_id=project_id, card_id=card_id, phase=phase, message=error)
     return {
         "type": "turn",
         "phase": phase,
@@ -647,6 +680,7 @@ def _turn_event(
         "error": error,
         "needs_github_login": needs_github_login,
         "blocked": blocked,
+        "status_message": status_message,
     }
 
 
@@ -703,7 +737,16 @@ async def _run_grilling_turn(
         db.update_session(
             conn, card_id, model=model, effort=effort, error_text=message, needs_github_login=0
         )
-        publish(card_id, _turn_event(phase="grilling", error=message, needs_github_login=False))
+        publish(
+            card_id,
+            _turn_event(
+                phase="grilling",
+                error=message,
+                needs_github_login=False,
+                card_id=card_id,
+                project_id=row["project_id"],
+            ),
+        )
         return None
 
     if turn is None:
@@ -754,6 +797,43 @@ async def _run_grilling_turn(
     return parsed if parsed["questions"] else None
 
 
+def _draft_status_message(cwd: str | None, phase: str) -> str | None:
+    """Issue #154: after a `creating_prd`/`creating_issues` turn completes,
+    check whether `.claude/prd_draft.json` was actually written (by the
+    `/to-prd`/`/to-issues` skill -- see those SKILL.md files) and, if so,
+    return a short status line confirming it for the frontend to render.
+
+    Returns `None` -- no status to publish -- whenever the file is missing,
+    unreadable, not valid JSON, or doesn't yet carry the key this phase
+    expects (`prd` for `creating_prd`, an `issues` list for
+    `creating_issues`): a turn that didn't actually write the expected draft
+    content gets no incremental status here, same as before this existed --
+    the eventual error/success handling elsewhere is unaffected either way.
+    """
+    if not cwd:
+        return None
+    draft_path = Path(cwd) / ".claude" / "prd_draft.json"
+    try:
+        draft = json.loads(draft_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(draft, dict):
+        return None
+
+    if phase == "creating_prd":
+        return "PRD draft written." if isinstance(draft.get("prd"), dict) else None
+
+    if phase == "creating_issues":
+        issues = draft.get("issues")
+        if not isinstance(issues, list):
+            return None
+        count = len(issues)
+        noun = "issue" if count == 1 else "issues"
+        return f"Issues draft written ({count} {noun})."
+
+    return None
+
+
 async def _run_chain_step(
     card_id: int, conn, row, *, phase: str, prompt: str, cwd: str | None, model: str | None, effort: str | None
 ) -> tuple[bool, str | None]:
@@ -761,6 +841,12 @@ async def _run_chain_step(
 
     On failure, publishes the error `turn` event and `done` itself -- the
     chain stops here exactly as the old blocking version did.
+
+    On success, publishes an intermediate `turn` event carrying a
+    `status_message` (issue #154) once `_draft_status_message` confirms the
+    draft file this phase is responsible for was actually written -- giving
+    the user live feedback mid-phase instead of nothing until the chain's
+    final `details` summary.
     """
     db.update_session(conn, row["id"], phase=phase, error_text=None, needs_github_login=0)
     publish(card_id, {"type": "phase", "phase": phase})
@@ -785,7 +871,16 @@ async def _run_chain_step(
         _close_engine(card_id)
         message = str(e)
         db.update_session(conn, row["id"], error_text=message, needs_github_login=0)
-        publish(card_id, _turn_event(phase=phase, error=message, needs_github_login=False))
+        publish(
+            card_id,
+            _turn_event(
+                phase=phase,
+                error=message,
+                needs_github_login=False,
+                card_id=card_id,
+                project_id=row["project_id"],
+            ),
+        )
         publish(card_id, {"type": "done"})
         return False, None
 
@@ -802,6 +897,11 @@ async def _run_chain_step(
         console_text=row["console_text"] + "\n\n" + turn["result"],
         context_pct=turn.get("context_pct"),
     )
+
+    status_message = _draft_status_message(cwd, phase)
+    if status_message is not None:
+        publish(card_id, _turn_event(phase=phase, status_message=status_message))
+
     return True, turn["session_id"]
 
 
@@ -812,19 +912,45 @@ async def _run_publish_step(card_id: int, conn, row, *, cwd: str | None) -> bool
     success, having appended the publisher's result text to `console_text`
     so `_finish_chain`'s `parse_details()` can parse PRD/issue numbers
     unchanged. Returns False on failure, having published the error `turn`
-    and `done` itself here -- exactly like `_run_chain_step` does."""
+    and `done` itself here -- exactly like `_run_chain_step` does.
+
+    Issue #154: passes `publish_draft` an `on_progress` callback that
+    publishes an intermediate `turn` event -- "PRD published as #N" right
+    after the PRD issue is created, then "Created issue #N" after each child
+    issue -- instead of the caller only finding out once the whole publish
+    call has finished. `publish()` is documented safe to call from a worker
+    thread (see `live_stream.publish`), which is where `on_progress` actually
+    runs, since `publish_draft` itself executes via `asyncio.to_thread`
+    below.
+    """
     db.update_session(conn, row["id"], phase="publishing", error_text=None, needs_github_login=0)
     publish(card_id, {"type": "phase", "phase": "publishing"})
 
     draft_path = Path(cwd) / ".claude" / "prd_draft.json" if cwd else Path(".claude/prd_draft.json")
 
+    def on_progress(event: dict) -> None:
+        if event["kind"] == "prd":
+            status_message = f"PRD published as #{event['number']}"
+        else:
+            status_message = f"Created issue #{event['number']}"
+        publish(card_id, _turn_event(phase="publishing", status_message=status_message))
+
     try:
-        result_text = await asyncio.to_thread(publish_draft, draft_path, cwd)
+        result_text = await asyncio.to_thread(publish_draft, draft_path, cwd, on_progress=on_progress)
     except GithubPublishError as e:
         message = str(e)
         needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, row["id"], error_text=message, needs_github_login=needs_login)
-        publish(card_id, _turn_event(phase="publishing", error=message, needs_github_login=bool(needs_login)))
+        publish(
+            card_id,
+            _turn_event(
+                phase="publishing",
+                error=message,
+                needs_github_login=bool(needs_login),
+                card_id=card_id,
+                project_id=row["project_id"],
+            ),
+        )
         publish(card_id, {"type": "done"})
         return False
 
@@ -1157,7 +1283,16 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
         message = str(e)
         needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
-        publish(card_id, _turn_event(phase="implementing", error=message, needs_github_login=bool(needs_login)))
+        publish(
+            card_id,
+            _turn_event(
+                phase="implementing",
+                error=message,
+                needs_github_login=bool(needs_login),
+                card_id=card_id,
+                project_id=row["project_id"],
+            ),
+        )
         publish(card_id, {"type": "done"})
         add_error_notification(row["project_id"], card_id, "implementing", message)
         await _drain_implement_queue(row["project_id"], cwd)
@@ -1314,7 +1449,16 @@ async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -
         message = str(e)
         needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
-        publish(card_id, _turn_event(phase="implementing", error=message, needs_github_login=bool(needs_login)))
+        publish(
+            card_id,
+            _turn_event(
+                phase="implementing",
+                error=message,
+                needs_github_login=bool(needs_login),
+                card_id=card_id,
+                project_id=row["project_id"],
+            ),
+        )
         publish(card_id, {"type": "done"})
         add_error_notification(row["project_id"], card_id, "implementing", message)
         await _drain_implement_queue(row["project_id"], cwd)
@@ -1398,7 +1542,16 @@ async def continue_qa_job(card_id: int, answers: dict, extra_notes: str, *, cwd:
         message = str(e)
         needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
-        publish(card_id, _turn_event(phase="qa_closing", error=message, needs_github_login=bool(needs_login)))
+        publish(
+            card_id,
+            _turn_event(
+                phase="qa_closing",
+                error=message,
+                needs_github_login=bool(needs_login),
+                card_id=card_id,
+                project_id=row["project_id"],
+            ),
+        )
         publish(card_id, {"type": "done"})
         add_error_notification(row["project_id"], card_id, "qa_closing", message)
         return

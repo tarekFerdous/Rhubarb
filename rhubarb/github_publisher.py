@@ -9,6 +9,7 @@ import json
 import re
 import subprocess
 from pathlib import Path
+from typing import Callable, Optional
 
 _ISSUE_URL_RE = re.compile(r"/issues/(\d+)\s*$")
 
@@ -17,7 +18,12 @@ class GithubPublishError(RuntimeError):
     pass
 
 
-def _create_issue(title: str, body: str, labels: list[str], *, cwd: str) -> tuple[int, str]:
+def create_issue(title: str, body: str, labels: list[str], *, cwd: str) -> tuple[int, str]:
+    """Create one GitHub issue via `gh issue create` and return its
+    `(number, title)`. Public (issue #154) so a caller like
+    `session_runner._run_publish_step` can drive the per-issue loop itself
+    -- or just pass an `on_progress` callback into `publish_draft` below,
+    which is built on top of this same function."""
     args = ["gh", "issue", "create", "--title", title, "--body", body]
     for label in labels:
         args += ["--label", label]
@@ -34,7 +40,31 @@ def _create_issue(title: str, body: str, labels: list[str], *, cwd: str) -> tupl
     return int(match.group(1)), title
 
 
-def publish_draft(draft_path: Path, cwd: str) -> str:
+# Backwards-compat alias -- `create_issue` used to be private (`_create_issue`).
+_create_issue = create_issue
+
+
+def publish_draft(
+    draft_path: Path,
+    cwd: str,
+    *,
+    on_progress: Optional[Callable[[dict], None]] = None,
+) -> str:
+    """Read `draft_path` and create the PRD issue, then each child issue in
+    `draft["issues"]`, via `create_issue()` above.
+
+    `on_progress` (issue #154), if given, is called synchronously right
+    after each issue is created -- once for the PRD
+    (`{"kind": "prd", "number": N, "title": ...}`) and once per child issue
+    (`{"kind": "issue", "number": N, "title": ...}`) -- so a caller can
+    observe progress mid-call instead of only seeing the final joined-string
+    summary this function still returns once everything is done. Omit it
+    (the default) to get exactly the old behavior.
+
+    Preserves every other existing behavior: the draft file is deleted via
+    `finally` regardless of outcome, and a failure on issue N is reported
+    with the already-created PRD's number folded into the message.
+    """
     draft_path = Path(draft_path)
 
     try:
@@ -45,12 +75,16 @@ def publish_draft(draft_path: Path, cwd: str) -> str:
     prd_number = None
     try:
         prd = draft["prd"]
-        prd_number, prd_title = _create_issue(prd["title"], prd["body"], prd.get("labels", []), cwd=cwd)
+        prd_number, prd_title = create_issue(prd["title"], prd["body"], prd.get("labels", []), cwd=cwd)
         lines = [f"PRD #{prd_number}: {prd_title}"]
+        if on_progress is not None:
+            on_progress({"kind": "prd", "number": prd_number, "title": prd_title})
 
         for issue in draft.get("issues", []):
-            issue_number, issue_title = _create_issue(issue["title"], issue["body"], issue.get("labels", []), cwd=cwd)
+            issue_number, issue_title = create_issue(issue["title"], issue["body"], issue.get("labels", []), cwd=cwd)
             lines.append(f"Issue #{issue_number}: {issue_title}")
+            if on_progress is not None:
+                on_progress({"kind": "issue", "number": issue_number, "title": issue_title})
 
         return "\n".join(lines)
     except GithubPublishError as e:

@@ -821,7 +821,7 @@ def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, 
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     monkeypatch.setattr(
-        session_runner, "publish_draft", lambda draft_path, cwd: "PRD #5: My PRD\nIssue #6: Child one"
+        session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #5: My PRD\nIssue #6: Child one"
     )
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
@@ -1079,7 +1079,7 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
     monkeypatch.setattr(
         session_runner,
         "publish_draft",
-        lambda draft_path, cwd: "PRD #5: My PRD\nIssue #6: Child one\nIssue #7: Child two",
+        lambda draft_path, cwd, on_progress=None: "PRD #5: My PRD\nIssue #6: Child one\nIssue #7: Child two",
     )
 
     # The grilling reply itself: no more questions -> stays in grilling and
@@ -1138,7 +1138,7 @@ def test_confirm_advance_runs_publishing_phase_with_no_extra_cli_calls(client, t
 
     seen_publish_calls = []
 
-    def fake_publish_draft(draft_path, cwd):
+    def fake_publish_draft(draft_path, cwd, on_progress=None):
         seen_publish_calls.append((draft_path, cwd))
         return "PRD #5: My PRD\nIssue #6: Child one"
 
@@ -1192,7 +1192,7 @@ def test_publish_draft_failure_stops_chain_with_error_turn(client, tmp_path, mon
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
-    def failing_publish_draft(draft_path, cwd):
+    def failing_publish_draft(draft_path, cwd, on_progress=None):
         raise GithubPublishError("gh: not logged in, run `gh auth login`")
 
     monkeypatch.setattr(session_runner, "publish_draft", failing_publish_draft)
@@ -1231,7 +1231,7 @@ def test_retry_on_publishing_phase_reruns_publisher_and_completes(client, tmp_pa
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
-    def failing_publish_draft(draft_path, cwd):
+    def failing_publish_draft(draft_path, cwd, on_progress=None):
         raise GithubPublishError("gh rate limited")
 
     monkeypatch.setattr(session_runner, "publish_draft", failing_publish_draft)
@@ -1242,7 +1242,7 @@ def test_retry_on_publishing_phase_reruns_publisher_and_completes(client, tmp_pa
     assert "gh rate limited" in row["error_text"]
 
     monkeypatch.setattr(
-        session_runner, "publish_draft", lambda draft_path, cwd: "PRD #9: Retried PRD\nIssue #10: Only child"
+        session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #9: Retried PRD\nIssue #10: Only child"
     )
 
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
@@ -1253,6 +1253,113 @@ def test_retry_on_publishing_phase_reruns_publisher_and_completes(client, tmp_pa
     details = json.loads(row["details_json"])
     assert details["prd"] == {"number": 9, "title": "Retried PRD"}
     assert details["issues"] == [{"number": 10, "title": "Only child"}]
+
+
+def test_run_publish_step_publishes_intermediate_event_after_each_issue(client, tmp_path, monkeypatch):
+    """Issue #154: `_run_publish_step` must publish a `turn` event carrying
+    a `status_message` right after the PRD issue is created ("PRD published
+    as #N") and right after each child issue is created ("Created issue
+    #N") -- observable mid-call on the session's live stream, not only in
+    the final aggregate result. Drives the real `publish_draft`/
+    `create_issue` path (only the `gh` subprocess call itself is faked),
+    exercising the actual production per-issue loop rather than mocking
+    `publish_draft` away entirely."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    claude_dir = Path(cwd) / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    draft = {
+        "prd": {"title": "My PRD", "body": "PRD body", "labels": ["ready-for-agent"]},
+        "issues": [
+            {"title": "Child one", "body": "Body one", "labels": []},
+            {"title": "Child two", "body": "Body two", "labels": []},
+        ],
+    }
+    (claude_dir / "prd_draft.json").write_text(json.dumps(draft), encoding="utf-8")
+
+    def fake_run(args, **kwargs):
+        if "My PRD" in args:
+            return type("Result", (), {"returncode": 0, "stdout": "https://github.com/x/y/issues/5\n", "stderr": ""})()
+        if "Child one" in args:
+            return type("Result", (), {"returncode": 0, "stdout": "https://github.com/x/y/issues/6\n", "stderr": ""})()
+        if "Child two" in args:
+            return type("Result", (), {"returncode": 0, "stdout": "https://github.com/x/y/issues/7\n", "stderr": ""})()
+        raise AssertionError(f"unexpected args {args}")
+
+    monkeypatch.setattr("rhubarb.github_publisher.subprocess.run", fake_run)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    row = db.get_session(conn, row_id)
+
+    ok = asyncio.run(session_runner._run_publish_step(row_id, conn, row, cwd=cwd))
+    assert ok is True
+
+    events = live_stream._buffers.get(row_id, [])
+    status_messages = [
+        e["status_message"]
+        for e in events
+        if e.get("type") == "turn" and e.get("phase") == "publishing" and e.get("status_message")
+    ]
+    assert status_messages == [
+        "PRD published as #5",
+        "Created issue #6",
+        "Created issue #7",
+    ]
+
+
+def test_run_chain_step_publishes_status_once_draft_files_are_written(client, tmp_path, monkeypatch):
+    """Issue #154: while a session is in `creating_prd`/`creating_issues`,
+    the user must see a status update once the corresponding draft content
+    was actually written to `.claude/prd_draft.json` -- not just a generic
+    spinner. `_run_chain_step` detects this by reading the draft file back
+    after each turn completes."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    claude_dir = Path(cwd) / ".claude"
+
+    def handler(prompt, **kw):
+        if prompt == "/rhubarb:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
+        if prompt == "/rhubarb:to-prd":
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            (claude_dir / "prd_draft.json").write_text(
+                json.dumps({"prd": {"title": "My PRD", "body": "b", "labels": []}}), encoding="utf-8"
+            )
+            return iter([_result_event("Wrote PRD draft.")])
+        if prompt == "/rhubarb:to-issues":
+            (claude_dir / "prd_draft.json").write_text(
+                json.dumps(
+                    {
+                        "prd": {"title": "My PRD", "body": "b", "labels": []},
+                        "issues": [
+                            {"title": "Child one", "body": "b1", "labels": []},
+                            {"title": "Child two", "body": "b2", "labels": []},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return iter([_result_event("Wrote issues draft.")])
+        return iter([_result_event("Implemented.")])
+
+    _mock_engine(monkeypatch, handler)
+    monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #5: My PRD\nIssue #6: Child one\nIssue #7: Child two")
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
+    events = live_stream._buffers.get(row_id, [])
+    status_by_phase = {
+        e["phase"]: e["status_message"]
+        for e in events
+        if e.get("type") == "turn" and e.get("status_message")
+    }
+    assert status_by_phase["creating_prd"] == "PRD draft written."
+    assert status_by_phase["creating_issues"] == "Issues draft written (2 issues)."
 
 
 @pytest.mark.parametrize(
@@ -1353,7 +1460,7 @@ def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypa
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
     monkeypatch.setattr(
-        session_runner, "publish_draft", lambda draft_path, cwd: "PRD #9: Retried PRD\nIssue #10: Only child"
+        session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #9: Retried PRD\nIssue #10: Only child"
     )
 
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
@@ -1476,7 +1583,7 @@ def test_retry_on_creating_prd_phase_is_unaffected_by_implement_branch(client, t
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
     monkeypatch.setattr(
-        session_runner, "publish_draft", lambda draft_path, cwd: "PRD #30: Regression PRD\nIssue #31: Only child"
+        session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #30: Regression PRD\nIssue #31: Only child"
     )
 
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
@@ -1780,7 +1887,7 @@ def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch)
     row_id = db.create_session(conn, project_a)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd_a))
 
-    monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd: "PRD #1: p\nIssue #2: i")
+    monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #1: p\nIssue #2: i")
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd_a, confirm_advance=True))
 
     row = db.get_session(conn, row_id)
@@ -3320,7 +3427,7 @@ def test_finish_chain_does_not_publish_minimize_and_still_starts_implementing(cl
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
-    monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd: "PRD #1: p\nIssue #2: i")
+    monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #1: p\nIssue #2: i")
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
@@ -3356,7 +3463,7 @@ def test_finish_chain_falls_back_to_pooling_when_no_prd_was_parsed(client, tmp_p
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
-    monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd: "no PRD/issue numbers in here at all")
+    monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "no PRD/issue numbers in here at all")
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 

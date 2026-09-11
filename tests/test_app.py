@@ -1,7 +1,7 @@
 import json
 import subprocess
 
-from rhubarb import afk_loop, db, ollama_installer, session_runner
+from rhubarb import afk_loop, db, error_log, ollama_installer, session_runner
 from rhubarb.web import app as app_module
 
 
@@ -762,6 +762,113 @@ def test_session_error_notifications_endpoint_round_trip(client, tmp_path):
     dismiss_resp = client.post(f"/api/projects/{project_id}/session-error-notifications/dismiss")
     assert dismiss_resp.json() == {"dismissed": True}
     assert client.get(f"/api/projects/{project_id}/session-error-notifications").json() == {"notifications": []}
+
+
+def test_project_errors_endpoint_returns_empty_list_when_log_file_missing(client, tmp_path, monkeypatch):
+    """Issue #155: before any error has ever been logged, the log file
+    doesn't exist yet -- the endpoint must return an empty list, not error."""
+    monkeypatch.setattr(error_log, "DEFAULT_LOG_PATH", tmp_path / "no-such-home" / "logs" / "errors.log")
+    project_id = _open_project(client, tmp_path, "proj")
+
+    resp = client.get(f"/api/projects/{project_id}/errors")
+    assert resp.status_code == 200
+    assert resp.json() == {"errors": []}
+
+
+def test_project_errors_endpoint_scopes_to_project(client, tmp_path, monkeypatch):
+    """Entries logged for a different project_id must never leak into this
+    project's response."""
+    monkeypatch.setattr(error_log, "DEFAULT_LOG_PATH", tmp_path / "err-home" / "logs" / "errors.log")
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "proj-a", "https://github.com/x/proj-a.git")
+    _init_repo(root / "proj-b", "https://github.com/x/proj-b.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    projects = {p["name"]: p["id"] for p in client.get("/api/app-state").json()["projects"]}
+    project_a, project_b = projects["proj-a"], projects["proj-b"]
+
+    error_log.log_error(project_id=project_a, card_id=1, phase="implementing", message="a broke")
+    error_log.log_error(project_id=project_b, card_id=2, phase="implementing", message="b broke")
+
+    resp_a = client.get(f"/api/projects/{project_a}/errors").json()
+    assert [e["message"] for e in resp_a["errors"]] == ["a broke"]
+
+    resp_b = client.get(f"/api/projects/{project_b}/errors").json()
+    assert [e["message"] for e in resp_b["errors"]] == ["b broke"]
+
+
+def test_project_errors_endpoint_filters_by_phase(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(error_log, "DEFAULT_LOG_PATH", tmp_path / "err-home" / "logs" / "errors.log")
+    project_id = _open_project(client, tmp_path, "proj")
+
+    error_log.log_error(project_id=project_id, card_id=1, phase="grilling", message="grill boom")
+    error_log.log_error(project_id=project_id, card_id=2, phase="implementing", message="impl boom")
+
+    resp = client.get(f"/api/projects/{project_id}/errors", params={"phase": "implementing"}).json()
+    assert [e["message"] for e in resp["errors"]] == ["impl boom"]
+
+
+def test_project_errors_endpoint_filters_by_card_id(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(error_log, "DEFAULT_LOG_PATH", tmp_path / "err-home" / "logs" / "errors.log")
+    project_id = _open_project(client, tmp_path, "proj")
+
+    error_log.log_error(project_id=project_id, card_id=1, phase="implementing", message="card one")
+    error_log.log_error(project_id=project_id, card_id=2, phase="implementing", message="card two")
+
+    resp = client.get(f"/api/projects/{project_id}/errors", params={"card_id": 2}).json()
+    assert [e["message"] for e in resp["errors"]] == ["card two"]
+
+
+def test_project_errors_endpoint_filters_by_free_text_search(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(error_log, "DEFAULT_LOG_PATH", tmp_path / "err-home" / "logs" / "errors.log")
+    project_id = _open_project(client, tmp_path, "proj")
+
+    error_log.log_error(project_id=project_id, card_id=1, phase="implementing", message="Disk was full")
+    error_log.log_error(project_id=project_id, card_id=2, phase="implementing", message="network timeout")
+
+    resp = client.get(f"/api/projects/{project_id}/errors", params={"q": "disk"}).json()
+    assert [e["message"] for e in resp["errors"]] == ["Disk was full"]
+
+
+def test_project_errors_endpoint_filters_by_date_range(client, tmp_path, monkeypatch):
+    """Uses direct JSONL writes (rather than `log_error`, whose timestamp is
+    always `now`) so the test can control each entry's timestamp precisely."""
+    log_path = tmp_path / "err-home" / "logs" / "errors.log"
+    monkeypatch.setattr(error_log, "DEFAULT_LOG_PATH", log_path)
+    project_id = _open_project(client, tmp_path, "proj")
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    entries = [
+        {"timestamp": "2026-01-01T00:00:00+00:00", "project_id": project_id, "card_id": 1, "phase": "implementing", "message": "too early"},
+        {"timestamp": "2026-02-01T00:00:00+00:00", "project_id": project_id, "card_id": 2, "phase": "implementing", "message": "in range"},
+        {"timestamp": "2026-03-01T00:00:00+00:00", "project_id": project_id, "card_id": 3, "phase": "implementing", "message": "too late"},
+    ]
+    with log_path.open("w", encoding="utf-8") as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + "\n")
+
+    resp = client.get(
+        f"/api/projects/{project_id}/errors",
+        params={"since": "2026-01-15T00:00:00+00:00", "until": "2026-02-15T00:00:00+00:00"},
+    ).json()
+    assert [e["message"] for e in resp["errors"]] == ["in range"]
+
+
+def test_project_errors_endpoint_combines_filters_with_and_semantics(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(error_log, "DEFAULT_LOG_PATH", tmp_path / "err-home" / "logs" / "errors.log")
+    project_id = _open_project(client, tmp_path, "proj")
+
+    error_log.log_error(project_id=project_id, card_id=1, phase="implementing", message="disk full")
+    error_log.log_error(project_id=project_id, card_id=2, phase="implementing", message="disk full")
+    error_log.log_error(project_id=project_id, card_id=2, phase="publishing", message="disk full")
+
+    resp = client.get(
+        f"/api/projects/{project_id}/errors",
+        params={"phase": "implementing", "card_id": 2, "q": "disk"},
+    ).json()
+    assert len(resp["errors"]) == 1
+    assert resp["errors"][0]["card_id"] == 2
+    assert resp["errors"][0]["phase"] == "implementing"
 
 
 def test_implement_reply_endpoint_reaches_continue_implement_job(client, tmp_path, monkeypatch):
