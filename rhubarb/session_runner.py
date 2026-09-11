@@ -213,6 +213,17 @@ def close_session(conn, card_id: int) -> None:
     publish(card_id, {"type": "closed", "card_id": card_id})
 
 
+def get_engine(card_id: int) -> PtyEngine | None:
+    """Return `card_id`'s resident `PtyEngine` tab, or `None` if there isn't
+    a live one -- the accessor the raw passthrough WebSocket endpoint
+    (`/ws/sessions/{card_id}/pty` in `rhubarb/web/app.py`, issue #165) uses
+    to find the engine to forward received bytes into, via its public
+    `write()` method. Read-only -- never creates, respawns, or otherwise
+    mutates `_pty_engines`, mirroring `get_engine_model_effort`'s own
+    "just look it up" shape."""
+    return _pty_engines.get(card_id)
+
+
 def get_engine_model_effort(card_id: int) -> tuple[str | None, str | None] | None:
     """Return the `(model, effort)` this card's resident `PtyEngine` was
     actually constructed with (issue #139) -- ground truth for the live
