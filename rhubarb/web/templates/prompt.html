@@ -91,7 +91,15 @@
     </div>
     </div>
     <div class="card middle">
-      <p class="console-title">Live Terminal</p>
+      <p class="console-title">
+        Live Terminal
+        <!-- Passthrough typing indicator (issue #167): flashed briefly by
+             flashPassthroughIndicator() whenever the user types straight into
+             the live CLI process while an automated turn is running, so the
+             accepted keystroke/turn interleaving risk (see PRD #162) is
+             visible rather than silent. -->
+        <span id="passthrough-indicator" class="passthrough-indicator" hidden>typing during automated turn</span>
+      </p>
       <div id="terminal-view" class="terminal-view"></div>
     </div>
     <div class="card right">
@@ -334,6 +342,7 @@
     const parallelImplementationWarningEl = document.getElementById("parallel-implementation-warning");
     const terminalViewHiddenToggleEl = document.getElementById("terminal-view-hidden-toggle");
     const terminalViewEl = document.getElementById("terminal-view");
+    const passthroughIndicatorEl = document.getElementById("passthrough-indicator");
     const ollamaEnabledToggleEl = document.getElementById("ollama-enabled-toggle");
     const ollamaToggleErrorEl = document.getElementById("ollama-toggle-error");
     const ollamaGateModalEl = document.getElementById("ollama-gate-modal");
@@ -594,6 +603,8 @@
       currentLeftSession = null;
       preQaLeftSession = null;
       refreshModelEffortCard();
+      turnInFlight = false;
+      syncPtySocket();
       rightCards.clear();
       backgroundSources.forEach((es) => es.close());
       backgroundSources.clear();
@@ -848,6 +859,8 @@
       activeProject = null;
       updatePolls();
       leftCardId = null;
+      turnInFlight = false;
+      syncPtySocket();
       currentLeftSession = null;
       rightCards.clear();
       resetPromptBox();
@@ -1179,6 +1192,12 @@
         // The respawned engine is now this card's ground truth -- refresh
         // right away so the card's selects (and a later re-render) show it.
         await refreshModelEffortCard();
+        // The old engine (and its passthrough socket's server-side end) is
+        // gone -- same card id, but a forced reconnect is needed since
+        // syncPtySocket's normal no-op check would otherwise leave the
+        // stale socket in place.
+        turnInFlight = false;
+        syncPtySocket({ force: true });
       } else {
         modelChangeTextEl.textContent =
           "This change takes effect starting with your next new session. Any session already in progress keeps using the model it started with.";
@@ -1206,6 +1225,9 @@
         effortChangeTextEl.textContent =
           "Applied immediately -- your current session's Live Terminal was restarted with the new effort.";
         await refreshModelEffortCard();
+        // See the identical comment in updateModel above.
+        turnInFlight = false;
+        syncPtySocket({ force: true });
       } else if (leftCardId !== null && !cardsWithTurn.has(leftCardId)) {
         // A left-card session that exists but hasn't received its first
         // turn yet (so has no live engine for the backend to have
@@ -1310,7 +1332,14 @@
     // (its own untold default is ~80 cols) makes those positions land in
     // the wrong place, corrupting the whole view (found in QA of #109/#110,
     // which widened the PTY itself without updating this to match).
-    const term = new Terminal({ convertEol: true, disableStdin: true, fontSize: 13, cols: 200, rows: 50 });
+    // disableStdin is false from the start (issue #167) -- unlike before
+    // passthrough existed, stdin is no longer toggled on only for the two
+    // curated-reply-mode states (see enableTerminalReplyInput/
+    // disableTerminalReplyInput below). Passthrough mode needs typed input
+    // live at all times a card is focused, not just those two states, so
+    // the on/off gating now happens entirely inside term.onData's own
+    // terminalReplySendFn check instead of at the xterm level.
+    const term = new Terminal({ convertEol: true, disableStdin: false, fontSize: 13, cols: 200, rows: 50 });
     term.open(document.getElementById("terminal-view"));
 
     // Responsive resize without touching the real terminal's size (issue
@@ -1365,23 +1394,26 @@
     new ResizeObserver(rescaleTerminalToFit).observe(document.getElementById("terminal-view"));
 
     // Terminal-as-alternate-reply-input (issue #130): a local line editor
-    // layered on top of the read-only terminal, NOT a raw PTY passthrough --
-    // typed text is only ever submitted through the exact same reply
-    // functions the structured answer box already calls (sendReply /
-    // sendImplementReply). Enabled only while the focused left card is in
-    // one of those two single-flat-text-reply states (see
-    // enableTerminalReplyInput's callers); disabled at every other time via
-    // showOnly(), which every other state transition already calls -- so a
-    // turn actively streaming, QA grilling's structured per-question
-    // answers, or any other state never has stdin enabled here, keeping
-    // this from ever colliding with an in-flight turn's captured PTY output.
+    // layered on top of the terminal, NOT a raw PTY passthrough -- typed
+    // text is only ever submitted through the exact same reply functions the
+    // structured answer box already calls (sendReply / sendImplementReply).
+    // `terminalReplySendFn` is set only while the focused left card is in one
+    // of those two single-flat-text-reply states (see
+    // enableTerminalReplyInput's callers), and cleared at every other time
+    // via showOnly(), which every other state transition already calls.
+    //
+    // Issue #167: this used to also gate the xterm-level `disableStdin`
+    // option (on only during those two states) -- now that raw passthrough
+    // mode exists as the default owner of typed input the rest of the time
+    // (see term.onData below), stdin stays enabled always, and
+    // `terminalReplySendFn` being set/unset is purely which branch of
+    // term.onData a keystroke falls into, curated vs. passthrough.
     let terminalReplySendFn = null;
     let terminalReplyBuffer = "";
 
     function enableTerminalReplyInput(sendFn) {
       terminalReplySendFn = sendFn;
       terminalReplyBuffer = "";
-      term.options.disableStdin = false;
       term.write("\r\n> ");
     }
 
@@ -1389,7 +1421,6 @@
       if (!terminalReplySendFn) return;
       terminalReplySendFn = null;
       terminalReplyBuffer = "";
-      term.options.disableStdin = true;
     }
 
     // Issue #143: give button-driven reply submission immediate loading
@@ -1489,35 +1520,158 @@
       sendFn(text, triggerBtn);
     }
 
+    // Mode coexistence (issue #167): a single term.onData handler, gated on
+    // `terminalReplySendFn` -- when it's set (the two curated-reply states:
+    // awaiting a grilling answer, or an implement-blocked answer -- see
+    // enableTerminalReplyInput's callers), curated mode owns the keystroke
+    // and returns before reaching the passthrough branch below. The rest of
+    // the time (including while an automated turn is actively running --
+    // deliberately not gated on that, see PRD #162), passthrough is simply
+    // the default owner of onData. Only one branch ever runs per keystroke,
+    // so the two modes never fight over the same input.
     term.onData((data) => {
-      if (!terminalReplySendFn) return;
-
-      if (data === "\r" || data === "\n") {
-        const text = terminalReplyBuffer;
-        const sendFn = terminalReplySendFn;
-        term.write("\r\n");
-        disableTerminalReplyInput();
-        if (text.trim()) sendFn(text, { disabled: false });
-        return;
-      }
-
-      if (data === "\x7f" || data === "\b") {
-        // Backspace/delete -- basic terminal actions only, no arrow-key or
-        // cursor-movement editing.
-        if (terminalReplyBuffer.length > 0) {
-          terminalReplyBuffer = terminalReplyBuffer.slice(0, -1);
-          term.write("\b \b");
+      if (terminalReplySendFn) {
+        if (data === "\r" || data === "\n") {
+          const text = terminalReplyBuffer;
+          const sendFn = terminalReplySendFn;
+          term.write("\r\n");
+          disableTerminalReplyInput();
+          if (text.trim()) sendFn(text, { disabled: false });
+          return;
         }
+
+        if (data === "\x7f" || data === "\b") {
+          // Backspace/delete -- basic terminal actions only, no arrow-key or
+          // cursor-movement editing.
+          if (terminalReplyBuffer.length > 0) {
+            terminalReplyBuffer = terminalReplyBuffer.slice(0, -1);
+            term.write("\b \b");
+          }
+          return;
+        }
+
+        // Ignore other control characters and escape sequences (arrow keys,
+        // Ctrl+C, etc.) -- only printable characters are accepted by this
+        // hand-rolled line editor.
+        if (data.length === 0 || data.charCodeAt(0) < 0x20 || data.startsWith("\x1b")) return;
+
+        terminalReplyBuffer += data;
+        term.write(data);
         return;
       }
 
-      // Ignore other control characters and escape sequences (arrow keys,
-      // Ctrl+C, etc.) -- only printable characters are accepted.
-      if (data.length === 0 || data.charCodeAt(0) < 0x20 || data.startsWith("\x1b")) return;
-
-      terminalReplyBuffer += data;
-      term.write(data);
+      // Passthrough mode: forward the raw keystroke as-is over the
+      // WebSocket into the live CLI process (issue #165) -- unlike curated
+      // mode above, nothing is filtered here (arrow keys, Ctrl+C, etc. are
+      // all legitimate raw terminal input); the PTY itself, not this code,
+      // is responsible for interpreting and echoing it back over the
+      // existing SSE stream.
+      if (turnInFlight) flashPassthroughIndicator();
+      sendPassthroughData(data);
     });
+
+    // --- Raw PTY passthrough WebSocket (issue #167) -----------------------
+    // Wires the terminal to the `/ws/sessions/{card_id}/pty` channel built in
+    // issue #165. Purely an input channel to whichever card is currently
+    // focused (`leftCardId`) -- all output still arrives the existing way,
+    // over the SSE stream's `terminal_output` events. Kept in sync with
+    // `leftCardId` at every place that variable changes (see the
+    // `syncPtySocket()` calls alongside `refreshModelEffortCard()` below,
+    // which already fires at exactly those same focus-change points).
+    let ptySocket = null;
+    let ptySocketCardId = null;
+    let ptyReconnectTimer = null;
+
+    function ptyWebSocketUrl(cardId) {
+      const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+      return `${scheme}//${window.location.host}/ws/sessions/${cardId}/pty`;
+    }
+
+    function closePtySocket() {
+      clearTimeout(ptyReconnectTimer);
+      ptyReconnectTimer = null;
+      if (ptySocket) {
+        const socket = ptySocket;
+        ptySocket = null;
+        socket.onclose = null;
+        socket.onerror = null;
+        try {
+          socket.close();
+        } catch (err) {
+          // Already closing/closed -- nothing to do.
+        }
+      }
+      ptySocketCardId = null;
+    }
+
+    // `force: true` (used after a model/effort change respawns the focused
+    // card's engine -- see updateModel/updateEffort) always reconnects even
+    // though `leftCardId` itself didn't change, since the old engine (and
+    // therefore the old socket's server-side connection) is gone. Otherwise
+    // a no-op whenever the same card is already connected/connecting.
+    function syncPtySocket({ force = false } = {}) {
+      if (leftCardId === null) {
+        closePtySocket();
+        return;
+      }
+
+      if (
+        !force &&
+        ptySocketCardId === leftCardId &&
+        ptySocket &&
+        (ptySocket.readyState === WebSocket.OPEN || ptySocket.readyState === WebSocket.CONNECTING)
+      ) {
+        return;
+      }
+
+      closePtySocket();
+      const cardId = leftCardId;
+      ptySocketCardId = cardId;
+      const socket = new WebSocket(ptyWebSocketUrl(cardId));
+      ptySocket = socket;
+
+      socket.onclose = () => {
+        if (ptySocket !== socket) return;
+        ptySocket = null;
+        // The card may not have a resident PtyEngine yet (e.g. a brand new
+        // session still on its first grilling turn) -- the server closes
+        // with 1008 in that case (see pty_passthrough). Retry once after a
+        // short delay instead of leaving passthrough permanently dead for
+        // the rest of this card's life; harmless if the card genuinely has
+        // no engine, since it'll just close the same way again.
+        ptyReconnectTimer = setTimeout(() => {
+          if (leftCardId === cardId) syncPtySocket();
+        }, 1500);
+      };
+      // onerror is followed by onclose in every browser, so the retry above
+      // covers both -- nothing extra needed here.
+    }
+
+    function sendPassthroughData(data) {
+      if (ptySocket && ptySocket.readyState === WebSocket.OPEN) {
+        ptySocket.send(data);
+      }
+    }
+
+    // Lightweight visual indicator (issue #167 acceptance criteria): tracks
+    // whether an automated turn is currently running for the focused card --
+    // true from the moment a reply/prompt is sent (sendReply,
+    // sendImplementReply, the initial start-form submit) until the next
+    // turn/phase/done event updates that same card (applyTurn and the
+    // phase/done handling in handleStreamEvent). Purely cosmetic: it only
+    // drives flashPassthroughIndicator() above and never gates or delays the
+    // passthrough write itself.
+    let turnInFlight = false;
+    let passthroughIndicatorTimer = null;
+
+    function flashPassthroughIndicator() {
+      if (!passthroughIndicatorEl) return;
+      passthroughIndicatorEl.hidden = false;
+      clearTimeout(passthroughIndicatorTimer);
+      passthroughIndicatorTimer = setTimeout(() => {
+        passthroughIndicatorEl.hidden = true;
+      }, 1500);
+    }
 
     let eventSource = null;
     const cardSnapshots = new Map(); // card_id -> latest {phase, interview, details, error, needs_github_login}
@@ -1640,6 +1794,8 @@
       const qaSnapshot = cardSnapshots.get(qaCardId);
       if (qaSnapshot) rightCards.set(qaCardId, qaSnapshot);
       leftCardId = null;
+      turnInFlight = false;
+      syncPtySocket();
       currentLeftSession = null;
       refreshModelEffortCard();
       resetPromptBox();
@@ -1662,6 +1818,10 @@
     function connectStream(cardId) {
       if (eventSource) eventSource.close();
       term.reset();
+      // Every caller here already set `leftCardId = cardId` first -- `force`
+      // makes this reconnect unconditionally (covers e.g. retryCard, where
+      // the previous engine may have just died and been replaced).
+      syncPtySocket({ force: true });
       const es = new EventSource(`/api/sessions/${cardId}/stream`);
       eventSource = es;
       es.onmessage = (e) => handleStreamEvent(cardId, es, JSON.parse(e.data));
@@ -1731,6 +1891,7 @@
       }
 
       if (event.type === "phase") {
+        turnInFlight = false;
         setHeading(headingForPhase(event.phase));
         // The do-to-implement handoff's own transition into "implementing"
         // (session_runner.start_implement_job) arrives as this raw `phase`
@@ -1757,6 +1918,10 @@
 
     function applyTurn(cardId, event) {
       cardsWithTurn.add(cardId);
+      // This event is a turn's actual response arriving for `cardId` --
+      // if that's the focused card, its automated turn is no longer in
+      // flight (issue #167's passthrough-typing indicator signal).
+      if (cardId === leftCardId) turnInFlight = false;
       const snapshot = {
         card_id: cardId,
         session_type: cardSessionTypes.get(cardId) || "do",
@@ -1810,6 +1975,8 @@
           if (bgEs) { backgroundSources.delete(cardId); eventSource = bgEs; }
 
           leftCardId = cardId;
+          turnInFlight = false;
+          syncPtySocket();
           currentLeftSession = snapshot;
           refreshModelEffortCard();
           startForm.style.display = "none";
@@ -1842,6 +2009,8 @@
 
         blockedTakeoverCardId = cardId;
         leftCardId = cardId;
+        turnInFlight = false;
+        syncPtySocket();
         currentLeftSession = snapshot;
         refreshModelEffortCard();
         startForm.style.display = "none";
@@ -1901,6 +2070,8 @@
       }
 
       leftCardId = null;
+      turnInFlight = false;
+      syncPtySocket();
       currentLeftSession = null;
       refreshModelEffortCard();
       resetPromptBox();
@@ -1923,6 +2094,8 @@
       rightCards.set(cardId, snapshot);
       if (leftCardId === cardId) {
         leftCardId = null;
+        turnInFlight = false;
+        syncPtySocket();
         currentLeftSession = null;
         refreshModelEffortCard();
         resetPromptBox();
@@ -2018,6 +2191,10 @@
 
     async function sendReply(replyText, triggerBtn) {
       if (!replyText.trim() || leftCardId === null) return;
+      // The automated grilling turn this reply kicks off is now in flight
+      // (issue #167's passthrough-typing indicator signal) until the next
+      // turn/phase/done event for this card clears it.
+      turnInFlight = true;
       const res = await fetch("/api/session/continue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2026,6 +2203,7 @@
       const data = await res.json();
 
       if (data.error) {
+        turnInFlight = false;
         showGrillingError(data.error);
       }
       // Otherwise, the reply's effect (next questions, or hand-off to the next
@@ -2058,6 +2236,7 @@
 
     async function sendImplementReply(replyText, triggerBtn) {
       if (!replyText.trim() || leftCardId === null) return;
+      turnInFlight = true;
       const res = await fetch(`/api/sessions/${leftCardId}/implement-reply`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2066,6 +2245,7 @@
       const data = await res.json();
 
       if (data.error) {
+        turnInFlight = false;
         showGrillingError(data.error);
       }
       // Otherwise, the reply's effect (re-blocked with a new question, or a
@@ -2078,6 +2258,7 @@
     async function sendConfirmAdvance(triggerBtn) {
       if (leftCardId === null) return;
       markButtonPending(triggerBtn);
+      turnInFlight = true;
       const res = await fetch("/api/session/continue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2086,6 +2267,7 @@
       const data = await res.json();
 
       if (data.error) {
+        turnInFlight = false;
         showGrillingError(data.error);
       }
       // Otherwise, the chain's effect (creating_prd, creating_issues, details)
@@ -2366,6 +2548,11 @@
     function renderLeftSession(session) {
       currentLeftSession = session;
       leftCardId = session.card_id;
+      turnInFlight = false;
+      // Not `syncPtySocket()` here -- every caller of renderLeftSession
+      // follows it with a connectStream(session.card_id) call, which force-
+      // reconnects the passthrough socket; doing it here too would just be
+      // an immediately-superseded connect/disconnect.
       refreshModelEffortCard();
 
       if (session.phase === "grilling") {
@@ -2527,6 +2714,7 @@
 
     async function retryCard(cardId) {
       await fetch(`/api/sessions/${cardId}/retry`, { method: "POST" });
+      turnInFlight = false;
       connectStream(cardId);
     }
 
@@ -2578,6 +2766,11 @@
         return;
       }
       leftCardId = data.card_id;
+      // The prompt just submitted is already this brand-new session's first
+      // grilling turn, in flight on the backend from this point on. (Not
+      // `syncPtySocket()` here -- the connectStream() call below force-
+      // reconnects the passthrough socket already.)
+      turnInFlight = true;
       currentLeftSession = { card_id: data.card_id, phase: "grilling", interview: { header: "", questions: [], footer: "" } };
       refreshModelEffortCard();
       lastRenderedQuestionFileContent = null;

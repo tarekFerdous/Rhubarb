@@ -893,6 +893,21 @@ textarea.prompt-box:focus {
   background: #000;
 }
 
+/* Passthrough typing indicator (issue #167) -- same small-pill shape as
+   .rescue-source-badge, same warning color as .modal-warning-text, so it
+   reads as "notice" rather than "error". Toggled via the `hidden` attribute,
+   not a CSS class, matching every other transient indicator in this file. */
+.passthrough-indicator {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(217, 119, 6, 0.15);
+  color: #b45309;
+  font-size: 0.7rem;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+
 /* xterm.js's own root element defaults to a content-driven height (tall
    enough for all 50 fixed rows, easily taller than this panel's actual
    flex-allotted space) unless explicitly bounded -- without this, that
