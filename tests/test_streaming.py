@@ -1,7 +1,12 @@
 import json
 
+import pytest
+from starlette.websockets import WebSocketDisconnect
+
 from rhubarb import live_stream, session_runner
+from rhubarb.pty_engine import PtyEngine
 from rhubarb.web import app as app_module
+from tests.test_pty_engine import FakePtyBackend
 
 
 async def _noop_job(*args, **kwargs):
@@ -155,3 +160,96 @@ def test_stream_session_replay_continues_past_an_earlier_done_from_a_retry(clien
     events = [json.loads(line[len("data:"):].strip()) for line in lines]
     assert events == live_stream._buffers[card_id]
     assert events[-1] == {"type": "done"}
+
+
+# ---------------------------------------------------------------------------
+# Raw passthrough WebSocket channel (issue #165, child of PRD #162) -- purely
+# additive alongside the SSE stream above; none of the tests in this section
+# touch `/api/sessions/{card_id}/stream` or its behavior.
+# ---------------------------------------------------------------------------
+
+
+def test_pty_passthrough_websocket_forwards_bytes_to_the_correct_cards_engine(client):
+    """Bytes sent over `/ws/sessions/{card_id}/pty` must reach that card's
+    resident PtyEngine's write path -- exercised here through a real
+    `PtyEngine` wired to a `FakePtyBackend` (the same fake used throughout
+    test_pty_engine.py), so this test goes through `PtyEngine.write` itself,
+    not a stand-in double."""
+    backend = FakePtyBackend([], eof_after=False)
+    engine = PtyEngine(pty_factory=lambda argv, *, cwd, env: backend)
+    engine.start()
+    session_runner.register_engine(555, engine)
+
+    with client.websocket_connect("/ws/sessions/555/pty") as ws:
+        ws.send_text("echo hello")
+
+    assert backend.writes == ["echo hello"]
+
+
+def test_pty_passthrough_websocket_forwards_multiple_frames_in_order(client):
+    backend = FakePtyBackend([], eof_after=False)
+    engine = PtyEngine(pty_factory=lambda argv, *, cwd, env: backend)
+    engine.start()
+    session_runner.register_engine(556, engine)
+
+    with client.websocket_connect("/ws/sessions/556/pty") as ws:
+        ws.send_text("a")
+        ws.send_text("b")
+        ws.send_text("c")
+
+    assert backend.writes == ["a", "b", "c"]
+
+
+def test_pty_passthrough_websocket_never_forwards_to_a_different_cards_engine(client):
+    """A frame sent to one card's socket must never reach another card's
+    engine -- the endpoint is scoped by the `card_id` path parameter."""
+    backend_1 = FakePtyBackend([], eof_after=False)
+    backend_2 = FakePtyBackend([], eof_after=False)
+    engine_1 = PtyEngine(pty_factory=lambda argv, *, cwd, env: backend_1)
+    engine_2 = PtyEngine(pty_factory=lambda argv, *, cwd, env: backend_2)
+    engine_1.start()
+    engine_2.start()
+    session_runner.register_engine(1, engine_1)
+    session_runner.register_engine(2, engine_2)
+
+    with client.websocket_connect("/ws/sessions/1/pty") as ws:
+        ws.send_text("only for card 1")
+
+    assert backend_1.writes == ["only for card 1"]
+    assert backend_2.writes == []
+
+
+def test_pty_passthrough_websocket_closes_immediately_for_a_card_with_no_live_engine(client):
+    """No resident engine for this card_id -- nothing to forward to, so the
+    connection is refused (closed with policy-violation code 1008) rather
+    than accepted and silently dropping input."""
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/ws/sessions/999999/pty"):
+            pass
+
+
+def test_pty_passthrough_websocket_does_not_affect_the_sse_stream_for_the_same_card(client):
+    """The passthrough channel is purely additive -- using it alongside the
+    existing SSE stream for the same card_id must not change what that
+    stream replays."""
+    card_id = 777
+    backend = FakePtyBackend([], eof_after=False)
+    engine = PtyEngine(pty_factory=lambda argv, *, cwd, env: backend)
+    engine.start()
+    session_runner.register_engine(card_id, engine)
+
+    live_stream.publish(card_id, {"type": "phase", "phase": "grilling"})
+    live_stream.publish(card_id, {"type": "done"})
+
+    with client.websocket_connect(f"/ws/sessions/{card_id}/pty") as ws:
+        ws.send_text("keystrokes")
+
+    with client.stream("GET", f"/api/sessions/{card_id}/stream") as response:
+        lines = [line for line in response.iter_lines() if line.startswith("data:")]
+
+    events = [json.loads(line[len("data:"):].strip()) for line in lines]
+    assert events == [
+        {"type": "phase", "phase": "grilling"},
+        {"type": "done"},
+    ]
+    assert backend.writes == ["keystrokes"]

@@ -5,7 +5,7 @@ import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -15,6 +15,7 @@ from rhubarb.cli_client import ClaudeCLIError, get_auth_status
 from rhubarb.folder_picker import pick_folder
 from rhubarb.prd_list import compute_prd_list
 from rhubarb.projects import scan_projects
+from rhubarb.pty_engine import PtyEngineError
 from rhubarb.qa_parser import parse_grilling_response
 from rhubarb.question_files import read_question_file
 from rhubarb.terminal import open_terminal_running
@@ -500,6 +501,50 @@ async def stream_session(card_id: int):
             live_stream.unsubscribe(card_id, queue)
 
     return StreamingResponse(event_source(), media_type="text/event-stream")
+
+
+@app.websocket("/ws/sessions/{card_id}/pty")
+async def pty_passthrough(websocket: WebSocket, card_id: int):
+    """Raw interactive passthrough channel (issue #165, child of PRD #162
+    "Add raw interactive passthrough mode to the Live Terminal"): accepts a
+    WebSocket connection scoped to a single card's resident `PtyEngine` and
+    forwards every text frame received over the socket straight into that
+    engine's write path (`PtyEngine.write`), byte for byte, exactly as a
+    person typing directly into the terminal would.
+
+    This is purely an input channel, additive alongside the existing SSE
+    stream (`GET /api/sessions/{card_id}/stream` above) -- it carries no
+    output of its own and does not touch, replace, or change that stream's
+    behavior in any way; a frontend still reads `terminal_output`/`result`
+    events from the SSE stream exactly as before. Frontend wiring that
+    actually opens this socket from `prompt.html` is issue #167, out of
+    scope here.
+
+    `PtyEngine.write` is guarded by the same `asyncio.Lock` the automated-
+    turn write loop (`_stream_chunks_until_marker`) holds for its entire
+    paced prompt write, so a passthrough write forwarded here can never
+    physically interleave its bytes with an in-flight automated turn's
+    writes into the same PTY, in either direction.
+
+    Closes immediately with code 1008 (policy violation) if `card_id` names
+    no live resident engine -- there's nothing to forward to. Ends quietly
+    (no error) on a normal client disconnect, or if the engine dies/closes
+    out from under an open connection (`PtyEngineError` from `write`)."""
+    engine = session_runner.get_engine(card_id)
+    if engine is None:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                await engine.write(data)
+            except PtyEngineError:
+                break
+    except WebSocketDisconnect:
+        pass
 
 
 @app.post("/api/session/start")

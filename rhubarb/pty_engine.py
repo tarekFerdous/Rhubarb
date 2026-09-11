@@ -450,6 +450,17 @@ class PtyEngine:
         self.claude_session_id: str = resume_session_id or str(uuid.uuid4())
         self._is_resume = resume_session_id is not None
 
+        # Guards every write to `self._proc` -- both the paced automated-turn
+        # prompt writes below (`_stream_chunks_until_marker`) and the public
+        # `write()` passthrough path (issue #165, raw interactive passthrough
+        # -- see PRD #162) -- so the two writers can never physically
+        # interleave bytes into the same PTY. `_stream_chunks_until_marker`
+        # holds this lock for its ENTIRE paced write (every chunk plus the
+        # trailing "\r"), not just per-chunk, precisely because a passthrough
+        # write landing in the gap between two paced chunks would already be
+        # byte-level interleaving from the PTY's point of view.
+        self._write_lock = asyncio.Lock()
+
     def _build_args(self) -> list[str]:
         args = ["claude", "--dangerously-skip-permissions"]
         args += _plugin_args()
@@ -520,13 +531,16 @@ class PtyEngine:
         every prompt regardless of length or content."""
         assert self._proc is not None
 
-        for start in range(0, len(prompt), _WRITE_CHUNK_SIZE):
-            text_chunk = prompt[start : start + _WRITE_CHUNK_SIZE]
-            await asyncio.to_thread(self._proc.write, text_chunk)
-            await asyncio.sleep(_WRITE_CHUNK_DELAY_SECONDS)
+        # Held for the whole paced sequence -- see `_write_lock`'s docstring
+        # in `__init__` for why per-chunk locking wouldn't be enough.
+        async with self._write_lock:
+            for start in range(0, len(prompt), _WRITE_CHUNK_SIZE):
+                text_chunk = prompt[start : start + _WRITE_CHUNK_SIZE]
+                await asyncio.to_thread(self._proc.write, text_chunk)
+                await asyncio.sleep(_WRITE_CHUNK_DELAY_SECONDS)
 
-        await asyncio.sleep(_WRITE_FINAL_DELAY_SECONDS)
-        await asyncio.to_thread(self._proc.write, "\r")
+            await asyncio.sleep(_WRITE_FINAL_DELAY_SECONDS)
+            await asyncio.to_thread(self._proc.write, "\r")
 
         buffer = ""
         while TURN_COMPLETE_MARKER not in buffer:
@@ -621,6 +635,28 @@ class PtyEngine:
         # their final plain text, same text `qa_parser.py` parses.
         print(f"[pty result]\n{clean_text}")
         yield {"type": "result", "result": clean_text, "session_id": self.claude_session_id, "is_error": False}
+
+    async def write(self, data: str) -> None:
+        """Public write path for raw interactive passthrough (issue #165,
+        child of PRD #162 -- "raw interactive passthrough mode"): forwards
+        `data` straight to the underlying PTY process, exactly as a person
+        typing directly into the terminal would produce, with no marker/
+        prompt handling of any kind layered on top.
+
+        Guarded by the same `_write_lock` the automated-turn write loop
+        (`_stream_chunks_until_marker`) holds for its entire paced prompt
+        write, so a passthrough write can never land in the middle of an
+        in-flight automated turn's chunks (or vice versa) -- whichever
+        writer gets the lock first completes its ENTIRE write before the
+        other's bytes reach the PTY. Neither writer's bytes are ever
+        physically interleaved into the underlying process's input stream.
+
+        Raises `PtyEngineError` if the process hasn't been started yet (or
+        was already closed) -- there is nothing to write to."""
+        if self._proc is None:
+            raise PtyEngineError("PtyEngine has not been started")
+        async with self._write_lock:
+            await asyncio.to_thread(self._proc.write, data)
 
     def isalive(self) -> bool:
         """Whether the underlying PTY process is still running -- False if

@@ -957,3 +957,107 @@ def test_close_terminates_a_live_process():
 def test_close_is_a_noop_when_never_started():
     engine = PtyEngine(pty_factory=lambda *a, **kw: FakePtyBackend([]))
     engine.close()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Public write() passthrough path and the shared write lock (issue #165)
+# ---------------------------------------------------------------------------
+
+
+def test_write_forwards_data_straight_to_the_backend():
+    backend = FakePtyBackend([], eof_after=False)
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+    engine.start()
+
+    run(engine.write("raw passthrough keystrokes"))
+
+    assert backend.writes == ["raw passthrough keystrokes"]
+
+
+def test_write_raises_if_the_engine_was_never_started():
+    engine = PtyEngine(pty_factory=lambda *a, **kw: FakePtyBackend([]))
+
+    with pytest.raises(PtyEngineError):
+        run(engine.write("x"))
+
+
+def test_write_raises_after_close():
+    backend = FakePtyBackend([], eof_after=False)
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+    engine.start()
+    engine.close()
+
+    with pytest.raises(PtyEngineError):
+        run(engine.write("x"))
+
+
+class _SignalingPtyBackend(FakePtyBackend):
+    """Same as `FakePtyBackend`, but sets `started_writing` the moment the
+    first write lands -- used below to deterministically let a concurrent
+    passthrough write attempt only AFTER the automated-turn write loop has
+    already acquired `_write_lock` and is mid-sequence (rather than racing
+    against a bare `asyncio.sleep`, which would be flaky)."""
+
+    def __init__(self, chunks, started_writing, *, eof_after=False):
+        super().__init__(chunks, eof_after=eof_after)
+        self._started_writing = started_writing
+
+    def write(self, data):
+        result = super().write(data)
+        if not self._started_writing.is_set():
+            self._started_writing.set()
+        return result
+
+
+def test_concurrent_passthrough_write_never_interleaves_with_paced_automated_write():
+    """Issue #165's core guarantee: a passthrough write arriving while an
+    automated turn's paced prompt write is in flight must never land in the
+    middle of that write's chunks -- it must be forced to wait for the
+    ENTIRE paced sequence (every chunk plus the trailing "\\r") to finish,
+    since anything else would physically interleave bytes into the same PTY
+    from the fake backend's point of view."""
+
+    async def scenario():
+        started_writing = asyncio.Event()
+        backend = _SignalingPtyBackend([TURN_COMPLETE_MARKER], started_writing)
+        factory, _ = _fake_factory(backend)
+        engine = PtyEngine(pty_factory=factory)
+        engine.start()
+
+        long_prompt = "x" * (pty_engine._WRITE_CHUNK_SIZE * 5)
+
+        async def run_turn():
+            return [event async for event in engine.stream_turn(long_prompt)]
+
+        async def run_passthrough():
+            # Wait until the automated write loop has already started (and
+            # therefore already holds `_write_lock`) before racing our own
+            # write in -- deterministic instead of a timing guess.
+            await started_writing.wait()
+            await engine.write("PASSTHROUGH")
+
+        await asyncio.gather(run_turn(), run_passthrough())
+        return backend.writes, long_prompt
+
+    writes, long_prompt = run(scenario())
+
+    passthrough_indices = [i for i, w in enumerate(writes) if w == "PASSTHROUGH"]
+    assert len(passthrough_indices) == 1
+
+    carriage_return_indices = [i for i, w in enumerate(writes) if w == "\r"]
+    assert len(carriage_return_indices) == 1
+
+    # The passthrough write started only once the automated write loop had
+    # already begun (and thus already held `_write_lock`), so it must land
+    # entirely AFTER the automated turn's whole paced sequence -- never
+    # spliced in between its chunks or between the last chunk and the
+    # trailing "\r".
+    assert passthrough_indices[0] > carriage_return_indices[0]
+
+    # Reconstructing everything up to (and including) the "\r" must
+    # reproduce the original prompt exactly, with no foreign bytes mixed in
+    # -- i.e. no corrupted/interleaved byte sequence.
+    prompt_writes = writes[: carriage_return_indices[0]]
+    assert "".join(prompt_writes) == long_prompt
