@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from rhubarb import db, live_stream, pty_engine, session_runner
+from rhubarb import db, error_log, live_stream, pty_engine, session_runner
 from rhubarb.cli_client import ClaudeCLIError
 from rhubarb.github_publisher import GithubPublishError
 from rhubarb.pty_engine import PtyEngineUnrecoverableError
@@ -2347,8 +2347,13 @@ def test_start_implement_job_uses_ollama_rescue_when_qa_regex_parser_finds_nothi
 def test_start_implement_job_skips_ollama_rescue_when_declined(client, tmp_path, monkeypatch):
     """Issue #119: with `ollama_declined` true, a QA handoff turn whose free
     text looks like it was trying to be a QA session but doesn't match the
-    strict regex format must NOT invoke the rescue function -- it falls back
-    to the parser's original (empty) issues, same as Ollama being unavailable."""
+    strict regex format must NOT invoke the Ollama rescue function.
+
+    Issue #159's corrective CLI retry is a separate mechanism from the
+    Ollama rescue and is never gated by `ollama_declined` -- it still fires
+    here (the malformed round is "suspicious"), and once that retry turn
+    produces a well-formed round, that becomes the final result instead of
+    the empty issues this scenario used to silently fall back to."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -2363,7 +2368,16 @@ def test_start_implement_job_skips_ollama_rescue_when_declined(client, tmp_path,
     (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
 
     malformed_qa_text = _QA_BLOCK + "\n\nQA session for PRD 7: this is malformed, no quoted title at all\n"
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_qa_text, session_id="qa-session-id")]))
+    well_formed_retry_text = 'QA session for PRD 7: "Tracked PRD"\n\nIssue 8: "Child"\nQuestion 1: "Does it work now?"\n'
+    calls = {"n": 0}
+
+    def handler(prompt, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return iter([_result_event(malformed_qa_text, session_id="qa-session-id")])
+        return iter([_result_event(well_formed_retry_text, session_id="qa-session-id-retry")])
+
+    _mock_engine(monkeypatch, handler)
 
     def fake_rescue(raw_text):
         raise AssertionError("rescue must not be called when ollama_declined is true")
@@ -2380,11 +2394,15 @@ def test_start_implement_job_skips_ollama_rescue_when_declined(client, tmp_path,
 
     asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
 
+    # Exactly one corrective retry turn -- not more.
+    assert calls["n"] == 2
+
     sessions = db.list_sessions_for_project(conn, project_id)
     qa_row = next(s for s in sessions if s["session_type"] == "qa")
+    assert qa_row["claude_session_id"] == "qa-session-id-retry"
     qa_events = live_stream._buffers.get(qa_row["id"], [])
     qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
-    assert qa_turn_events[0]["issues"] == []
+    assert qa_turn_events[0]["issues"][0]["questions"][0]["text"] == "Does it work now?"
 
 
 def test_start_implement_job_uses_ollama_rescue_when_not_declined(client, tmp_path, monkeypatch):
@@ -2429,6 +2447,197 @@ def test_start_implement_job_uses_ollama_rescue_when_not_declined(client, tmp_pa
     qa_events = live_stream._buffers.get(qa_row["id"], [])
     qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
     assert qa_turn_events[0]["issues"] == rescued["issues"]
+
+
+# ---------------------------------------------------------------------------
+# QA-grilling corrective-retry tests (issue #159 -- mirrors #158's grilling
+# corrective-retry tests, applied to the QA-grilling parse path instead)
+# ---------------------------------------------------------------------------
+
+
+def test_qa_corrective_retry_fires_once_and_uses_reformatted_result(client, tmp_path, monkeypatch):
+    """A QA handoff turn whose result contains recognizable QA-question-
+    attempt content (the "QA session for PRD" trigger) but doesn't parse,
+    and whose Ollama rescue attempt also comes back empty, must trigger
+    exactly one corrective follow-up turn -- handing the model its own
+    unparseable output back -- rather than silently handing off a QA
+    session with zero issues."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    tracker = {
+        "prd": {"number": 7, "title": "Tracked PRD"},
+        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
+        "qa_changes": [],
+        "status": "implemented",
+    }
+    claude_dir = Path(cwd) / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+
+    malformed_qa_text = _QA_BLOCK + "\n\nQA session for PRD 7: this is malformed, no quoted title at all\n"
+    well_formed_retry_text = (
+        'QA session for PRD 7: "Tracked PRD"\n\n'
+        'Issue 8: "Child"\n'
+        'Question 1: "Does the reformatted round parse now?"\n'
+    )
+    seen_prompts = []
+
+    def handler(prompt, **kw):
+        seen_prompts.append(prompt)
+        if len(seen_prompts) == 1:
+            return iter([_result_event(malformed_qa_text, session_id="qa-session-id")])
+        return iter([_result_event(well_formed_retry_text, session_id="qa-session-id-retry")])
+
+    _mock_engine(monkeypatch, handler)
+    # Ollama rescue is attempted (not declined) but comes back unavailable --
+    # the corrective retry is what actually rescues this round.
+    monkeypatch.setattr(session_runner, "rescue_qa_response", lambda raw_text: None)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    # Exactly one corrective retry -- the initial handoff turn, plus one
+    # follow-up, and no more.
+    assert len(seen_prompts) == 2
+    # The retry prompt hands the model its own broken output back.
+    assert malformed_qa_text in seen_prompts[1]
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    qa_row = next(s for s in sessions if s["session_type"] == "qa")
+    assert qa_row["claude_session_id"] == "qa-session-id-retry"
+    qa_events = live_stream._buffers.get(qa_row["id"], [])
+    qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
+    assert qa_turn_events[0]["issues"][0]["questions"][0]["text"] == "Does the reformatted round parse now?"
+
+
+def test_qa_no_retry_when_result_has_no_recognizable_qa_content(client, tmp_path, monkeypatch):
+    """A genuine 'no QA questions' handoff -- the qa_grilling JSON marker is
+    present, but neither the (nonexistent) question file nor the terminal
+    text contains anything resembling a QA session round -- must NOT trigger
+    any corrective retry. This is treated as done, same as today: a QA
+    session is still created with an empty issues list."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    tracker = {
+        "prd": {"number": 7, "title": "Tracked PRD"},
+        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
+        "qa_changes": [],
+        "status": "implemented",
+    }
+    claude_dir = Path(cwd) / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+
+    seen_prompts = []
+
+    def handler(prompt, **kw):
+        seen_prompts.append(prompt)
+        # Only the qa_grilling JSON marker -- no "QA session for PRD" prose
+        # at all, in either the terminal text or (absent) file.
+        return iter([_result_event(_QA_BLOCK, session_id="qa-session-id")])
+
+    _mock_engine(monkeypatch, handler)
+
+    def fake_rescue(raw_text):
+        raise AssertionError("rescue must not be called when there is nothing to rescue")
+
+    monkeypatch.setattr(session_runner, "rescue_qa_response", fake_rescue)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    # No corrective retry -- only the original handoff turn.
+    assert len(seen_prompts) == 1
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    qa_row = next(s for s in sessions if s["session_type"] == "qa")
+    assert qa_row["claude_session_id"] == "qa-session-id"
+    qa_events = live_stream._buffers.get(qa_row["id"], [])
+    qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
+    assert qa_turn_events[0]["issues"] == []
+
+    impl_row = db.get_session(conn, row_id)
+    assert impl_row["error_text"] is None
+
+
+def test_qa_corrective_retry_publishes_explicit_error_when_still_unparseable(client, tmp_path, monkeypatch):
+    """If the corrective retry's own result also fails to parse, an explicit
+    error must be published/persisted (and land in the app-wide error log)
+    instead of silently falling through to a QA session with empty issues."""
+    log_path = tmp_path / "err-home" / "logs" / "errors.log"
+    monkeypatch.setattr(error_log, "DEFAULT_LOG_PATH", log_path)
+
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    tracker = {
+        "prd": {"number": 7, "title": "Tracked PRD"},
+        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
+        "qa_changes": [],
+        "status": "implemented",
+    }
+    claude_dir = Path(cwd) / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+
+    malformed_qa_text = _QA_BLOCK + "\n\nQA session for PRD 7: this is malformed, no quoted title at all\n"
+    still_malformed_retry_text = "QA session for PRD 7: still no quoted title, still broken\n"
+    seen_prompts = []
+
+    def handler(prompt, **kw):
+        seen_prompts.append(prompt)
+        if len(seen_prompts) == 1:
+            return iter([_result_event(malformed_qa_text, session_id="qa-session-id")])
+        return iter([_result_event(still_malformed_retry_text, session_id="qa-session-id-retry")])
+
+    _mock_engine(monkeypatch, handler)
+    monkeypatch.setattr(session_runner, "rescue_qa_response", lambda raw_text: None)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    # Exactly one corrective retry -- not an unbounded loop.
+    assert len(seen_prompts) == 2
+
+    # No QA session was created -- the broken handoff is not silently
+    # passed through.
+    sessions = db.list_sessions_for_project(conn, project_id)
+    assert not [s for s in sessions if s["session_type"] == "qa"]
+
+    # The explicit error landed on the implement card's own stream.
+    impl_events = live_stream._buffers.get(row_id, [])
+    error_turn_events = [
+        e for e in impl_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling" and e.get("error")
+    ]
+    assert len(error_turn_events) == 1
+    assert impl_events[-1] == {"type": "done"}
+
+    # Persisted on the row, and landed in the app-wide error log too.
+    impl_row = db.get_session(conn, row_id)
+    assert impl_row["error_text"]
+
+    errors = error_log.query_errors(project_id, log_path=log_path)
+    assert any(e["phase"] == "qa_grilling" and e["card_id"] == row_id for e in errors)
 
 
 def test_start_implement_job_pools_session_normally_when_no_qa_block(client, tmp_path, monkeypatch):
