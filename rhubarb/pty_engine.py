@@ -114,6 +114,25 @@ already exists under that id server-side -- and resending the same prompt.
 If that retried turn ALSO dies the same way, `stream_turn` gives up rather
 than retrying again, and raises `PtyEngineUnrecoverableError` (see its
 docstring for the failure shape a future caller should key off of).
+
+## Live console trace (issue #160)
+
+There was previously no way to *watch* a PTY-driven turn happen short of
+attaching a live-terminal-view consumer to the `terminal_output` events, or
+waiting for the single `[pty result]` line `stream_turn` already printed
+once a turn finished. That makes an unattended run started with `python -m
+uvicorn rhubarb.web.app:app --reload` opaque while it's in flight, for
+every phase that goes through `PtyEngine` (grilling, creating_prd,
+creating_issues, implementing, qa, ...), not just grilling.
+
+`_stream_chunks_until_marker` now re-resolves the accumulated buffer-so-far
+through `_render_terminal_text` -- the exact same function that later
+produces `stream_turn`'s final `result` text -- after every single raw
+chunk it reads off the PTY, and prints that resolved state straight to this
+process's stdout. This is unconditional: no environment variable or config
+flag gates it, and it applies uniformly to every PTY-driven turn regardless
+of phase. It is purely a console side effect -- it changes nothing about
+what `_stream_chunks_until_marker`/`stream_turn` yield to callers.
 """
 
 import asyncio
@@ -476,6 +495,19 @@ class PtyEngine:
         want the turn's text strip it back out themselves, the same way
         `stream_turn` does for its `result` event below.
 
+        Live console trace (issue #160): after every raw chunk is folded
+        into the accumulated buffer, that buffer-so-far is re-resolved
+        through `_render_terminal_text` -- the SAME function `stream_turn`
+        uses to produce its final `result` text -- and printed to this
+        process's stdout. This is unconditional (no debug flag gates it)
+        and applies to every PTY-driven turn, for any phase (grilling,
+        creating_prd, creating_issues, implementing, qa, ...), not just
+        grilling -- so a person watching the console `python -m uvicorn
+        rhubarb.web.app:app --reload` runs in can see the interactive
+        session's screen resolve live, turn by turn, the same way a real
+        terminal watching the raw PTY stream would, without needing to
+        attach a separate live-terminal-view consumer.
+
         Raises `PtyEngineError` if the process ends first -- callers decide
         what to do with that (see `stream_turn`, which retries this once via
         `_restart_after_death` before giving up).
@@ -511,6 +543,7 @@ class PtyEngine:
                     )
                 continue
             buffer += chunk
+            print(f"[pty live]\n{_render_terminal_text(buffer)}")
             yield chunk
 
     async def stream_turn(self, prompt: str) -> AsyncIterator[dict]:

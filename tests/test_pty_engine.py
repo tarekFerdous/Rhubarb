@@ -590,6 +590,49 @@ def test_stream_turn_reproduces_the_production_corruption_pattern_gate_and_em_da
     assert 'Question 2: "Should this ship behind a flag?"' in result_text
 
 
+def test_stream_turn_prints_a_live_rendered_trace_for_every_chunk_read(monkeypatch, capsys):
+    """Issue #160: after every raw chunk is read off the PTY, the
+    accumulated buffer-so-far must be re-rendered through the SAME
+    `_render_terminal_text` function `stream_turn` uses to produce its
+    final `result` text, and printed to the console -- unconditionally, no
+    debug flag needed, for every phase (this test doesn't care which
+    phase -- `PtyEngine` has no notion of phase at all, so "applies to
+    every phase" just falls out of it applying to every turn)."""
+    chunks = ["Working", " on it...\n", f"Here you go.\n{TURN_COMPLETE_MARKER}\n"]
+    backend = FakePtyBackend(chunks)
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    calls = []
+    real_render = pty_engine._render_terminal_text
+
+    def counting_render(raw):
+        calls.append(raw)
+        return real_render(raw)
+
+    monkeypatch.setattr(pty_engine, "_render_terminal_text", counting_render)
+
+    run(_collect(engine.stream_turn("hi")))
+
+    # One live re-render per chunk read during the loop, plus the one
+    # existing final render (over the marker-stripped text) that already
+    # produces `result` -- i.e. exactly len(chunks) + 1 calls total, not
+    # just once at the end.
+    assert len(calls) == len(chunks) + 1
+
+    # Each live call saw the buffer accumulated so far, not just the latest
+    # chunk in isolation.
+    accumulated = ""
+    for expected_chunk, call_arg in zip(chunks, calls):
+        accumulated += expected_chunk
+        assert call_arg == accumulated
+
+    # And it was actually printed to the console, not just computed.
+    printed = capsys.readouterr().out
+    assert "Working on it..." in printed
+    assert "Here you go." in printed
+
+
 def test_stream_turn_terminal_output_events_still_carry_the_raw_unmodified_bytes():
     """The live-terminal-view consumer must keep receiving the exact raw
     PTY bytes, ANSI and all -- only the separate `result` text is resolved
