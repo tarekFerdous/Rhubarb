@@ -168,10 +168,21 @@ _MARKER_INSTRUCTION = (
 # large enough that a normal turn doesn't need many round trips.
 _READ_CHUNK = 4096
 
-# Virtual screen size for `_render_terminal_text`'s terminal emulation --
-# deliberately far larger than any real terminal Claude Code itself would
-# have been given, so a normal turn's output is never truncated and never
-# forced to re-wrap differently than the source terminal already did.
+# Virtual screen size for `_render_terminal_text`'s terminal emulation.
+# `_VIRTUAL_SCREEN_COLUMNS` is the DEFAULT column width only -- issue #166
+# (dynamic PTY resize) made the real PTY's width per-session state (see
+# `PtyEngine._cols` below, seeded from this default but changed at runtime
+# by `PtyEngine.resize()`), so `_render_terminal_text` now takes a
+# `columns` argument instead of always reading this module constant
+# directly; every call site inside `PtyEngine` passes `self._cols` so the
+# virtual re-render screen width can never drift from whatever the real
+# PTY was last resized to (see `resize()`'s docstring for how that
+# invariant is preserved). `_VIRTUAL_SCREEN_LINES` (the scrollback depth of
+# the virtual re-render, unrelated to the real PTY's row count) stays a
+# plain module constant -- deliberately far larger than any real terminal
+# Claude Code itself would have been given, so a normal turn's output is
+# never truncated and never forced to re-wrap differently than the source
+# terminal already did.
 _VIRTUAL_SCREEN_COLUMNS = 200
 _VIRTUAL_SCREEN_LINES = 4000
 
@@ -194,14 +205,18 @@ _WRITE_CHUNK_SIZE = 32
 _WRITE_CHUNK_DELAY_SECONDS = 0.02
 _WRITE_FINAL_DELAY_SECONDS = 0.05
 
-# Window size the real PTY itself is spawned with. `pywinpty`/`ptyprocess`
-# both default to a plain 80x24 if not told otherwise, which is narrow
-# enough that Claude Code word-wraps its own question/option text across
-# multiple physical lines -- breaking `qa_parser.py`'s single-line field
-# matching. `_PTY_COLUMNS` intentionally reuses `_VIRTUAL_SCREEN_COLUMNS`
-# (rather than a separately hardcoded number) so the real PTY's width and
-# `_render_terminal_text`'s virtual re-render screen width can never drift
-# out of sync with each other.
+# DEFAULT window size a new `PtyEngine` seeds itself with (issue #166: these
+# are no longer the only size a session ever runs at -- see `PtyEngine.__init__`'s
+# `rows`/`cols` parameters and `PtyEngine.resize()`, which make the real
+# per-session size mutable at runtime). `pywinpty`/`ptyprocess` both default
+# to a plain 80x24 if not told otherwise, which is narrow enough that Claude
+# Code word-wraps its own question/option text across multiple physical
+# lines -- breaking `qa_parser.py`'s single-line field matching.
+# `_PTY_COLUMNS` intentionally reuses `_VIRTUAL_SCREEN_COLUMNS` (rather than
+# a separately hardcoded number) so a freshly-constructed engine's real PTY
+# width and its `_render_terminal_text` virtual re-render screen width start
+# out equal; `resize()` is what keeps them equal from then on as either one
+# changes at runtime.
 _PTY_ROWS = 50
 _PTY_COLUMNS = _VIRTUAL_SCREEN_COLUMNS
 
@@ -265,7 +280,7 @@ def _strip_unadvancing_format_characters(raw: str) -> str:
     )
 
 
-def _render_terminal_text(raw: str) -> str:
+def _render_terminal_text(raw: str, columns: int = _VIRTUAL_SCREEN_COLUMNS) -> str:
     """Resolve `raw` -- true terminal-emulator input (ANSI escape codes,
     cursor movement, and all), exactly as a real PTY produced it -- to the
     plain text a person watching a real terminal would see once every
@@ -279,11 +294,19 @@ def _render_terminal_text(raw: str) -> str:
     the live `xterm.js` terminal view already renders this same raw stream
     correctly.
 
+    `columns` (issue #166) is the virtual screen's width -- every caller
+    inside this module passes the calling `PtyEngine`'s own `self._cols`,
+    the SAME number that engine's real PTY was last resized to (see
+    `PtyEngine.resize()`), so this virtual re-render can never drift out of
+    sync with the real terminal width that produced `raw` in the first
+    place. It defaults to `_VIRTUAL_SCREEN_COLUMNS` only so this function
+    remains callable on its own (e.g. in a test) without a `PtyEngine`.
+
     Only rows up to (and including) the one the cursor ended on are kept --
     `pyte.Screen.display` always returns exactly `_VIRTUAL_SCREEN_LINES`
     rows regardless of how much was actually written, and every row is
-    padded to `_VIRTUAL_SCREEN_COLUMNS` with spaces, so both are trimmed
-    back off to recover the real content and its original line count.
+    padded to `columns` with spaces, so both are trimmed back off to
+    recover the real content and its original line count.
 
     Before `raw` reaches pyte, two pyte parser/screen defects that
     otherwise corrupt or drop ordinary text are worked around --
@@ -293,7 +316,7 @@ def _render_terminal_text(raw: str) -> str:
     ordinary text/ANSI resolves exactly as already documented above."""
     raw = _desubparameterize_csi_sequences(raw)
     raw = _strip_unadvancing_format_characters(raw)
-    screen = pyte.Screen(_VIRTUAL_SCREEN_COLUMNS, _VIRTUAL_SCREEN_LINES)
+    screen = pyte.Screen(columns, _VIRTUAL_SCREEN_LINES)
     pyte.Stream(screen).feed(raw)
     rows = screen.display[: screen.cursor.y + 1]
     return "\n".join(row.rstrip() for row in rows)
@@ -354,24 +377,52 @@ class PtyBackend(Protocol):
 
     def terminate(self, force: bool = False) -> None: ...
 
+    def resize(self, rows: int, cols: int) -> None:
+        """Resize the underlying PTY's window size at runtime (issue #166:
+        dynamic PTY resize, so a live session's real terminal can be kept in
+        sync with the frontend xterm.js panel's actual pixel size instead of
+        staying fixed at whatever size it was first spawned with).
 
-def _spawn_winpty(argv: list[str], *, cwd: str | None, env: dict) -> PtyBackend:
+        Neither real backend names this method `resize` itself --
+        `winpty.PtyProcess` and `ptyprocess.PtyProcessUnicode` both expose
+        the equivalent as `setwinsize(rows, cols)` (`_spawn_winpty`/
+        `_spawn_unix_pty` below alias `.resize` to that method right after
+        spawning, so both conform to this Protocol without a wrapper
+        class)."""
+        ...
+
+
+def _spawn_winpty(
+    argv: list[str], *, cwd: str | None, env: dict, rows: int = _PTY_ROWS, cols: int = _PTY_COLUMNS
+) -> PtyBackend:
     """Real backend: spawn `argv` inside a Windows ConPTY via `pywinpty`.
 
     Imported lazily so importing this module (e.g. for tests, which always
     inject a fake `pty_factory`) never requires `pywinpty` to be installed
     on non-Windows dev/CI machines.
 
-    Passes an explicit `dimensions=` (see `_PTY_ROWS`/`_PTY_COLUMNS`)
-    instead of relying on `winpty.PtyProcess.spawn`'s own 80x24 default --
-    see those constants' docstring for why.
-    """
+    Passes an explicit `dimensions=` (`rows`/`cols`, defaulting to
+    `_PTY_ROWS`/`_PTY_COLUMNS` -- see those constants' docstring) instead of
+    relying on `winpty.PtyProcess.spawn`'s own 80x24 default. `PtyEngine`
+    passes its own current `self._rows`/`self._cols` here when it resolved
+    this function itself as the default backend (see `PtyEngine.__init__`
+    and `start()`); a directly-injected test `pty_factory` never calls this
+    function at all, so those defaults are what a direct unit test of this
+    function alone (no `PtyEngine` involved) exercises.
+
+    `winpty.PtyProcess` has no method literally named `resize` -- it's
+    aliased here, right after spawn, to the object's own `setwinsize`
+    (issue #166) so the returned object satisfies `PtyBackend.resize`."""
     import winpty
 
-    return winpty.PtyProcess.spawn(argv, cwd=cwd, env=env, dimensions=(_PTY_ROWS, _PTY_COLUMNS))
+    proc = winpty.PtyProcess.spawn(argv, cwd=cwd, env=env, dimensions=(rows, cols))
+    proc.resize = proc.setwinsize
+    return proc
 
 
-def _spawn_unix_pty(argv: list[str], *, cwd: str | None, env: dict) -> PtyBackend:
+def _spawn_unix_pty(
+    argv: list[str], *, cwd: str | None, env: dict, rows: int = _PTY_ROWS, cols: int = _PTY_COLUMNS
+) -> PtyBackend:
     """Real backend: spawn `argv` inside a standard Unix pty via
     `ptyprocess` (macOS/Linux).
 
@@ -385,13 +436,20 @@ def _spawn_unix_pty(argv: list[str], *, cwd: str | None, env: dict) -> PtyBacken
     on Windows dev/CI machines, and so this module stays importable there
     even though `ptyprocess` is a Unix-only package.
 
-    Passes an explicit `dimensions=` (see `_PTY_ROWS`/`_PTY_COLUMNS`)
-    instead of relying on `ptyprocess.PtyProcessUnicode.spawn`'s own 80x24
-    default -- see those constants' docstring for why.
-    """
+    Passes an explicit `dimensions=` (`rows`/`cols`, defaulting to
+    `_PTY_ROWS`/`_PTY_COLUMNS`) instead of relying on
+    `ptyprocess.PtyProcessUnicode.spawn`'s own 80x24 default -- see
+    `_spawn_winpty`'s docstring above for who actually supplies non-default
+    values.
+
+    `ptyprocess.PtyProcessUnicode` has no method literally named `resize`
+    either -- aliased here to its own `setwinsize`, same as `_spawn_winpty`
+    above."""
     import ptyprocess
 
-    return ptyprocess.PtyProcessUnicode.spawn(argv, cwd=cwd, env=env, dimensions=(_PTY_ROWS, _PTY_COLUMNS))
+    proc = ptyprocess.PtyProcessUnicode.spawn(argv, cwd=cwd, env=env, dimensions=(rows, cols))
+    proc.resize = proc.setwinsize
+    return proc
 
 
 def _default_pty_factory():
@@ -419,7 +477,16 @@ class PtyEngine:
     `pty_factory(argv, *, cwd, env) -> PtyBackend` is injectable so tests
     never spawn a real `claude` process; it defaults to
     `_default_pty_factory()`, which selects the right real backend for the
-    current platform automatically.
+    current platform automatically -- and, only in that default case, is
+    also called with `rows=`/`cols=` (see `start()`) so the two real
+    backends spawn at this engine's actual current size (issue #166).
+
+    `rows`/`cols` (issue #166) seed this session's PTY size -- per-instance
+    state now, not a fixed module-wide constant -- and can be changed at any
+    time via `resize()`, which also keeps `_render_terminal_text`'s virtual
+    re-render screen width (used by `stream_turn`'s `result` text and the
+    live console trace) in lockstep with whatever the real PTY was last
+    resized to.
 
     Mirrors `cli_client.stream_prompt`'s external shape on purpose: a
     prompt goes in, an async iterable of turn-event dicts comes out, and
@@ -438,11 +505,39 @@ class PtyEngine:
         effort: str | None = None,
         resume_session_id: str | None = None,
         pty_factory=None,
+        rows: int = _PTY_ROWS,
+        cols: int = _PTY_COLUMNS,
     ):
         self.cwd = cwd
         self.model = model
         self.effort = effort
-        self._pty_factory = pty_factory or _default_pty_factory()
+
+        # Per-session PTY size (issue #166) -- seeded from `_PTY_ROWS`/
+        # `_PTY_COLUMNS` by default, but no longer fixed for this engine's
+        # whole lifetime: `resize()` updates these at runtime, and `self._cols`
+        # is what every `_render_terminal_text` call below is resolved
+        # against, so the virtual re-render width tracks the real PTY width
+        # by construction -- there is only ever this one stored number, never
+        # a second copy that could drift out of sync with it.
+        self._rows = rows
+        self._cols = cols
+
+        # `pty_factory` is the test-injection seam: every existing caller
+        # (all of `tests/test_pty_engine.py`) passes an explicit fake here
+        # with the plain `(argv, *, cwd, env)` signature and expects it
+        # called with exactly that -- no `rows`/`cols` kwargs. Only when NO
+        # `pty_factory` is injected (real production use, and the
+        # `_default_pty_factory` selection tests) does `start()` below pass
+        # this engine's current `self._rows`/`self._cols` through, since only
+        # the two real backends (`_spawn_winpty`/`_spawn_unix_pty`) accept
+        # them.
+        if pty_factory is not None:
+            self._pty_factory = pty_factory
+            self._pty_factory_takes_dimensions = False
+        else:
+            self._pty_factory = _default_pty_factory()
+            self._pty_factory_takes_dimensions = True
+
         self._proc: PtyBackend | None = None
 
         # Known immediately -- see module docstring's "Session id" section --
@@ -476,12 +571,61 @@ class PtyEngine:
 
     def start(self) -> "PtyEngine":
         """Spawn (or, for a reattach, respawn) the PTY-backed `claude`
-        process. Idempotent no-op if already started."""
+        process. Idempotent no-op if already started.
+
+        Passes this engine's current `self._rows`/`self._cols` (issue #166)
+        to the factory ONLY when it's the real default backend selection
+        (see `__init__`'s `_pty_factory_takes_dimensions`) -- an injected
+        test `pty_factory` is always called with just `(argv, cwd, env)`,
+        matching every existing test's fake signature. Reading `self._rows`/
+        `self._cols` here (rather than snapshotting them in `__init__`)
+        means a `resize()` call made before this engine's first spawn --
+        or before a crash-triggered respawn via `_restart_after_death` --
+        is picked up: the fresh process comes up already sized to the
+        latest known size, not this engine's construction-time default."""
         if self._proc is not None:
             return self
         env = _clean_env()
-        self._proc = self._pty_factory(self._build_args(), cwd=self.cwd, env=env)
+        if self._pty_factory_takes_dimensions:
+            self._proc = self._pty_factory(
+                self._build_args(), cwd=self.cwd, env=env, rows=self._rows, cols=self._cols
+            )
+        else:
+            self._proc = self._pty_factory(self._build_args(), cwd=self.cwd, env=env)
         return self
+
+    def resize(self, rows: int, cols: int) -> None:
+        """Resize this session's PTY to `(rows, cols)` at runtime (issue
+        #166) -- called when the frontend's xterm.js fit-addon recomputes
+        the live-terminal panel's actual cols/rows (on load, and on every
+        panel resize) and signals the new size to the backend, so the REAL
+        pseudoterminal is resized to match what the user now sees, not just
+        the on-screen xterm.js buffer.
+
+        Always updates `self._rows`/`self._cols` first, even if no process
+        is currently running (nothing left to forward the resize to yet --
+        `start()` above will spawn at this new size instead) -- so a
+        `resize()` called between sessions, or right after a mid-turn crash
+        and before `_restart_after_death`'s respawn completes, is never
+        silently lost.
+
+        This is also what keeps `_render_terminal_text`'s virtual re-render
+        screen width in lockstep with the real PTY width: `stream_turn`/
+        `_stream_chunks_until_marker` always read `self._cols` fresh for
+        every render call (see their `_render_terminal_text(..., self._cols)`
+        calls below), so as soon as this method updates `self._cols`, the
+        very next render -- even one already in flight for the current
+        turn -- resolves against the new width. There is only ever this one
+        stored width, never a second copy that could drift out of sync with
+        it.
+
+        Forwards to the live backend's own `resize()` (see `PtyBackend.resize`)
+        only when a process is actually running; otherwise a no-op on the
+        process side, since there's no process to resize yet."""
+        self._rows = rows
+        self._cols = cols
+        if self._proc is not None:
+            self._proc.resize(rows, cols)
 
     def _restart_after_death(self) -> None:
         """Tear down the dead process and respawn once, reattaching via
@@ -557,7 +701,7 @@ class PtyEngine:
                     )
                 continue
             buffer += chunk
-            print(f"[pty live]\n{_render_terminal_text(buffer)}")
+            print(f"[pty live]\n{_render_terminal_text(buffer, self._cols)}")
             yield chunk
 
     async def stream_turn(self, prompt: str) -> AsyncIterator[dict]:
@@ -628,7 +772,7 @@ class PtyEngine:
                 ) from second_error
 
         text, _marker, _trailing = buffer.partition(TURN_COMPLETE_MARKER)
-        clean_text = _render_terminal_text(text)
+        clean_text = _render_terminal_text(text, self._cols)
         # Debug visibility into this turn's rendered (not raw) PTY output --
         # what a round of questions/options resolves to after
         # `_render_terminal_text` collapses ANSI/cursor-movement redraws to

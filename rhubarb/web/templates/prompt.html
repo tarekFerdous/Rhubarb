@@ -11,6 +11,12 @@
        <pre>. -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
   <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+  <!-- Fit addon (issue #166): recomputes cols/rows from the panel's actual
+       pixel size on resize, replacing the old fixed-200-column /
+       font-shrinking approach (see resizeTerminalToFit below). Same CDN,
+       version pinned to match xterm@5.3.0 (the last major xterm-addon-fit
+       line published under the unscoped package name). -->
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
 </head>
 <body>
   <div class="split">
@@ -1326,12 +1332,6 @@
     // card changes. Visible by default (no `hidden` toggling anywhere on
     // it) -- it's the middle card's only content now that the separate
     // plain-text Output panel has been removed (issue #131 QA follow-up).
-    // cols/rows must match pty_engine.py's _PTY_COLUMNS/_PTY_ROWS exactly --
-    // the raw PTY stream this renders carries absolute cursor-positioning
-    // escape codes computed against THAT width. A narrower xterm.js buffer
-    // (its own untold default is ~80 cols) makes those positions land in
-    // the wrong place, corrupting the whole view (found in QA of #109/#110,
-    // which widened the PTY itself without updating this to match).
     // disableStdin is false from the start (issue #167) -- unlike before
     // passthrough existed, stdin is no longer toggled on only for the two
     // curated-reply-mode states (see enableTerminalReplyInput/
@@ -1339,59 +1339,64 @@
     // live at all times a card is focused, not just those two states, so
     // the on/off gating now happens entirely inside term.onData's own
     // terminalReplySendFn check instead of at the xterm level.
-    const term = new Terminal({ convertEol: true, disableStdin: false, fontSize: 13, cols: 200, rows: 50 });
+    //
+    // No fixed `cols`/`rows` here (issue #166) -- the fit-addon below
+    // computes them from the panel's actual pixel size on open and on every
+    // resize, and signals the result to the backend PTY (see
+    // resizeTerminalToFit/sendPtyResize) so the two stay matched. This
+    // replaces the previous fixed-200-column buffer + font-shrinking
+    // approach (`rescaleTerminalToFit`, issue #131): that made the *real*
+    // PTY's width a fixed constant the frontend could only ever visually
+    // cram into whatever space was available (by shrinking `fontSize`,
+    // sometimes down to near-illegible sizes on a narrow panel) -- it never
+    // changed how many actual columns/rows either side believed the
+    // terminal had. `fit()` instead recomputes the true `cols`/`rows` for
+    // the current panel size at a fixed, legible font size, and the new
+    // resize-signaling endpoint (`POST /api/sessions/{card_id}/resize`)
+    // lets the backend's real PTY (and pyte's virtual re-render screen --
+    // see `pty_engine._render_terminal_text`'s `columns` parameter) track
+    // it exactly, instead of silently drifting out of sync with whatever
+    // the frontend buffer now shows.
+    const term = new Terminal({ convertEol: true, disableStdin: false, fontSize: 13 });
     term.open(document.getElementById("terminal-view"));
 
-    // Responsive resize without touching the real terminal's size (issue
-    // #131): `cols`/`rows` above stay fixed at 200x50, matching the backend
-    // PTY exactly (see the comment above) -- no resize signal is ever sent
-    // to it. Instead, xterm's own `fontSize` option is shrunk so the fixed
-    // 200-column buffer still fits within `.terminal-view`'s current width,
-    // never clipping and never needing a horizontal scrollbar.
-    //
-    // A CSS `transform: scale()` on the rendered element was tried first and
-    // reverted (QA on #131): `scrollWidth` -- what that approach measured to
-    // compute its scale factor -- reflects whatever content currently
-    // happens to be rendered (it shrinks for short lines), not the
-    // terminal's true fixed 200-column width, so the computed scale was
-    // wrong (over-shrinking, and leaving `.xterm-viewport`'s native
-    // scrollbar stranded well short of the panel's actual right edge --
-    // "the scrollbar is in the middle of the terminal"). Adjusting the real
-    // `fontSize` instead sidesteps that entirely: xterm recomputes its own
-    // cell/viewport/scrollbar geometry from the new size, and native font
-    // rendering at a smaller size is measurably crisper than the same
-    // visual size produced by scaling an already-rasterized 13px render.
-    const TERMINAL_BASE_FONT_SIZE = 13;
-    let terminalBaseCellWidthPx = null;
+    const fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
 
-    function rescaleTerminalToFit() {
-      const panel = document.getElementById("terminal-view");
+    // Debounced so a continuous panel drag-resize (many ResizeObserver
+    // callbacks in quick succession) doesn't fire one resize POST per
+    // frame -- only the settled final size is sent to the backend. `fit()`
+    // itself still runs on every callback (purely local/synchronous), so
+    // the on-screen buffer always tracks the panel live; only the
+    // network signal to the backend PTY is coalesced.
+    const TERMINAL_RESIZE_SIGNAL_DEBOUNCE_MS = 200;
+    let terminalResizeSignalTimer = null;
 
-      if (terminalBaseCellWidthPx === null) {
-        // `.xterm-char-measure-element` is xterm's own hidden element for
-        // measuring current font-metrics -- its width divided by its
-        // (fixed) character count gives the true per-column pixel width at
-        // the current font size, independent of whatever text has actually
-        // been written to the buffer. Measured once, while still at
-        // TERMINAL_BASE_FONT_SIZE (this function never runs before that,
-        // and only ever changes fontSize itself, so the first measurement
-        // is always at the base size); everything after this is pure
-        // proportional math, no remeasuring needed.
-        const measurer = document.querySelector("#terminal-view .xterm-char-measure-element");
-        if (!measurer || !measurer.textContent.length) return;
-        const cellWidthPx = measurer.getBoundingClientRect().width / measurer.textContent.length;
-        if (!cellWidthPx) return;
-        terminalBaseCellWidthPx = cellWidthPx;
-      }
-
-      const naturalWidth = terminalBaseCellWidthPx * 200; // cols
-      const paddingPx = 16; // .terminal-view's own 8px padding, both sides
-      const availableWidth = panel.clientWidth - paddingPx;
-      const scale = Math.min(1, availableWidth / naturalWidth);
-      term.options.fontSize = Math.max(4, TERMINAL_BASE_FONT_SIZE * scale);
+    function sendPtyResize(rows, cols) {
+      if (leftCardId === null) return;
+      fetch(`/api/sessions/${leftCardId}/resize`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rows, cols }),
+      }).catch(() => {
+        // Best-effort: on failure the backend PTY simply stays at its
+        // previous size until a later resize call succeeds. The frontend
+        // xterm.js buffer has already been resized locally either way.
+      });
     }
 
-    new ResizeObserver(rescaleTerminalToFit).observe(document.getElementById("terminal-view"));
+    function resizeTerminalToFit() {
+      fitAddon.fit();
+      clearTimeout(terminalResizeSignalTimer);
+      terminalResizeSignalTimer = setTimeout(() => {
+        sendPtyResize(term.rows, term.cols);
+      }, TERMINAL_RESIZE_SIGNAL_DEBOUNCE_MS);
+    }
+
+    // Fires once immediately (current panel size -- this is the "seeded
+    // from the panel's initial size" case) and again on every subsequent
+    // panel resize.
+    new ResizeObserver(resizeTerminalToFit).observe(document.getElementById("terminal-view"));
 
     // Terminal-as-alternate-reply-input (issue #130): a local line editor
     // layered on top of the terminal, NOT a raw PTY passthrough -- typed
@@ -1629,6 +1634,17 @@
       ptySocketCardId = cardId;
       const socket = new WebSocket(ptyWebSocketUrl(cardId));
       ptySocket = socket;
+
+      // Issue #166: the panel itself may not have changed size at all (no
+      // ResizeObserver callback fires just because focus moved to a
+      // different card), but the newly-focused card's own resident
+      // PtyEngine could still be sitting at its construction-time default
+      // size (or whatever size it last had before this card lost focus) --
+      // re-send the frontend's CURRENT already-fitted size every time focus
+      // lands on a (possibly different) card, so a card that never
+      // triggered its own resize event still gets its backend PTY
+      // synced to what the terminal view is actually showing.
+      sendPtyResize(term.rows, term.cols);
 
       socket.onclose = () => {
         if (ptySocket !== socket) return;
