@@ -3429,7 +3429,11 @@ def _capture_real_pty_spawns(monkeypatch):
     captured argvs, appended to in spawn order."""
     spawns = []
 
-    def fake_factory(argv, *, cwd, env):
+    def fake_factory(argv, *, cwd, env, **kwargs):
+        # `**kwargs` absorbs the `rows`/`cols` PtyEngine passes through to
+        # the real default-selected factory (issue #166, see
+        # `PtyEngine.start`) -- these tests only care about the argv a
+        # spawn was called with.
         spawns.append(argv)
         return _ArgvCapturingBackend()
 

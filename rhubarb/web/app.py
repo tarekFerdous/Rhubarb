@@ -547,6 +547,44 @@ async def pty_passthrough(websocket: WebSocket, card_id: int):
         pass
 
 
+@app.post("/api/sessions/{card_id}/resize")
+def resize_session_pty(card_id: int, body: dict):
+    """Dynamic PTY resize (issue #166): the frontend's xterm.js fit-addon
+    calls this whenever it recomputes the live-terminal panel's actual
+    cols/rows (on load, and on every panel resize -- see `resizeTerminalToFit`
+    in `prompt.html`) so the REAL pseudoterminal backing this card's
+    resident `PtyEngine` is resized to match, not just the on-screen
+    xterm.js buffer.
+
+    A plain HTTP endpoint rather than piggybacking on the raw passthrough
+    WebSocket (`/ws/sessions/{card_id}/pty`, issue #165) on purpose: that
+    channel is documented and built as a byte-for-byte passthrough straight
+    into the PTY's stdin, with no control-plane framing of any kind --
+    every frame it receives is forwarded to `PtyEngine.write()` verbatim.
+    Overloading it with a second, structured message shape would mean
+    inventing an escaping/framing scheme to tell a resize control message
+    apart from literal keystroke bytes (which can be arbitrary), and would
+    contradict that endpoint's own docstring ("carries no output of its
+    own" / "byte for byte"). A separate small endpoint keeps that channel's
+    contract exactly as simple as it already is.
+
+    A no-op (not an error) if `card_id` names no live resident engine --
+    a session can be resized before its first turn ever creates one (or
+    after it's already closed); there's simply nothing to resize yet, and
+    the size a session eventually spawns at is seeded from `PtyEngine`'s
+    own default (`_PTY_ROWS`/`_PTY_COLUMNS`) until a later resize call
+    lands against a live engine."""
+    rows = body["rows"]
+    cols = body["cols"]
+
+    engine = session_runner.get_engine(card_id)
+    if engine is None:
+        return {"resized": False}
+
+    engine.resize(rows, cols)
+    return {"resized": True, "rows": rows, "cols": cols}
+
+
 @app.post("/api/session/start")
 async def start_session(body: dict):
     project_id = _active_project_id

@@ -26,6 +26,14 @@ class FakePtyBackend:
     output arriving incrementally), then either raises EOFError (process
     exited) or returns "" forever (process still alive, nothing new yet)
     once exhausted, per `eof_after`.
+
+    `resize`/`setwinsize` (issue #166) both record every call into
+    `self.resizes` -- `setwinsize` is the name the two real backends
+    (`winpty.PtyProcess`, `ptyprocess.PtyProcessUnicode`) actually expose;
+    `resize` is the `PtyBackend` Protocol's own name, which `_spawn_winpty`/
+    `_spawn_unix_pty` alias to the real object's `setwinsize` right after
+    spawning (see their docstrings) -- defining both here the same way lets
+    this one fake stand in for either call path.
     """
 
     def __init__(self, chunks, *, eof_after=True):
@@ -34,6 +42,7 @@ class FakePtyBackend:
         self.writes = []
         self.terminated = False
         self.reads = 0
+        self.resizes = []
 
     def write(self, data):
         self.writes.append(data)
@@ -52,6 +61,12 @@ class FakePtyBackend:
 
     def terminate(self, force=False):
         self.terminated = True
+
+    def setwinsize(self, rows, cols):
+        self.resizes.append((rows, cols))
+
+    def resize(self, rows, cols):
+        self.setwinsize(rows, cols)
 
 
 def _fake_factory(backend):
@@ -606,9 +621,9 @@ def test_stream_turn_prints_a_live_rendered_trace_for_every_chunk_read(monkeypat
     calls = []
     real_render = pty_engine._render_terminal_text
 
-    def counting_render(raw):
+    def counting_render(raw, columns=pty_engine._VIRTUAL_SCREEN_COLUMNS):
         calls.append(raw)
-        return real_render(raw)
+        return real_render(raw, columns)
 
     monkeypatch.setattr(pty_engine, "_render_terminal_text", counting_render)
 
@@ -822,7 +837,12 @@ def test_engine_uses_platform_selected_factory_when_none_is_injected(monkeypatch
     without the caller having to know or care which OS it's running on."""
     sentinel_backend = FakePtyBackend([])
 
-    def fake_unix_factory(argv, *, cwd, env):
+    def fake_unix_factory(argv, *, cwd, env, **kwargs):
+        # `**kwargs` absorbs the `rows`/`cols` PtyEngine passes through to
+        # the real default-selected factory (issue #166, see
+        # `PtyEngine.start`) -- this test only cares that the platform
+        # selection itself resolved to `_spawn_unix_pty`, not what dims it
+        # was called with.
         return sentinel_backend
 
     monkeypatch.setattr(pty_engine.platform, "system", lambda: "Linux")
@@ -936,6 +956,152 @@ def test_unix_pty_backend_conforms_to_pty_backend_protocol_surface():
 
     assert "hi from unix" in events[-1]["result"]
     assert backend.writes == ["hello", "\r"]
+
+
+# ---------------------------------------------------------------------------
+# Dynamic PTY resize (issue #166): `PtyEngine.resize()` forwards to the live
+# backend, keeps `self._cols` (and therefore `_render_terminal_text`'s
+# virtual re-render screen width) in lockstep with the real PTY width, and
+# is picked up by a later spawn/respawn when made against the real
+# default-selected backend.
+# ---------------------------------------------------------------------------
+
+
+def test_resize_forwards_to_the_running_backends_resize_method():
+    backend = FakePtyBackend([], eof_after=False)
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+    engine.start()
+
+    engine.resize(30, 100)
+
+    assert backend.resizes == [(30, 100)]
+
+
+def test_resize_before_start_does_not_raise_and_updates_stored_dimensions():
+    """A resize signal can legitimately arrive before this card's engine has
+    ever spawned a process (or after it's died) -- must not raise, and must
+    still remember the new size for whenever a process does exist."""
+    engine = PtyEngine(pty_factory=lambda *a, **kw: FakePtyBackend([], eof_after=False))
+
+    engine.resize(10, 40)  # must not raise -- no process yet
+
+    assert engine._rows == 10
+    assert engine._cols == 40
+
+
+def test_resize_updates_stored_dimensions_used_by_a_later_start(monkeypatch):
+    """A resize made before `start()` is ever called must be honored by the
+    eventual spawn, not silently dropped in favor of this engine's
+    construction-time default -- verified against the REAL default-selected
+    factory (not an injected fake), since only that path threads `rows`/
+    `cols` through to the spawn call at all (see `PtyEngine.start`)."""
+    calls = {}
+
+    def fake_spawn(argv, *, cwd, env, rows=None, cols=None):
+        calls["rows"] = rows
+        calls["cols"] = cols
+        return FakePtyBackend([])
+
+    monkeypatch.setattr(pty_engine.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(pty_engine, "_spawn_unix_pty", fake_spawn)
+
+    engine = PtyEngine()
+    engine.resize(40, 140)
+    engine.start()
+
+    assert calls == {"rows": 40, "cols": 140}
+
+
+def test_resize_keeps_the_virtual_render_screen_width_in_lockstep_with_the_pty_width(monkeypatch):
+    """After a resize, every subsequent `_render_terminal_text` call this
+    engine makes (both the per-chunk live trace and the final `result`
+    render) must use the NEW column width, not the width this engine was
+    constructed with -- the whole point of storing a single `self._cols`
+    rather than two separately-tracked numbers (see `resize()`'s
+    docstring)."""
+    backend = FakePtyBackend([f"hi\n{TURN_COMPLETE_MARKER}\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+    engine.start()
+
+    engine.resize(30, 120)
+
+    seen_columns = []
+    real_render = pty_engine._render_terminal_text
+
+    def capturing_render(raw, columns=pty_engine._VIRTUAL_SCREEN_COLUMNS):
+        seen_columns.append(columns)
+        return real_render(raw, columns)
+
+    monkeypatch.setattr(pty_engine, "_render_terminal_text", capturing_render)
+
+    run(_collect(engine.stream_turn("hi")))
+
+    assert backend.resizes == [(30, 120)]
+    assert seen_columns  # at least one render call happened
+    assert all(columns == 120 for columns in seen_columns)
+
+
+def test_a_default_constructed_engine_seeds_its_dimensions_from_the_module_defaults():
+    engine = PtyEngine(pty_factory=lambda *a, **kw: FakePtyBackend([]))
+
+    assert engine._rows == pty_engine._PTY_ROWS
+    assert engine._cols == pty_engine._PTY_COLUMNS
+
+
+def test_spawn_winpty_aliases_resize_to_the_real_objects_setwinsize(monkeypatch):
+    """`winpty.PtyProcess` has no method literally named `resize` -- `_spawn_winpty`
+    must alias it to the real object's own `setwinsize` right after spawn so the
+    returned backend satisfies `PtyBackend.resize`."""
+    import sys
+    import types
+
+    class FakeWinptyProcess:
+        def __init__(self):
+            self.resizes = []
+
+        def setwinsize(self, rows, cols):
+            self.resizes.append((rows, cols))
+
+    class FakePtyProcess:
+        @classmethod
+        def spawn(cls, argv, cwd=None, env=None, dimensions=None):
+            return FakeWinptyProcess()
+
+    fake_module = types.SimpleNamespace(PtyProcess=FakePtyProcess)
+    monkeypatch.setitem(sys.modules, "winpty", fake_module)
+
+    backend = pty_engine._spawn_winpty(["claude"], cwd=None, env={})
+    backend.resize(50, 200)
+
+    assert backend.resizes == [(50, 200)]
+
+
+def test_spawn_unix_pty_aliases_resize_to_the_real_objects_setwinsize(monkeypatch):
+    """Same as the winpty case above, for `ptyprocess.PtyProcessUnicode`."""
+    import sys
+    import types
+
+    class FakeUnixProcess:
+        def __init__(self):
+            self.resizes = []
+
+        def setwinsize(self, rows, cols):
+            self.resizes.append((rows, cols))
+
+    class FakePtyProcessUnicode:
+        @classmethod
+        def spawn(cls, argv, cwd=None, env=None, dimensions=None):
+            return FakeUnixProcess()
+
+    fake_module = types.SimpleNamespace(PtyProcessUnicode=FakePtyProcessUnicode)
+    monkeypatch.setitem(sys.modules, "ptyprocess", fake_module)
+
+    backend = pty_engine._spawn_unix_pty(["claude"], cwd=None, env={})
+    backend.resize(50, 200)
+
+    assert backend.resizes == [(50, 200)]
 
 
 # ---------------------------------------------------------------------------
