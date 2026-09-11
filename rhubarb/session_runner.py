@@ -684,6 +684,116 @@ def _turn_event(
     }
 
 
+_GRILLING_CORRECTIVE_PROMPT_TEMPLATE = (
+    'Your last reply for this round of grilling questions did not parse -- '
+    'it did not match the required `Question N: "..."` format (with '
+    "`Options:`/`Option N:`/`Recommended:` for a choice question, or "
+    "`Recommended text:` for an open one), so Rhubarb could not render it. "
+    "Here is exactly what you sent, unparsed:\n\n"
+    "-----\n{broken_output}\n-----\n\n"
+    "Please rewrite this same round's questions in the exact required "
+    "format described in your grilling instructions, and write the "
+    "rewritten `Question N:` blocks to `.claude/rhubarb_question.md` again "
+    "(overwriting it), exactly as you would for any other round -- do not "
+    "ask any new questions, just reformat the ones above."
+)
+
+
+def _grilling_result_is_suspicious(parsed: dict, file_text: str | None, terminal_text: str) -> bool:
+    """True when this round's parsed result came back with no questions, but
+    either the question file's raw content (captured before
+    `_run_grilling_turn` drops it for being unparseable) or the raw terminal
+    text looks like it was trying to contain questions -- issue #158's
+    extension of `should_attempt_grilling_rescue`'s own trigger check (the
+    `"question "` substring) to both sources, rather than terminal text
+    alone as the pre-existing Ollama-rescue check above does. Never true
+    for a genuine "no more questions" wrap-up turn, since that contains the
+    trigger substring in neither source."""
+    if should_attempt_grilling_rescue(parsed, terminal_text):
+        return True
+    return file_text is not None and should_attempt_grilling_rescue(parsed, file_text)
+
+
+async def _run_grilling_corrective_retry(
+    card_id: int,
+    conn,
+    row,
+    *,
+    broken_output: str,
+    session_id: str,
+    cwd: str | None,
+    model: str | None,
+    effort: str | None,
+) -> tuple[dict, dict] | None:
+    """Issue #158: a one-shot corrective follow-up turn for when
+    `_run_grilling_turn`'s existing file/terminal-text/Ollama-rescue chain
+    still leaves `parsed["questions"]` empty on a result that looks like it
+    was trying to contain questions (see `_grilling_result_is_suspicious`)
+    rather than a genuine wrap-up. Hands the model `broken_output` -- its
+    own unparseable output from the round just run -- back verbatim, states
+    plainly that it didn't parse, and asks it to rewrite that same round's
+    questions in the exact required format.
+
+    Returns `(turn, parsed)` once the corrective turn completes -- `parsed`
+    may still have empty `questions` if the corrective retry *also* failed
+    to produce something parseable; the caller decides what to do with
+    that (this function makes no second attempt). Returns `None` when the
+    retry turn could not be run to completion at all: a crash (routed to
+    the blocked-card flow, same as any other grilling turn's crash), a
+    genuine CLI error (persisted/published as this session's error, same
+    shape as `_run_grilling_turn`'s own `ClaudeCLIError` branch), or a
+    lock-busy no-op (`_run_turn` has already published that error itself).
+    In every `None` case the error has already been fully handled/published
+    here or upstream -- the caller must stop immediately without publishing
+    or persisting anything further of its own."""
+    prompt = _GRILLING_CORRECTIVE_PROMPT_TEMPLATE.format(broken_output=broken_output)
+    try:
+        turn = await _run_turn(
+            card_id,
+            prompt,
+            session_id=session_id,
+            cwd=cwd,
+            model=model,
+            effort=effort,
+            phase="grilling",
+        )
+    except PtyEngineUnrecoverableError as e:
+        await _route_crash_to_blocked(card_id, conn, e, phase="grilling")
+        return None
+    except ClaudeCLIError as e:
+        _close_engine(card_id)
+        message = str(e)
+        db.update_session(
+            conn, card_id, model=model, effort=effort, error_text=message, needs_github_login=0
+        )
+        publish(
+            card_id,
+            _turn_event(
+                phase="grilling",
+                error=message,
+                needs_github_login=False,
+                card_id=card_id,
+                project_id=row["project_id"],
+            ),
+        )
+        return None
+
+    if turn is None:
+        # Issue #144/#149: lock busy -- `_run_turn` already published the
+        # duplicate-call error itself.
+        return None
+
+    file_text = read_question_file(cwd, _GRILLING_QUESTION_FILE)
+    parsed = parse_grilling_response(file_text) if file_text is not None else None
+    if file_text is not None and not parsed["questions"]:
+        delete_question_file(cwd, _GRILLING_QUESTION_FILE)
+        parsed = None
+    if parsed is None:
+        parsed = parse_grilling_response(turn["result"])
+
+    return turn, parsed
+
+
 async def _run_grilling_turn(
     card_id: int,
     conn,
@@ -780,6 +890,75 @@ async def _run_grilling_turn(
         if rescued is not None:
             parsed = rescued
     console_text = row["console_text"] + "\n\n" + turn["result"] if row["console_text"] else turn["result"]
+
+    if not parsed["questions"] and _grilling_result_is_suspicious(parsed, file_text, turn["result"]):
+        # Issue #158: the file and/or terminal text looked like it was
+        # trying to contain questions, but nothing in the fallback chain
+        # above (file -> terminal text -> Ollama rescue) managed to parse
+        # any -- this is not a genuine "no more questions" wrap-up. Give the
+        # model exactly one corrective follow-up turn with its own broken
+        # output handed back, rather than silently treating this as done.
+        broken_output = file_text if file_text is not None else turn["result"]
+        retry_outcome = await _run_grilling_corrective_retry(
+            card_id,
+            conn,
+            row,
+            broken_output=broken_output,
+            session_id=turn["session_id"],
+            cwd=cwd,
+            model=model,
+            effort=effort,
+        )
+        if retry_outcome is None:
+            # Already fully handled (a crash routed to the blocked-card
+            # flow, a genuine CLI error published/persisted, or a
+            # lock-busy no-op) -- nothing further to do here.
+            return None
+
+        retry_turn, retry_parsed = retry_outcome
+        console_text = console_text + "\n\n" + retry_turn["result"]
+
+        if not retry_parsed["questions"]:
+            # The corrective retry also failed to produce anything
+            # parseable -- stop trying automatically. Publish/persist an
+            # explicit error through the same `_turn_event` path every
+            # other grilling error already uses (which also feeds the
+            # app-wide error log, see `error_log.log_error`), instead of
+            # falling back to the generic "ready to proceed?" wrap-up gate
+            # -- that gate would misrepresent a parse failure as grilling
+            # being genuinely done.
+            message = (
+                "This grilling round's questions did not parse, and a "
+                "corrective retry asking the model to reformat them also "
+                "failed to produce parseable questions. Stopping "
+                "automatically rather than risk silently treating this as "
+                "\"no more questions\"."
+            )
+            db.update_session(
+                conn,
+                card_id,
+                model=model,
+                effort=effort,
+                claude_session_id=retry_turn["session_id"],
+                console_text=console_text,
+                error_text=message,
+                needs_github_login=0,
+            )
+            publish(
+                card_id,
+                _turn_event(
+                    phase="grilling",
+                    error=message,
+                    needs_github_login=False,
+                    card_id=card_id,
+                    project_id=row["project_id"],
+                ),
+            )
+            return None
+
+        turn = retry_turn
+        parsed = retry_parsed
+
     db.update_session(
         conn,
         card_id,

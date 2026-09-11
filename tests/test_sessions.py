@@ -712,34 +712,55 @@ def test_grilling_turn_does_not_use_ollama_rescue_on_a_genuine_wrap_up(client, t
 
 def test_grilling_turn_falls_back_to_empty_result_when_ollama_rescue_returns_none(client, tmp_path, monkeypatch):
     """When Ollama is unavailable/times out/returns something invalid
-    (modeled here as rescue_grilling_response returning None), the turn
-    must fall back to the original empty parsed result, not crash."""
+    (modeled here as rescue_grilling_response returning None), the turn must
+    not crash. Issue #158: since the raw text still looks like it was
+    trying to contain questions, this no longer just silently falls back to
+    an empty parsed result -- a corrective retry runs, and since (in this
+    test) it comes back equally unparseable, an explicit error is
+    published/persisted instead of a bare empty interview."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     malformed_text = 'Question 1: unterminated, no closing quote\n'
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_text)]))
+    calls = []
+
+    def handler(prompt, **kw):
+        calls.append(prompt)
+        return iter([_result_event(malformed_text, session_id=f"s{len(calls)}")])
+
+    _mock_engine(monkeypatch, handler)
     monkeypatch.setattr(session_runner, "rescue_grilling_response", lambda raw_text: None)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
+    assert len(calls) == 2
+
     row = db.get_session(conn, row_id)
-    interview = json.loads(row["interview_json"])
-    assert interview["questions"] == []
+    assert row["error_text"] is not None
 
 
 def test_grilling_turn_skips_ollama_rescue_when_declined(client, tmp_path, monkeypatch):
     """Issue #119: with `ollama_declined` true, a turn whose regex parse is
     empty and whose raw text contains the trigger substring must NOT invoke
     the rescue function -- the toggle must actually gate the rescue call,
-    not just the install-gate modal's own display logic."""
+    not just the install-gate modal's own display logic. Issue #158: the
+    decline toggle only gates the Ollama rescue call, not the separate
+    corrective-retry mechanism -- that still fires, and since (in this test)
+    its result is equally unparseable, ends in an explicit error rather
+    than a silently empty interview."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     malformed_text = 'Question 1: The quote never closes, so the regex parser finds nothing here.\n'
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_text)]))
+    calls = []
+
+    def handler(prompt, **kw):
+        calls.append(prompt)
+        return iter([_result_event(malformed_text, session_id=f"s{len(calls)}")])
+
+    _mock_engine(monkeypatch, handler)
 
     def fake_rescue(raw_text):
         raise AssertionError("rescue must not be called when ollama_declined is true")
@@ -751,9 +772,10 @@ def test_grilling_turn_skips_ollama_rescue_when_declined(client, tmp_path, monke
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
+    assert len(calls) == 2
+
     row = db.get_session(conn, row_id)
-    interview = json.loads(row["interview_json"])
-    assert interview["questions"] == []
+    assert row["error_text"] is not None
 
 
 def test_grilling_turn_uses_ollama_rescue_when_not_declined(client, tmp_path, monkeypatch):
@@ -789,6 +811,124 @@ def test_grilling_turn_uses_ollama_rescue_when_not_declined(client, tmp_path, mo
     row = db.get_session(conn, row_id)
     interview = json.loads(row["interview_json"])
     assert interview == rescued
+
+
+# ---------------------------------------------------------------------------
+# Corrective retry for a grilling round that failed to parse (issue #158)
+# ---------------------------------------------------------------------------
+
+
+def test_grilling_turn_corrective_retry_fires_on_suspicious_unparseable_result(client, tmp_path, monkeypatch):
+    """A round whose terminal text looks like it was trying to contain
+    questions (contains "Question "), but which the whole existing fallback
+    chain (file -> terminal text -> Ollama rescue) still fails to parse,
+    must trigger exactly one corrective follow-up turn: the model is handed
+    its own broken output back and asked to reformat it. When that
+    corrective turn comes back parseable, its questions -- not the generic
+    "ready to proceed?" wrap-up -- are what gets published/persisted."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    malformed_text = 'Question 1: the quote never closes, so the regex parser finds nothing here.\n'
+    calls = []
+
+    def handler(prompt, **kw):
+        calls.append(prompt)
+        if "did not parse" in prompt:
+            assert malformed_text in prompt
+            return iter([_result_event('Question 1: "Reformatted question?"', session_id="s2")])
+        return iter([_result_event(malformed_text, session_id="s1")])
+
+    _mock_engine(monkeypatch, handler)
+    monkeypatch.setattr(session_runner, "rescue_grilling_response", lambda raw_text: None)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    assert len(calls) == 2, "expected exactly one corrective retry turn, in addition to the original"
+
+    row = db.get_session(conn, row_id)
+    assert row["error_text"] is None
+    assert row["claude_session_id"] == "s2"
+    interview = json.loads(row["interview_json"])
+    assert interview["questions"][0]["text"] == "Reformatted question?"
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e["type"] == "turn"]
+    assert len(turn_events) == 1
+    assert turn_events[0]["interview"]["questions"][0]["text"] == "Reformatted question?"
+    assert turn_events[0]["error"] is None
+
+
+def test_grilling_turn_no_corrective_retry_on_a_genuine_wrap_up(client, tmp_path, monkeypatch):
+    """A genuine "grilling is done" wrap-up (no "Question " substring at all,
+    in either the file or the terminal text) must NOT trigger any corrective
+    retry -- it's treated as done, same as before issue #158."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    calls = []
+
+    def handler(prompt, **kw):
+        calls.append(prompt)
+        return iter([_result_event("Thanks, that's everything I need.")])
+
+    _mock_engine(monkeypatch, handler)
+
+    def fail_retry(*args, **kwargs):
+        raise AssertionError("corrective retry must not run on a genuine wrap-up")
+
+    monkeypatch.setattr(session_runner, "_run_grilling_corrective_retry", fail_retry)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    assert len(calls) == 1
+
+    row = db.get_session(conn, row_id)
+    assert row["error_text"] is None
+    interview = json.loads(row["interview_json"])
+    assert interview["questions"] == []
+
+
+def test_grilling_turn_corrective_retry_failure_publishes_explicit_error(client, tmp_path, monkeypatch):
+    """When the corrective retry's own result also fails to parse, the
+    session must stop automatically with an explicit, persisted/published
+    error -- never the generic "ready to proceed?" gate a genuine empty
+    wrap-up would show."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    malformed_text = 'Question 1: still no closing quote here either\n'
+    calls = []
+
+    def handler(prompt, **kw):
+        calls.append(prompt)
+        # Every turn -- original and corrective retry alike -- comes back
+        # equally unparseable.
+        return iter([_result_event(malformed_text, session_id=f"s{len(calls)}")])
+
+    _mock_engine(monkeypatch, handler)
+    monkeypatch.setattr(session_runner, "rescue_grilling_response", lambda raw_text: None)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    assert len(calls) == 2, "must not retry more than once"
+
+    row = db.get_session(conn, row_id)
+    assert row["error_text"] is not None
+    assert "did not" in row["error_text"] or "failed" in row["error_text"]
+    assert row["claude_session_id"] == "s2"
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e["type"] == "turn"]
+    assert turn_events, "an explicit error turn event must be published"
+    assert turn_events[-1]["error"] == row["error_text"]
+    assert turn_events[-1]["phase"] == "grilling"
 
 
 def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, tmp_path, monkeypatch):
