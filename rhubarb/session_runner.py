@@ -559,6 +559,7 @@ async def _run_turn(
     cwd: str | None,
     model: str | None = None,
     effort: str | None = None,
+    phase: str,
 ) -> dict | None:
     """Run one turn against this card's resident `PtyEngine` tab (see
     `_get_or_create_engine` -- constructed and started on the first call for
@@ -575,13 +576,27 @@ async def _run_turn(
     Issue #144: guarded by this card's turn lock (`_get_turn_lock`) so two
     overlapping calls for the same `card_id` can never both write to and
     read from the same resident `PtyEngine` at once. If the lock is already
-    held -- a genuine in-flight turn for this card_id -- this call returns
-    `None` immediately, touching neither the engine nor anything else;
-    every caller must check for `None` and return early rather than treat
-    it as a normal completed (or failed) turn.
+    held -- a genuine in-flight turn for this card_id -- this call (issue
+    #149) publishes an explicit error `turn` event (`_turn_event`, tagged
+    with the caller's own in-flight `phase` so the frontend's existing
+    per-phase error handling -- e.g. `grilling`'s Submit/Send re-enable --
+    picks it up exactly like any other turn failure) on this card's stream,
+    then returns `None` immediately, touching neither the engine nor
+    anything else. Every caller must check for `None` and return early
+    rather than treat it as a normal completed (or failed) turn -- and must
+    NOT publish or log anything further for this case, since the error has
+    already been surfaced here.
     """
     lock = _get_turn_lock(card_id)
     if lock.locked():
+        publish(
+            card_id,
+            _turn_event(
+                phase=phase,
+                error="Another turn for this session is already in progress -- please wait for it to finish.",
+                needs_github_login=False,
+            ),
+        )
         return None
 
     async with lock:
@@ -674,6 +689,7 @@ async def _run_grilling_turn(
             cwd=cwd,
             model=model,
             effort=effort,
+            phase="grilling",
         )
     except PtyEngineUnrecoverableError as e:
         await _route_crash_to_blocked(card_id, conn, e, phase="grilling")
@@ -691,10 +707,11 @@ async def _run_grilling_turn(
         return None
 
     if turn is None:
-        # Issue #144: a genuine turn for this card_id is already in flight
-        # (the lock was held) -- this duplicate call is a silent no-op, not
-        # an error: no DB update, no publish, and the in-flight turn's own
-        # engine is left completely untouched.
+        # Issue #144/#149: a genuine turn for this card_id is already in
+        # flight (the lock was held) -- `_run_turn` has already published
+        # the duplicate-call error itself, so there's nothing left to do
+        # here: no DB update, no additional publish, and the in-flight
+        # turn's own engine is left completely untouched.
         return None
 
     file_text = read_question_file(cwd, _GRILLING_QUESTION_FILE)
@@ -756,6 +773,7 @@ async def _run_chain_step(
             cwd=cwd,
             model=model,
             effort=effort,
+            phase=phase,
         )
     except PtyEngineUnrecoverableError as e:
         await _route_crash_to_blocked(card_id, conn, e, phase=phase)
@@ -772,8 +790,9 @@ async def _run_chain_step(
         return False, None
 
     if turn is None:
-        # Issue #144: a genuine turn for this card_id is already in flight
-        # -- silent no-op, no DB update, no publish, engine left untouched.
+        # Issue #144/#149: a genuine turn for this card_id is already in
+        # flight -- `_run_turn` already published the duplicate-call error
+        # itself; nothing more to do here.
         return False, None
 
     db.update_session(
@@ -1126,6 +1145,7 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
             cwd=cwd,
             model=model,
             effort=effort,
+            phase="implementing",
         )
     except PtyEngineUnrecoverableError as e:
         await _route_crash_to_blocked(card_id, conn, e, phase="implementing")
@@ -1144,8 +1164,9 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
         return
 
     if turn is None:
-        # Issue #144: a genuine turn for this card_id is already in flight
-        # -- silent no-op, no DB update, no publish, engine left untouched.
+        # Issue #144/#149: a genuine turn for this card_id is already in
+        # flight -- `_run_turn` already published the duplicate-call error
+        # itself; nothing more to do here.
         return
 
     await _finish_implement_turn(card_id, conn, row, turn, cwd=cwd, model=model, effort=effort)
@@ -1282,7 +1303,8 @@ async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -
 
     try:
         turn = await _run_turn(
-            card_id, reply, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort
+            card_id, reply, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort,
+            phase="implementing",
         )
     except PtyEngineUnrecoverableError as e:
         await _route_crash_to_blocked(card_id, conn, e, phase="implementing")
@@ -1299,8 +1321,9 @@ async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -
         return
 
     if turn is None:
-        # Issue #144: a genuine turn for this card_id is already in flight
-        # -- silent no-op, no DB update, no publish, engine left untouched.
+        # Issue #144/#149: a genuine turn for this card_id is already in
+        # flight -- `_run_turn` already published the duplicate-call error
+        # itself; nothing more to do here.
         return
 
     row = db.get_session(conn, card_id)
@@ -1362,7 +1385,8 @@ async def continue_qa_job(card_id: int, answers: dict, extra_notes: str, *, cwd:
 
     try:
         turn = await _run_turn(
-            card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort
+            card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort,
+            phase="qa_closing",
         )
     except PtyEngineUnrecoverableError as e:
         await _route_crash_to_blocked(card_id, conn, e, phase="qa_closing")
@@ -1380,8 +1404,9 @@ async def continue_qa_job(card_id: int, answers: dict, extra_notes: str, *, cwd:
         return
 
     if turn is None:
-        # Issue #144: a genuine turn for this card_id is already in flight
-        # -- silent no-op, no DB update, no publish, engine left untouched.
+        # Issue #144/#149: a genuine turn for this card_id is already in
+        # flight -- `_run_turn` already published the duplicate-call error
+        # itself; nothing more to do here.
         return
 
     context_pct = turn.get("context_pct")

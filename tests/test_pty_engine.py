@@ -308,13 +308,57 @@ def test_stream_turn_yields_init_then_result_events_carrying_session_id():
 
 
 def test_stream_turn_writes_the_prompt_to_the_pty():
+    """Issue #148: the prompt must reach the PTY as a paced sequence of
+    small text chunks followed by a SEPARATE trailing "\\r" write -- not one
+    atomic `write(prompt + "\\r")` call, which is what let the CLI's own
+    paste-detection heuristic swallow the Enter keystroke. Joining every
+    write back together must still reproduce the original prompt text plus
+    the trailing carriage return, and the very last write must be exactly
+    "\\r" on its own."""
     backend = FakePtyBackend([f"ok\n{TURN_COMPLETE_MARKER}\n"])
     factory, _ = _fake_factory(backend)
     engine = PtyEngine(pty_factory=factory)
 
     run(_collect(engine.stream_turn("what is 2+2?")))
 
-    assert backend.writes == ["what is 2+2?\r"]
+    assert len(backend.writes) > 1
+    assert backend.writes[-1] == "\r"
+    assert "".join(backend.writes) == "what is 2+2?\r"
+    # No single write bundles the trailing "\r" onto prompt text.
+    for chunk in backend.writes[:-1]:
+        assert not chunk.endswith("\r")
+
+
+def test_stream_turn_writes_the_prompt_in_small_paced_chunks():
+    """The prompt text itself must be split into chunks no larger than
+    `pty_engine._WRITE_CHUNK_SIZE` (not handed to the PTY as one atomic
+    string), with the trailing "\\r" arriving as its own final write."""
+    long_prompt = "x" * (pty_engine._WRITE_CHUNK_SIZE * 3 + 5)
+    backend = FakePtyBackend([f"ok\n{TURN_COMPLETE_MARKER}\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    run(_collect(engine.stream_turn(long_prompt)))
+
+    text_writes = backend.writes[:-1]
+    assert len(text_writes) > 1
+    for chunk in text_writes:
+        assert len(chunk) <= pty_engine._WRITE_CHUNK_SIZE
+    assert "".join(text_writes) == long_prompt
+    assert backend.writes[-1] == "\r"
+
+
+def test_stream_turn_writes_a_short_prompt_with_a_separate_trailing_carriage_return():
+    """Even a prompt shorter than one chunk still gets its "\\r" written
+    separately -- the paced-write behavior is unconditional, not gated on
+    prompt length."""
+    backend = FakePtyBackend([f"ok\n{TURN_COMPLETE_MARKER}\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    run(_collect(engine.stream_turn("hi")))
+
+    assert backend.writes == ["hi", "\r"]
 
 
 def test_stream_turn_stops_reading_as_soon_as_marker_appears_across_chunks():
@@ -646,9 +690,10 @@ def test_stream_turn_restarts_once_and_retries_the_same_prompt_after_a_mid_turn_
     idx = calls[1]["argv"].index("--resume")
     assert calls[1]["argv"][idx + 1] == session_id
 
-    # The same prompt was written to both backends (retry resends it).
-    assert dead_backend.writes == ["what is 2+2?\r"]
-    assert healthy_backend.writes == ["what is 2+2?\r"]
+    # The same prompt was written to both backends (retry resends it),
+    # each as paced chunk(s) followed by a separate trailing "\r" write.
+    assert dead_backend.writes == ["what is 2+2?", "\r"]
+    assert healthy_backend.writes == ["what is 2+2?", "\r"]
 
     # Caller sees a perfectly normal, successful turn -- no error surfaced.
     assert events[0]["type"] == "system"
@@ -847,7 +892,7 @@ def test_unix_pty_backend_conforms_to_pty_backend_protocol_surface():
     events = run(_collect(engine.stream_turn("hello")))
 
     assert "hi from unix" in events[-1]["result"]
-    assert backend.writes == ["hello\r"]
+    assert backend.writes == ["hello", "\r"]
 
 
 # ---------------------------------------------------------------------------

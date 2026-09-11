@@ -1240,11 +1240,77 @@
     // on an error path) and swaps in a "Thinking…" state. Guards against the
     // fake `{ disabled: false }` object the terminal's own Enter-key path
     // passes as `triggerBtn` -- that path has no on-screen button to update.
+    //
+    // Issue #150: a pending button is normally cleared one of two ways --
+    // (1) a `turn` SSE event triggers a full re-render of `interviewEl`
+    // (renderInterview/renderReadyToProceed/renderQaGrilling/etc all start
+    // with `interviewEl.innerHTML = ""`), which discards the stale disabled
+    // button along with the rest of the old DOM, or (2) showGrillingError()
+    // explicitly sweeps `[data-pending-label]` buttons back to enabled on an
+    // HTTP-level error. Both are "legitimate" clears. But if some other,
+    // currently-unanticipated path leaves a button pending forever (the
+    // scenario issue #149 addresses server-side for lock-busy, this is the
+    // client-side backstop for everything else), the button would otherwise
+    // stay stuck on "Thinking…" with no way for the user to retry. So every
+    // pending button also gets a bounded fallback timer, tracked in this
+    // WeakMap (keyed by the button element, so it can never leak into a
+    // global keyed-by-id table and never keeps a detached button alive on
+    // its own).
+    const PENDING_BUTTON_TIMEOUT_MS = 25000;
+    const pendingButtonTimers = new WeakMap();
+
+    function clearPendingButtonTimer(btn) {
+      const timerId = pendingButtonTimers.get(btn);
+      if (timerId !== undefined) {
+        clearTimeout(timerId);
+        pendingButtonTimers.delete(btn);
+      }
+    }
+
+    // Single choke point for clear-path (1) above: every render that
+    // replaces the interview DOM does so by mutating `interviewEl` itself
+    // (innerHTML = "", appendChild, etc.), so watching `interviewEl` for
+    // node removal catches every current and future re-render call site
+    // without needing to instrument each one individually. Whenever a
+    // pending button (or an ancestor containing one) is removed, its
+    // fallback timer is cancelled immediately -- it can never fire against
+    // a detached node, and no timer is left dangling past the render that
+    // legitimately cleared it.
+    const pendingButtonObserver = new MutationObserver((mutations) => {
+      for (const mutation of mutations) {
+        mutation.removedNodes.forEach((node) => {
+          if (!(node instanceof HTMLElement)) return;
+          clearPendingButtonTimer(node);
+          node.querySelectorAll?.("[data-pending-label]").forEach(clearPendingButtonTimer);
+        });
+      }
+    });
+    pendingButtonObserver.observe(interviewEl, { childList: true, subtree: true });
+
     function markButtonPending(btn) {
       if (!(btn instanceof HTMLElement)) return;
       btn.dataset.pendingLabel = btn.textContent;
       btn.disabled = true;
       btn.textContent = "Thinking…";
+
+      clearPendingButtonTimer(btn);
+      const timerId = setTimeout(() => handlePendingButtonTimeout(btn), PENDING_BUTTON_TIMEOUT_MS);
+      pendingButtonTimers.set(btn, timerId);
+    }
+
+    // Fires only if neither legitimate clear path (turn event / explicit
+    // error) got there first -- both of those cancel this button's timer
+    // before it can run (see pendingButtonObserver above and the sweep in
+    // showGrillingError below). The isConnected/dataset guard below is a
+    // defensive second check, not the primary cancellation mechanism: it
+    // means that even if some future code path clears pending state without
+    // going through either tracked path, this can't resurrect a stale
+    // "Thinking…" button or throw on a node that's no longer in the
+    // document.
+    function handlePendingButtonTimeout(btn) {
+      pendingButtonTimers.delete(btn);
+      if (!btn.isConnected || btn.dataset.pendingLabel === undefined) return;
+      showGrillingError("No response was received. Please try again.");
     }
 
     // Issue #134: a reply submitted through the structured answer box (not
@@ -1772,8 +1838,14 @@
 
       // Issue #143: restore any button-driven pending state within the
       // interview area on an HTTP-level error, uniformly across every
-      // reply/advance path, so the user can retry.
+      // reply/advance path, so the user can retry. Also doubles as the
+      // second legitimate clear path for issue #150's fallback timer (both
+      // the direct-error call from sendReply/sendConfirmAdvance/etc and the
+      // timeout fallback itself route through here) -- cancel the timer
+      // before resetting the button so a button reset by an error never
+      // also fires a stale "no response" timeout later.
       interviewEl.querySelectorAll("[data-pending-label]").forEach((btn) => {
+        clearPendingButtonTimer(btn);
         btn.disabled = false;
         btn.textContent = btn.dataset.pendingLabel;
         delete btn.dataset.pendingLabel;

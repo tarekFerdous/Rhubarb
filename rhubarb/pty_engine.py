@@ -156,6 +156,25 @@ _READ_CHUNK = 4096
 _VIRTUAL_SCREEN_COLUMNS = 200
 _VIRTUAL_SCREEN_LINES = 4000
 
+# Paced-write tuning (issue #148): writing an entire prompt to the PTY in
+# one atomic `write(prompt + "\r")` call can trip the `claude` CLI's own
+# paste-detection heuristic -- a large block of text arriving in a single
+# write looks like a pasted block, not human typing, and the CLI can treat
+# the trailing "\r" as part of that pasted content rather than as an Enter
+# keypress submitting it, leaving the prompt sitting unsubmitted in the
+# input box. Splitting the prompt into small chunks, written with a short
+# delay between each, mimics the arrival pattern of real keystrokes closely
+# enough to avoid that misdetection; writing the trailing "\r" as its own
+# separate write (after a slightly longer pause) keeps it from ever being
+# glued onto the last text chunk, so it reads unambiguously as a distinct
+# Enter keystroke. This is applied uniformly to every submission regardless
+# of length or content -- paste-detection reacts to how bytes arrive at the
+# PTY, not what they say, so there is no "risky prompt" heuristic to gate
+# it on. Values are implementation-tuned constants, not user-configurable.
+_WRITE_CHUNK_SIZE = 32
+_WRITE_CHUNK_DELAY_SECONDS = 0.02
+_WRITE_FINAL_DELAY_SECONDS = 0.05
+
 # Window size the real PTY itself is spawned with. `pywinpty`/`ptyprocess`
 # both default to a plain 80x24 if not told otherwise, which is narrow
 # enough that Claude Code word-wraps its own question/option text across
@@ -459,10 +478,23 @@ class PtyEngine:
 
         Raises `PtyEngineError` if the process ends first -- callers decide
         what to do with that (see `stream_turn`, which retries this once via
-        `_restart_after_death` before giving up)."""
+        `_restart_after_death` before giving up).
+
+        Writes `prompt` as a paced sequence of small chunks (see issue #148
+        and the `_WRITE_CHUNK_SIZE`/`_WRITE_CHUNK_DELAY_SECONDS` constants
+        above) rather than one atomic write, with the trailing `"\\r"` sent
+        as its own separate write after `_WRITE_FINAL_DELAY_SECONDS` -- see
+        those constants' docstring for why. Applied unconditionally, for
+        every prompt regardless of length or content."""
         assert self._proc is not None
 
-        await asyncio.to_thread(self._proc.write, prompt + "\r")
+        for start in range(0, len(prompt), _WRITE_CHUNK_SIZE):
+            text_chunk = prompt[start : start + _WRITE_CHUNK_SIZE]
+            await asyncio.to_thread(self._proc.write, text_chunk)
+            await asyncio.sleep(_WRITE_CHUNK_DELAY_SECONDS)
+
+        await asyncio.sleep(_WRITE_FINAL_DELAY_SECONDS)
+        await asyncio.to_thread(self._proc.write, "\r")
 
         buffer = ""
         while TURN_COMPLETE_MARKER not in buffer:

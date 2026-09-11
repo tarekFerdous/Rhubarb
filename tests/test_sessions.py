@@ -3397,7 +3397,10 @@ def test_run_turn_lock_rejects_a_concurrent_call_for_the_same_card_id(client, tm
     card_id, only the first ever reaches the engine's `stream_turn` -- the
     second, made while the first is still mid-turn (blocked inside
     `stream_turn` via a controlled `asyncio.Event`), returns `None`
-    immediately without constructing or touching the engine at all."""
+    immediately without constructing or touching the engine at all. Issue
+    #149: that second, rejected call must also publish an explicit error
+    `turn` event on this card's stream, tagged with the caller's own
+    `phase`, instead of leaving no trace at all."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -3414,14 +3417,16 @@ def test_run_turn_lock_rejects_a_concurrent_call_for_the_same_card_id(client, tm
 
     async def scenario():
         first_task = asyncio.create_task(
-            session_runner._run_turn(row_id, "first prompt", session_id=None, cwd=cwd, model=None, effort=None)
+            session_runner._run_turn(
+                row_id, "first prompt", session_id=None, cwd=cwd, model=None, effort=None, phase="grilling"
+            )
         )
         await entered.wait()  # first call is now mid-turn, blocked inside stream_turn
 
         # A second, overlapping call for the SAME card_id while the first
         # is still in flight -- must be rejected outright.
         second_result = await session_runner._run_turn(
-            row_id, "second prompt", session_id=None, cwd=cwd, model=None, effort=None
+            row_id, "second prompt", session_id=None, cwd=cwd, model=None, effort=None, phase="grilling"
         )
         assert second_result is None
 
@@ -3435,15 +3440,28 @@ def test_run_turn_lock_rejects_a_concurrent_call_for_the_same_card_id(client, tm
     assert len(fake_class.instances) == 1
     assert first_result["session_id"] == fake_class.instances[0].claude_session_id
 
+    # The rejected duplicate published an explicit error `turn` event
+    # (issue #149) -- not silence -- tagged with the phase it was called
+    # with, matching the shape every other turn failure publishes via
+    # `_turn_event`.
+    events = live_stream._buffers.get(row_id, [])
+    error_turn_events = [e for e in events if e["type"] == "turn" and e.get("error")]
+    assert len(error_turn_events) == 1
+    assert error_turn_events[0]["phase"] == "grilling"
+    assert error_turn_events[0]["needs_github_login"] is False
+
 
 def test_concurrent_start_implement_job_calls_only_one_reaches_the_engine(client, tmp_path, monkeypatch):
     """End-to-end through a real turn-initiating function: two overlapping
     `start_implement_job` calls for the same card_id (e.g. a double-clicked
     "implement" action) must not both drive the same resident PtyEngine.
-    The second, made while the first is still mid-turn, is a silent no-op --
-    it never reaches the engine and never publishes the turn's completion
-    events, so exactly one `turn` and one `done` event reach the session's
-    live buffer, and the row lands in its normal single-turn end state."""
+    The second, made while the first is still mid-turn, never reaches the
+    engine and never publishes the turn's own completion events (`done`
+    included) -- but per issue #149, it must no longer be silent either: it
+    publishes an explicit error `turn` event on the busy lock, so exactly
+    one *successful* `turn` event, one *error* `turn` event, and one `done`
+    event reach the session's live buffer, and the row still lands in its
+    normal single-turn end state."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -3466,7 +3484,8 @@ def test_concurrent_start_implement_job_calls_only_one_reaches_the_engine(client
         first_task = asyncio.create_task(session_runner.start_implement_job(row_id, 5, cwd=cwd))
         await entered.wait()  # first call's turn is now mid-flight
 
-        # A second, overlapping call for the same card_id -- silent no-op.
+        # A second, overlapping call for the same card_id -- rejected on the
+        # busy lock, but no longer silently (issue #149).
         await session_runner.start_implement_job(row_id, 5, cwd=cwd)
 
         release.set()
@@ -3484,10 +3503,15 @@ def test_concurrent_start_implement_job_calls_only_one_reaches_the_engine(client
     events = live_stream._buffers.get(row_id, [])
     turn_events = [e for e in events if e["type"] == "turn"]
     done_events = [e for e in events if e["type"] == "done"]
-    # Exactly the real turn's completion events -- the rejected duplicate
-    # published neither.
-    assert len(turn_events) == 1
+    # The real turn's own completion events, plus the rejected duplicate's
+    # explicit error `turn` event (issue #149) -- no `done` from the
+    # duplicate, since it returns before ever reaching that point.
+    assert len(turn_events) == 2
     assert len(done_events) == 1
+
+    error_turn_events = [e for e in turn_events if e.get("error")]
+    assert len(error_turn_events) == 1
+    assert error_turn_events[0]["phase"] == "implementing"
 
     # The engine the legitimate call used was closed exactly once (normal
     # end-of-turn pooling), not disturbed or double-closed by the rejected
@@ -3510,9 +3534,11 @@ def test_turn_lock_is_released_after_the_turn_completes(client, tmp_path, monkey
     row_id = db.create_session(conn, project_id)
 
     async def scenario():
-        first = await session_runner._run_turn(row_id, "first", session_id=None, cwd=cwd, model=None, effort=None)
+        first = await session_runner._run_turn(
+            row_id, "first", session_id=None, cwd=cwd, model=None, effort=None, phase="grilling"
+        )
         second = await session_runner._run_turn(
-            row_id, "second", session_id="s1", cwd=cwd, model=None, effort=None
+            row_id, "second", session_id="s1", cwd=cwd, model=None, effort=None, phase="grilling"
         )
         return first, second
 
