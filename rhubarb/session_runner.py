@@ -1307,6 +1307,130 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
     await _finish_implement_turn(card_id, conn, row, turn, cwd=cwd, model=model, effort=effort)
 
 
+# Issue #159: mirrors grilling's own corrective-retry prompt (see the
+# sibling fix for `_run_grilling_turn`) -- hands the model its own
+# unparseable QA-grilling round back verbatim and asks it to rewrite that
+# same round in the exact required format, rather than silently treating an
+# unparseable round as "no more QA questions".
+_QA_CORRECTIVE_RETRY_PROMPT_TEMPLATE = (
+    "Your last QA-grilling round did not parse into the required structured "
+    "format. Here is exactly what you sent:\n\n{broken_text}\n\n"
+    "Please rewrite that same round of QA questions in the exact required "
+    'format (a `QA session for PRD N: "..."` header, one `Issue N: "..."` '
+    'group per issue in tracker order, `Question N: "..."` lines numbered '
+    'sequentially within each issue, and an optional `Recommended text: '
+    '"..."` per question), and write it to `.claude/rhubarb_qa.md` exactly '
+    "as the qa-grilling skill instructs."
+)
+
+
+def _qa_result_is_suspicious(qa_parsed: dict, qa_file_text: str | None, terminal_text: str) -> bool:
+    """True when `parse_qa_response` (and, where attempted, the Ollama
+    rescue) came back with no issues, but either the QA question file's raw
+    content or the raw terminal text looks like the model was genuinely
+    trying to produce a QA-grilling round rather than this being some other,
+    unrelated turn -- i.e. `should_attempt_qa_rescue`'s own trigger check,
+    against *both* sources (issue #159 extends that check, which today only
+    ever looks at terminal text, to the file too) rather than just one. A
+    round with neither source showing this fingerprint is never retried --
+    that's the "no QA questions" case, indistinguishable from a genuine
+    wrap-up, so it's left exactly as before this existed."""
+    if qa_parsed["issues"]:
+        return False
+    if qa_file_text is not None and should_attempt_qa_rescue(qa_parsed, qa_file_text):
+        return True
+    return should_attempt_qa_rescue(qa_parsed, terminal_text)
+
+
+async def _fail_qa_corrective_retry(card_id: int, conn, row, cwd: str | None, message: str) -> None:
+    """Shared explicit-error tail for `_attempt_qa_corrective_retry`'s
+    failure paths (see its docstring): closes this card's engine, persists
+    `error_text`, publishes the error `turn` event (which feeds the
+    app-wide error log via `_turn_event`/`error_log.log_error`), publishes
+    `done`, records a background error notification, and drains this
+    project's queued implement jobs -- the same shape every other
+    `ClaudeCLIError` handler in this module already uses, since this
+    implement session is ending here instead of handing off to QA."""
+    _close_engine(card_id)
+    db.update_session(conn, card_id, error_text=message, needs_github_login=0)
+    publish(
+        card_id,
+        _turn_event(
+            phase="qa_grilling",
+            error=message,
+            needs_github_login=False,
+            card_id=card_id,
+            project_id=row["project_id"],
+        ),
+    )
+    publish(card_id, {"type": "done"})
+    add_error_notification(row["project_id"], card_id, "qa_grilling", message)
+    await _drain_implement_queue(row["project_id"], cwd)
+
+
+async def _attempt_qa_corrective_retry(
+    card_id: int, conn, row, *, broken_text: str, session_id: str, cwd: str | None, model, effort
+) -> tuple[dict, dict] | None:
+    """One corrective follow-up turn (issue #159), run once a QA-grilling
+    round's result looked like it was genuinely trying to contain questions
+    (`_qa_result_is_suspicious`) but failed to parse even after the
+    file/terminal/Ollama-rescue fallback chain. Hands the model its own
+    unparseable output back (`broken_text`) and asks it to rewrite that
+    round in the required format, then re-parses the retry turn's own
+    result the same way this module always does (file first, then terminal
+    text).
+
+    Returns `(qa_parsed, qa_turn)` -- the freshly re-parsed dict (guaranteed
+    to carry at least one issue) and the completed retry turn -- on success.
+    On any failure (the retry turn itself erroring or crashing, a duplicate
+    in-flight turn, or a retry result that *still* fails to parse), this
+    function has already reported an explicit error and fully wound down
+    this card (see `_fail_qa_corrective_retry`/`_route_crash_to_blocked`) --
+    callers must treat a `None` return as fully handled and simply return,
+    exactly like every other `_run_turn`-wrapping call site in this module."""
+    prompt = _QA_CORRECTIVE_RETRY_PROMPT_TEMPLATE.format(broken_text=broken_text)
+
+    try:
+        retry_turn = await _run_turn(
+            card_id, prompt, session_id=session_id, cwd=cwd, model=model, effort=effort, phase="qa_grilling"
+        )
+    except PtyEngineUnrecoverableError as e:
+        await _route_crash_to_blocked(card_id, conn, e, phase="qa_grilling")
+        return None
+    except ClaudeCLIError as e:
+        await _fail_qa_corrective_retry(card_id, conn, row, cwd, str(e))
+        return None
+
+    if retry_turn is None:
+        # Issue #144/#149: a genuine turn for this card_id is already in
+        # flight -- `_run_turn` already published the duplicate-call error
+        # itself; nothing more to do here.
+        return None
+
+    retry_file_text = read_question_file(cwd, _QA_QUESTION_FILE)
+    retry_parsed = parse_qa_response(retry_file_text) if retry_file_text is not None else None
+    if retry_file_text is not None and not retry_parsed["issues"]:
+        delete_question_file(cwd, _QA_QUESTION_FILE)
+        retry_parsed = None
+    if retry_parsed is None:
+        retry_parsed = parse_qa_response(retry_turn["result"])
+
+    if not retry_parsed["issues"]:
+        # The corrective retry ran, but its own result still didn't parse --
+        # stop trying automatically and surface this loudly instead of
+        # silently handing off a broken/empty QA round.
+        message = (
+            "A QA-grilling round could not be parsed into structured "
+            "questions, even after asking the model to rewrite it in the "
+            "required format. Check the session's console output for what "
+            "the model actually sent."
+        )
+        await _fail_qa_corrective_retry(card_id, conn, row, cwd, message)
+        return None
+
+    return retry_parsed, retry_turn
+
+
 async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: str | None, model, effort) -> None:
     """Shared tail for both `start_implement_job`'s first turn and
     `continue_implement_job`'s resume turn: persist the turn's console
@@ -1384,11 +1508,40 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
             rescued = await asyncio.to_thread(rescue_qa_response, turn["result"])
             if rescued is not None:
                 qa_parsed = rescued
+
+        qa_turn = turn
+        if _qa_result_is_suspicious(qa_parsed, qa_file_text, turn["result"]):
+            # Issue #159: this round looks like it was genuinely trying to
+            # contain QA questions -- rather than silently treating this as
+            # "no more QA questions" (indistinguishable from a genuine
+            # wrap-up otherwise), give the model one corrective follow-up
+            # turn with its own unparseable output before giving up for
+            # real.
+            broken_text = qa_file_text if qa_file_text is not None else turn["result"]
+            retry_result = await _attempt_qa_corrective_retry(
+                card_id,
+                conn,
+                row,
+                broken_text=broken_text,
+                session_id=turn["session_id"],
+                cwd=cwd,
+                model=model,
+                effort=effort,
+            )
+            if retry_result is None:
+                # Already fully handled (explicit error published/persisted,
+                # engine closed, queue drained) -- see
+                # `_attempt_qa_corrective_retry`'s docstring.
+                return
+            qa_parsed, qa_turn = retry_result
+            retried_console_text = console_text + "\n\n" + qa_turn["result"]
+            db.update_session(conn, card_id, console_text=retried_console_text, context_pct=qa_turn.get("context_pct"))
+
         qa_issues = qa_parsed["issues"]
         qa_row_id = db.create_session(
             conn,
             row["project_id"],
-            claude_session_id=turn["session_id"],
+            claude_session_id=qa_turn["session_id"],
             session_type="qa",
             phase="qa_grilling",
             details={"prd": qa_prd},
