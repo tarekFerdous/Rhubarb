@@ -1411,10 +1411,24 @@
     let terminalReplySendFn = null;
     let terminalReplyBuffer = "";
 
+    // Issue #164: enabling curated reply mode used to only flip the
+    // `terminalReplySendFn` gate and print the "> " prompt -- it never gave
+    // the terminal actual DOM focus. xterm.js captures keystrokes through a
+    // hidden `<textarea>` it manages internally (`.xterm-helper-textarea`),
+    // and that textarea only receives keystrokes while it holds real browser
+    // focus; nothing in this file ever called `term.focus()`, so unless the
+    // user happened to manually click inside the terminal panel first, every
+    // keystroke went to whatever (or nothing) already had focus and
+    // `term.onData` never fired at all -- the reply-mode branch inside it
+    // was correct but simply never reached. Calling `term.focus()` here
+    // (xterm's public API for focusing that helper textarea) is what
+    // actually routes typed input into `term.onData` the moment reply mode
+    // is entered, matching the on-screen "> " prompt this already writes.
     function enableTerminalReplyInput(sendFn) {
       terminalReplySendFn = sendFn;
       terminalReplyBuffer = "";
       term.write("\r\n> ");
+      term.focus();
     }
 
     function disableTerminalReplyInput() {
