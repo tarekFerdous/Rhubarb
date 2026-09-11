@@ -2811,6 +2811,116 @@ def test_continue_qa_job_does_not_recycle_a_high_usage_finished_session(client, 
     assert db.claim_available_session(conn, project_id) is None
 
 
+def _word_wrap_at(text, width):
+    """Simulate a terminal re-wrapping already-rendered text at `width`
+    columns (issue #163): each physical line is independently re-flowed to
+    `width` at word (space) boundaries -- mirroring how a PTY wraps a
+    stream of already-authored text -- without collapsing the JSON
+    pretty-printer's own original line breaks into one paragraph the way
+    `textwrap.wrap` would if applied to the whole blob at once. A no-op for
+    any line already within `width`."""
+    import textwrap
+
+    out_lines = []
+    for line in text.split("\n"):
+        if not line:
+            out_lines.append("")
+            continue
+        wrapped = textwrap.wrap(line, width=width, break_long_words=False, break_on_hyphens=False)
+        out_lines.extend(wrapped or [""])
+    return "\n".join(out_lines)
+
+
+_QA_BLOCK_LONG_TEXT = """\
+```json
+{
+  "phase": "qa_grilling",
+  "prd": {"number": 7, "title": "Tracked PRD"},
+  "checklist": [
+    {
+      "issue_number": 8,
+      "issue_title": "Child",
+      "items": [
+        {"id": "8-0", "text": "works correctly even when the terminal wraps this long item text at a narrower column than it was authored at"}
+      ]
+    }
+  ]
+}
+```"""
+
+_IMPLEMENT_BLOCKED_BLOCK_LONG_TEXT = """\
+Some preamble text.
+
+```json
+{
+  "phase": "implement_blocked",
+  "issue": 8,
+  "question": "Which auth provider should the login button use, given the issue body never specifies Google vs GitHub OAuth for this particular flow?",
+  "context": "The issue body doesn't specify Google vs GitHub OAuth."
+}
+```"""
+
+
+def test_parse_qa_grilling_block_tolerates_word_wrap_at_a_different_column(client, tmp_path):
+    """A fenced qa_grilling block that's been word-wrapped at an arbitrary
+    column (simulating a narrower terminal than it was authored at, issue
+    #163) must still parse -- the wrap can inject a raw newline in the
+    middle of a long string value, which `_parse_qa_grilling_block` must
+    rejoin before handing the block to `json.loads`."""
+    from rhubarb.session_runner import _parse_qa_grilling_block
+
+    wrapped = _word_wrap_at(_QA_BLOCK_LONG_TEXT, width=28)
+    assert wrapped != _QA_BLOCK_LONG_TEXT  # sanity: this actually rewrapped something
+
+    result = _parse_qa_grilling_block(wrapped)
+    assert result is not None
+    assert result["phase"] == "qa_grilling"
+    assert result["prd"]["number"] == 7
+    assert result["checklist"][0]["items"][0]["text"] == (
+        "works correctly even when the terminal wraps this long item "
+        "text at a narrower column than it was authored at"
+    )
+
+
+def test_parse_implement_blocked_block_tolerates_word_wrap_at_a_different_column():
+    """Same word-wrap tolerance as the qa_grilling case above, for the
+    implement_blocked block (issue #163)."""
+    from rhubarb.session_runner import _parse_implement_blocked_block
+
+    wrapped = _word_wrap_at(_IMPLEMENT_BLOCKED_BLOCK_LONG_TEXT, width=28)
+    assert wrapped != _IMPLEMENT_BLOCKED_BLOCK_LONG_TEXT
+
+    result = _parse_implement_blocked_block(wrapped)
+    assert result is not None
+    assert result["phase"] == "implement_blocked"
+    assert result["issue"] == 8
+    assert result["question"] == (
+        "Which auth provider should the login button use, given the "
+        "issue body never specifies Google vs GitHub OAuth for this "
+        "particular flow?"
+    )
+
+
+def test_parse_qa_grilling_block_returns_none_for_malformed_json_in_fence(client, tmp_path):
+    """A fenced block that matches `_FENCED_JSON_BLOCK_RE` but isn't valid
+    JSON (a trailing comma, here) is a genuine parse failure -- not a
+    word-wrap artifact -- and must still return None, unaffected by the
+    word-wrap rejoin step."""
+    from rhubarb.session_runner import _parse_qa_grilling_block
+
+    malformed = '```json\n{"phase": "qa_grilling", "prd": {"number": 7,}}\n```'
+    assert _parse_qa_grilling_block(malformed) is None
+
+
+def test_parse_implement_blocked_block_returns_none_for_malformed_json_in_fence():
+    """Same genuinely-malformed-JSON regression check as the qa_grilling
+    case above, for the implement_blocked parser."""
+    from rhubarb.session_runner import _parse_implement_blocked_block
+
+    malformed = '```json\n{"phase": "implement_blocked", "issue": 8, "question": "Which?",}\n```'
+    assert _parse_implement_blocked_block(malformed) is None
+
+
 def test_parse_qa_grilling_block_extracts_json_from_code_fence(client, tmp_path):
     """_parse_qa_grilling_block must find and return the qa_grilling JSON block."""
     from rhubarb.session_runner import _parse_qa_grilling_block

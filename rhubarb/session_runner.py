@@ -20,6 +20,78 @@ from pathlib import Path
 
 _FENCED_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```")
 
+
+def _rejoin_wrapped_json_strings(candidate: str) -> str:
+    """Undo terminal word-wrap inside a fenced JSON block's string literals
+    before handing `candidate` to `json.loads` -- the JSON-block analogue of
+    `qa_parser._reflow`'s "undo word-wrap before parsing" step for the
+    question-format parsers.
+
+    A real PTY-spawned terminal can word-wrap Claude's rendered text to fit
+    whatever width it's reporting (see `pty_engine.PtyEngine`'s own notes on
+    this), and that wrapping knows nothing about JSON syntax -- it can just
+    as easily inject a raw newline in the middle of a JSON string literal as
+    between two structural tokens. A raw, unescaped newline is never valid
+    inside a JSON string, so a long `"question"`/`"context"`/etc. value that
+    happened to wrap at one terminal width can produce different (and, at
+    the point it lands mid-string, invalid) JSON at a different width, even
+    though nothing about the semantic content changed.
+
+    Structural whitespace -- the pretty-printer's own newlines and
+    indentation between tokens (after `{`, `,`, `:`, etc.) -- is already
+    valid JSON exactly as-is and is left untouched; `json.loads` never cared
+    about that whitespace in the first place. Only whitespace runs
+    containing a newline that fall *inside* a string literal are collapsed
+    to a single space, undoing the wrap the same way the original text's
+    single space would have read before the terminal broke the line there.
+
+    Tracks string-literal state character by character (honoring `\\"`
+    escapes so an escaped quote never toggles it) rather than working
+    line-by-line, so this is correct regardless of how many times, or at
+    what column, a string got wrapped -- unlike a line-oriented rejoin,
+    which would have to guess whether a given physical line starts a new
+    logical field. A no-op whenever no string literal contains a raw
+    newline, which is true of any already word-wrap-free block (every
+    existing fixture predating this function included)."""
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    i = 0
+    n = len(candidate)
+    while i < n:
+        ch = candidate[i]
+        if in_string:
+            if escaped:
+                out.append(ch)
+                escaped = False
+                i += 1
+                continue
+            if ch == "\\":
+                out.append(ch)
+                escaped = True
+                i += 1
+                continue
+            if ch == '"':
+                in_string = False
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "\n":
+                j = i
+                while j < n and candidate[j] in " \t\r\n":
+                    j += 1
+                out.append(" ")
+                i = j
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_string = True
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
 from rhubarb import db, error_log
 from rhubarb.cli_client import ClaudeCLIError
 from rhubarb.github_publisher import GithubPublishError, publish_draft
@@ -1309,17 +1381,24 @@ async def continue_session_job(card_id: int, reply: str, *, cwd: str | None, con
 def _parse_qa_grilling_block(text: str) -> dict | None:
     """Extract the first JSON code block with phase=='qa_grilling' from a
     CLI turn result, as emitted by the /qa skill Phase 2. Returns None when
-    no such block is found (normal /implement run without the /qa auto-handoff)."""
+    no such block is found (normal /implement run without the /qa auto-handoff).
+
+    Each candidate is run through `_rejoin_wrapped_json_strings` before
+    `json.loads` -- see that function's docstring -- so a block that a
+    terminal word-wrapped at some column (splitting a long string value
+    across physical lines) still parses the same as it would unwrapped. A
+    genuinely malformed/incomplete block still fails `json.loads` and is
+    still skipped exactly as before."""
     for match in _FENCED_JSON_BLOCK_RE.finditer(text):
         try:
-            data = json.loads(match.group(1))
+            data = json.loads(_rejoin_wrapped_json_strings(match.group(1)))
             if isinstance(data, dict) and data.get("phase") == "qa_grilling":
                 return data
         except (json.JSONDecodeError, ValueError):
             continue
     # Fallback: bare JSON (no code fence)
     try:
-        data = json.loads(text.strip())
+        data = json.loads(_rejoin_wrapped_json_strings(text.strip()))
         if isinstance(data, dict) and data.get("phase") == "qa_grilling":
             return data
     except (json.JSONDecodeError, ValueError):
@@ -1332,16 +1411,19 @@ def _parse_implement_blocked_block(text: str) -> dict | None:
     a CLI turn result, as emitted by /rhubarb:implement when it genuinely
     cannot proceed without user-only information (see the skill's top-level
     "never pause to ask" directive). Returns None for the normal,
-    not-blocked case -- structurally identical to `_parse_qa_grilling_block`."""
+    not-blocked case -- structurally identical to `_parse_qa_grilling_block`,
+    including running each candidate through `_rejoin_wrapped_json_strings`
+    first (see that function's docstring) so a word-wrapped block still
+    parses, while a genuinely malformed/incomplete one still returns None."""
     for match in _FENCED_JSON_BLOCK_RE.finditer(text):
         try:
-            data = json.loads(match.group(1))
+            data = json.loads(_rejoin_wrapped_json_strings(match.group(1)))
             if isinstance(data, dict) and data.get("phase") == "implement_blocked":
                 return data
         except (json.JSONDecodeError, ValueError):
             continue
     try:
-        data = json.loads(text.strip())
+        data = json.loads(_rejoin_wrapped_json_strings(text.strip()))
         if isinstance(data, dict) and data.get("phase") == "implement_blocked":
             return data
     except (json.JSONDecodeError, ValueError):
