@@ -117,7 +117,8 @@ def test_turn_event_with_error_logs_via_shared_hook(_isolated_log_path):
     )
 
     # The published event shape is untouched by the new logging hook (aside
-    # from issue #154's additive `status_message` field, unused here).
+    # from issue #154's additive `status_message` field and issue #169's
+    # additive `stalled`/`stalled_context` fields, unused here).
     assert event == {
         "type": "turn",
         "phase": "implementing",
@@ -127,6 +128,8 @@ def test_turn_event_with_error_logs_via_shared_hook(_isolated_log_path):
         "needs_github_login": False,
         "blocked": None,
         "status_message": None,
+        "stalled": False,
+        "stalled_context": None,
     }
 
     lines = _isolated_log_path.read_text(encoding="utf-8").strip().splitlines()

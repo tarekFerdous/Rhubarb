@@ -39,6 +39,14 @@ def translate_event(raw_event: dict) -> dict | None:
         # nothing to translate: `data` already IS what the frontend renders.
         return {"type": "terminal_output", "data": raw_event.get("data", "")}
 
+    if kind == "stall":
+        # Passed straight through from `PtyEngine.stream_turn` (issue #169):
+        # `data` is the buffer-so-far, already rendered via
+        # `_render_terminal_text` -- `session_runner._run_turn` folds this
+        # into the existing `turn` event shape (`stalled`/`stalled_context`)
+        # rather than publishing this raw shape directly.
+        return {"type": "stall", "data": raw_event.get("data", "")}
+
     if kind == "stream_event":
         event = raw_event.get("event", {})
         event_type = event.get("type")

@@ -4119,6 +4119,103 @@ def test_turn_lock_is_released_after_the_turn_completes(client, tmp_path, monkey
     assert not session_runner._get_turn_lock(row_id).locked()
 
 
+def test_stall_event_keeps_the_turn_lock_held_and_does_not_end_run_turn(client, tmp_path, monkeypatch):
+    """Issue #169 (child of PRD #168 "Recover from a stalled turn instead of
+    hanging the turn lock forever"): a `stall` raw event -- `PtyEngine`
+    reporting its pending read has gone quiet, but is NOT giving up on it --
+    must be treated by `_run_turn`'s translation loop as first-class and
+    repeatable: published on the card's stream (as the existing `turn` event
+    shape, extended with `stalled`/`stalled_context`) and persisted onto the
+    row (mirroring `blocked_json`), all WITHOUT releasing the turn lock or
+    letting the in-flight `_run_turn` call return -- the underlying read is
+    still pending underneath. Once the turn genuinely resolves afterward,
+    the lock is released normally and the persisted stall context is
+    cleared, exactly as if it had never stalled."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    release = asyncio.Event()
+
+    class StallingFakeEngine:
+        instances: list["StallingFakeEngine"] = []
+
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, pty_factory=None):
+            self.claude_session_id = resume_session_id or "fresh-1"
+            self.started = False
+            self.closed = False
+            StallingFakeEngine.instances.append(self)
+
+        def start(self):
+            self.started = True
+            return self
+
+        def close(self):
+            self.closed = True
+
+        def isalive(self):
+            return self.started and not self.closed
+
+        async def stream_turn(self, prompt):
+            yield {"type": "system", "subtype": "init", "session_id": self.claude_session_id}
+            yield {"type": "stall", "data": "still working on it..."}
+            yield {"type": "stall", "data": "still working on it..."}
+            await release.wait()
+            yield _result_event("done at last", session_id=self.claude_session_id)
+
+    monkeypatch.setattr(session_runner, "PtyEngine", StallingFakeEngine)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+
+    async def scenario():
+        task = asyncio.create_task(
+            session_runner._run_turn(
+                row_id, "prompt", session_id=None, cwd=cwd, model=None, effort=None, phase="grilling"
+            )
+        )
+        # Let the translation loop actually process both stall events
+        # (nothing past them yet -- `release` isn't set) before asserting.
+        for _ in range(10):
+            await asyncio.sleep(0)
+
+        # A stall must not end the call or release the lock -- the
+        # underlying read is still genuinely pending.
+        assert not task.done()
+        assert session_runner._get_turn_lock(row_id).locked()
+
+        # Persisted on the row -- same precedent as `blocked_json` -- so a
+        # reconnect/page-refresh could recover and re-show it.
+        row = db.get_session(conn, row_id)
+        assert row["stalled_json"] is not None
+        stalled = json.loads(row["stalled_json"])
+        assert stalled == {"phase": "grilling", "context": "still working on it..."}
+
+        release.set()
+        return await task
+
+    result = asyncio.run(scenario())
+
+    assert result is not None
+    assert result["result"] == "done at last"
+    # The lock is released like any normal completed turn once it actually
+    # resolves.
+    assert not session_runner._get_turn_lock(row_id).locked()
+
+    # And the persisted stall context is cleared -- a later reconnect must
+    # not see a stall that's actually long over.
+    row = db.get_session(conn, row_id)
+    assert row["stalled_json"] is None
+
+    events = live_stream._buffers.get(row_id, [])
+    stall_turn_events = [e for e in events if e["type"] == "turn" and e.get("stalled")]
+    assert len(stall_turn_events) == 2
+    for event in stall_turn_events:
+        assert event["phase"] == "grilling"
+        assert event["stalled_context"] == "still working on it..."
+    # No error was ever published just because a stall happened.
+    assert not any(e.get("error") for e in events if e["type"] == "turn")
+
+
 def test_close_engine_removes_the_turn_lock(client, tmp_path, monkeypatch):
     """`_close_engine` must pop the card's entry out of `_turn_locks` too,
     alongside `_pty_engines` -- otherwise the lock registry grows
