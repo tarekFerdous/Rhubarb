@@ -629,7 +629,12 @@ async def _route_crash_to_blocked(card_id: int, conn, exc: PtyEngineUnrecoverabl
     _close_engine(card_id)
     blocked = _blocked_payload_from_crash(exc)
     db.update_session(
-        conn, card_id, claude_session_id=exc.claude_session_id, phase="blocked", blocked_json=json.dumps(blocked)
+        conn,
+        card_id,
+        claude_session_id=exc.claude_session_id,
+        phase="blocked",
+        blocked_json=json.dumps(blocked),
+        stalled_json=None,
     )
     publish(card_id, _turn_event(phase="blocked", blocked=blocked))
 
@@ -696,13 +701,51 @@ async def _run_turn(
             engine = _get_or_create_engine(
                 card_id, cwd=cwd, model=model, effort=effort, resume_session_id=session_id
             )
+            # Lazily opened, and only if a stall actually happens this turn
+            # -- most turns never do. Reused for both persisting the stall
+            # (below) and clearing it again once this turn resolves, rather
+            # than opening a fresh connection for each.
+            stall_conn = None
+            stalled = False
+
             async for raw_event in engine.stream_turn(prompt):
                 translated = translate_event(raw_event)
                 if translated is None:
                     continue
+                if translated["type"] == "stall":
+                    # Issue #169: the live process has gone quiet mid-turn,
+                    # but the underlying read `stream_turn` is awaiting is
+                    # still pending underneath -- this loop is NOT ending,
+                    # and the turn lock (`lock`, held for this whole `async
+                    # with` block) is NOT released. Publish this as the
+                    # existing `turn` event shape (extended with
+                    # `stalled`/`stalled_context`) so a caller already
+                    # listening for `turn` events picks it up for free, and
+                    # persist the same context on the row -- mirroring how
+                    # `blocked_json` is persisted -- so a later reconnect
+                    # can recover and re-show it even after this stall event
+                    # itself has scrolled out of the live SSE stream.
+                    stalled = True
+                    if stall_conn is None:
+                        stall_conn = db.get_connection()
+                    db.update_session(
+                        stall_conn,
+                        card_id,
+                        stalled_json=json.dumps({"phase": phase, "context": translated["data"]}),
+                    )
+                    publish(card_id, _turn_event(phase=phase, stalled=True, stalled_context=translated["data"]))
+                    continue
                 if translated["type"] == "turn":
                     translated["context_pct"] = _context_window_pct(raw_event)
                     holder["turn"] = translated
+                    if stalled:
+                        # The turn genuinely resolved (the marker was seen)
+                        # after having stalled at least once -- clear the
+                        # persisted stall context so a reconnect no longer
+                        # sees a stall that's actually long over.
+                        if stall_conn is None:
+                            stall_conn = db.get_connection()
+                        db.update_session(stall_conn, card_id, stalled_json=None)
                     continue
                 publish(card_id, translated)
 
@@ -737,6 +780,8 @@ def _turn_event(
     status_message: str | None = None,
     card_id: int | None = None,
     project_id: int | None = None,
+    stalled: bool = False,
+    stalled_context: str | None = None,
 ) -> dict:
     """Build the `turn` event every phase publishes on a session's live
     stream. `card_id`/`project_id` are only used here -- not part of the
@@ -752,6 +797,15 @@ def _turn_event(
     `details` turn. The frontend renders it via the same `renderSessionStatus`
     path that already shows the phase label (see `prompt.html`), rather than
     a new display surface.
+
+    `stalled`/`stalled_context` (issue #169, child of PRD #168) are this
+    same `turn` event shape extended, rather than a new event type, for a
+    turn that's still genuinely in flight but has gone quiet for a full
+    `pty_engine._STALL_QUIET_PERIOD_SECONDS` -- see `_run_turn`'s
+    translation loop, the only caller that ever sets these. `stalled_context`
+    is the live-process's buffer-so-far (already rendered through
+    `_render_terminal_text`) at the moment of that stall, for a UI to show
+    what the process was doing right before it went quiet.
     """
     if error is not None:
         error_log.log_error(project_id=project_id, card_id=card_id, phase=phase, message=error)
@@ -764,6 +818,8 @@ def _turn_event(
         "needs_github_login": needs_github_login,
         "blocked": blocked,
         "status_message": status_message,
+        "stalled": stalled,
+        "stalled_context": stalled_context,
     }
 
 

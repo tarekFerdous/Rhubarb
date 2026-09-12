@@ -927,6 +927,36 @@ def test_sessions_list_blocked_is_none_when_not_blocked(client, tmp_path):
     assert session["blocked"] is None
 
 
+def test_sessions_list_exposes_stalled_field(client, tmp_path):
+    """Issue #169: `stalled_json` (persisted by `session_runner._run_turn`
+    the same way `blocked_json` already is -- see `test_sessions_list_
+    exposes_blocked_field` above) must round-trip through the session list
+    endpoint as a `stalled` field, so a reconnect/page-refresh can recover
+    and re-show it."""
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id)
+    db.update_session(
+        conn, card_id, stalled_json=json.dumps({"phase": "grilling", "context": "still working..."})
+    )
+
+    sessions = client.get(f"/api/projects/{project_id}/sessions").json()["sessions"]
+    [session] = [s for s in sessions if s["card_id"] == card_id]
+    assert session["stalled"] == {"phase": "grilling", "context": "still working..."}
+
+
+def test_sessions_list_stalled_is_none_when_not_stalled(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id)
+
+    sessions = client.get(f"/api/projects/{project_id}/sessions").json()["sessions"]
+    [session] = [s for s in sessions if s["card_id"] == card_id]
+    assert session["stalled"] is None
+
+
 def test_close_session_endpoint_marks_the_row_closed(client, tmp_path):
     project_id = _open_project(client, tmp_path, "proj")
 
@@ -955,3 +985,107 @@ def test_sessions_list_excludes_a_closed_session(client, tmp_path):
 
     sessions = client.get(f"/api/projects/{project_id}/sessions").json()["sessions"]
     assert card_id not in [s["card_id"] for s in sessions]
+
+
+# ---------------------------------------------------------------------------
+# Stall-reply endpoint (issue #169, child of PRD #168 "Recover from a
+# stalled turn instead of hanging the turn lock forever"): mirrors
+# `resize_session_pty` in shape -- a small, separate endpoint that looks up
+# a card's resident engine and forwards straight into its lock-protected
+# `PtyEngine.write()`, without going through `_run_turn`'s own prompt-write
+# machinery, starting a new turn, or touching the turn lock a second time.
+# ---------------------------------------------------------------------------
+
+
+class _FakeWriteEngine:
+    """Minimal stand-in for a resident `PtyEngine` -- only `write()` is
+    exercised by the stall-reply endpoint, so that's all this fake needs to
+    implement. Records every call so a test can assert exactly what reached
+    it, and never touches any turn lock -- there is none here, since this
+    fake is registered directly into `session_runner._pty_engines` rather
+    than driven through `_run_turn`."""
+
+    def __init__(self):
+        self.writes = []
+
+    async def write(self, data):
+        self.writes.append(data)
+
+
+def test_stall_reply_endpoint_forwards_straight_into_the_cards_engine_write(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id)
+
+    engine = _FakeWriteEngine()
+    monkeypatch.setattr(session_runner, "_pty_engines", {card_id: engine})
+
+    resp = client.post(f"/api/sessions/{card_id}/stall-reply", json={"text": "please continue"})
+
+    assert resp.json() == {"replied": True}
+    assert engine.writes == ["please continue"]
+
+
+def test_stall_reply_endpoint_is_a_noop_for_a_card_with_no_live_engine(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id)
+    # No engine registered for this card_id at all.
+
+    resp = client.post(f"/api/sessions/{card_id}/stall-reply", json={"text": "anything"})
+
+    assert resp.json() == {"replied": False}
+
+
+def test_stall_reply_endpoint_never_touches_the_turn_lock_or_starts_a_new_turn(client, tmp_path, monkeypatch):
+    """The whole point of this endpoint: it must reach the engine's `write()`
+    directly, never `_run_turn` (which would try to acquire the per-card
+    turn lock a second time and start a brand-new turn on top of whatever's
+    already in flight)."""
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id)
+
+    engine = _FakeWriteEngine()
+    monkeypatch.setattr(session_runner, "_pty_engines", {card_id: engine})
+
+    def _run_turn_must_not_be_called(*args, **kwargs):
+        raise AssertionError("stall-reply must not go through _run_turn")
+
+    monkeypatch.setattr(session_runner, "_run_turn", _run_turn_must_not_be_called)
+
+    # Hold the turn lock ourselves, exactly as a genuinely in-flight turn
+    # would -- the endpoint must still succeed, proving it never tries to
+    # acquire this same lock.
+    lock = session_runner._get_turn_lock(card_id)
+    assert not lock.locked()
+
+    resp = client.post(f"/api/sessions/{card_id}/stall-reply", json={"text": "nudge"})
+
+    assert resp.json() == {"replied": True}
+    assert engine.writes == ["nudge"]
+    # Still untouched -- the endpoint never acquired or released it.
+    assert not lock.locked()
+
+
+def test_stall_reply_endpoint_forwards_to_the_correct_cards_engine_only(client, tmp_path, monkeypatch):
+    """With two cards each carrying their own resident engine, a reply for
+    one card must never reach the other's."""
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id_a = db.create_session(conn, project_id)
+    card_id_b = db.create_session(conn, project_id)
+
+    engine_a = _FakeWriteEngine()
+    engine_b = _FakeWriteEngine()
+    monkeypatch.setattr(session_runner, "_pty_engines", {card_id_a: engine_a, card_id_b: engine_b})
+
+    resp = client.post(f"/api/sessions/{card_id_a}/stall-reply", json={"text": "for A"})
+
+    assert resp.json() == {"replied": True}
+    assert engine_a.writes == ["for A"]
+    assert engine_b.writes == []

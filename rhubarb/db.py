@@ -145,6 +145,13 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
         conn.execute("ALTER TABLE sessions ADD COLUMN context_pct REAL")
     if "blocked_json" not in session_columns:
         conn.execute("ALTER TABLE sessions ADD COLUMN blocked_json TEXT")
+    if "stalled_json" not in session_columns:
+        # Issue #169 (child of PRD #168): the latest stalled-turn context
+        # (see `session_runner._run_turn`'s translation loop), persisted the
+        # same way `blocked_json` already is, so a reconnect/page-refresh
+        # can recover and re-show it while the turn is still genuinely stuck
+        # quiet mid-flight.
+        conn.execute("ALTER TABLE sessions ADD COLUMN stalled_json TEXT")
     conn.commit()
     return conn
 

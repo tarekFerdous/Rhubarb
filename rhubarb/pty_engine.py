@@ -168,6 +168,36 @@ _MARKER_INSTRUCTION = (
 # large enough that a normal turn doesn't need many round trips.
 _READ_CHUNK = 4096
 
+# Quiet-period timeout (issue #169, child of PRD #168 "Recover from a
+# stalled turn instead of hanging the turn lock forever"): `_stream_chunks_
+# until_marker`'s read loop previously issued one plain blocking read per
+# iteration with no timeout at all -- if the live CLI process ever went
+# quiet without printing `TURN_COMPLETE_MARKER` (suspected trigger: the
+# raw-passthrough typing feature, issue #165, interfering with the CLI
+# mid-turn -- though the fix below does not depend on knowing the exact
+# cause), that read blocked forever, and the per-card turn lock it's held
+# under in `session_runner._run_turn` never released -- every later submit
+# for that card then permanently failed with "Another turn for this session
+# is already in progress."
+#
+# `_stream_chunks_until_marker` now wraps each read in a `Task` and awaits it
+# via `asyncio.wait(..., timeout=_STALL_QUIET_PERIOD_SECONDS)` instead of a
+# bare `await`. Critically, `asyncio.wait` does NOT cancel a task that times
+# out -- unlike `asyncio.wait_for`, which would cancel (and therefore lose)
+# the pending read -- so on a timeout this only yields a `stall` event and
+# loops back to `asyncio.wait` on the exact SAME still-pending read task,
+# never issuing a second, concurrent read against the same PTY and never
+# losing whatever data eventually arrives. A stall can recur any number of
+# times on the same pending read before it finally resolves.
+#
+# A module-level constant (not hardcoded inline) so a test can monkeypatch
+# it down to a tiny value (see `tests/test_pty_engine.py`'s stall tests) and
+# exercise this path without a real multi-second sleep -- referenced by bare
+# name at call time (like `_render_terminal_text` already is elsewhere in
+# this module), so monkeypatching `pty_engine._STALL_QUIET_PERIOD_SECONDS`
+# takes effect immediately, with no reload needed.
+_STALL_QUIET_PERIOD_SECONDS = 5
+
 # Virtual screen size for `_render_terminal_text`'s terminal emulation.
 # `_VIRTUAL_SCREEN_COLUMNS` is the DEFAULT column width only -- issue #166
 # (dynamic PTY resize) made the real PTY's width per-session state (see
@@ -639,7 +669,7 @@ class PtyEngine:
         self._is_resume = True
         self.start()
 
-    async def _stream_chunks_until_marker(self, prompt: str) -> AsyncIterator[str]:
+    async def _stream_chunks_until_marker(self, prompt: str) -> AsyncIterator[str | dict]:
         """Write `prompt` to the current process and yield each raw output
         chunk exactly as read from the PTY (issue #88 -- this is what lets a
         caller relay the real, unmodified terminal byte stream -- ANSI
@@ -662,6 +692,20 @@ class PtyEngine:
         session's screen resolve live, turn by turn, the same way a real
         terminal watching the raw PTY stream would, without needing to
         attach a separate live-terminal-view consumer.
+
+        Stall detection (issue #169): each pending read is wrapped in a
+        `Task` and awaited via `asyncio.wait(..., timeout=
+        _STALL_QUIET_PERIOD_SECONDS)` -- NOT `asyncio.wait_for`, which would
+        cancel (and lose) the pending read on a timeout. Every time that
+        timeout elapses with the read still unresolved, this yields a
+        `{"type": "stall", "data": <buffer-so-far rendered through
+        _render_terminal_text>}` event and goes right back to waiting on the
+        SAME still-pending task -- never a second, concurrent read against
+        the same PTY, and never cancelled/replaced. This can recur any
+        number of times before the read finally resolves. Once it does, this
+        resumes exactly as before: the chunk (even an empty one, from a
+        completed-but-empty read) is folded into the buffer/marker check
+        below, with no special handling left over from having stalled.
 
         Raises `PtyEngineError` if the process ends first -- callers decide
         what to do with that (see `stream_turn`, which retries this once via
@@ -688,8 +732,19 @@ class PtyEngine:
 
         buffer = ""
         while TURN_COMPLETE_MARKER not in buffer:
+            read_task = asyncio.ensure_future(asyncio.to_thread(self._proc.read, _READ_CHUNK))
+            while True:
+                done, _pending = await asyncio.wait({read_task}, timeout=_STALL_QUIET_PERIOD_SECONDS)
+                if read_task in done:
+                    break
+                # The read is still pending after a full quiet period --
+                # surface a stall event carrying what's been seen so far, and
+                # go back to waiting on this EXACT same task (not a new
+                # read).
+                yield {"type": "stall", "data": _render_terminal_text(buffer, self._cols)}
+
             try:
-                chunk = await asyncio.to_thread(self._proc.read, _READ_CHUNK)
+                chunk = read_task.result()
             except EOFError:
                 raise PtyEngineError(
                     "claude PTY process ended before printing the turn-complete marker"
@@ -745,6 +800,15 @@ class PtyEngine:
         `stream_turn` raises `PtyEngineUnrecoverableError` instead of
         retrying again -- see that class's docstring for the shape a
         caller should route into the blocked-card flow.
+
+        Stall events (issue #169): `_stream_chunks_until_marker` can also
+        yield a `{"type": "stall", ...}` dict (instead of a raw string
+        chunk) whenever the pending read has gone quiet for
+        `_STALL_QUIET_PERIOD_SECONDS`. Those are passed through here
+        unmodified, exactly like `terminal_output` -- they carry no bearing
+        on `buffer`/marker detection (nothing new was actually read) and do
+        not end this loop; the underlying read this turn is waiting on is
+        still pending underneath.
         """
         self.start()
         assert self._proc is not None
@@ -753,16 +817,22 @@ class PtyEngine:
 
         buffer = ""
         try:
-            async for chunk in self._stream_chunks_until_marker(prompt):
-                buffer += chunk
-                yield {"type": "terminal_output", "data": chunk}
+            async for item in self._stream_chunks_until_marker(prompt):
+                if isinstance(item, dict):
+                    yield item
+                    continue
+                buffer += item
+                yield {"type": "terminal_output", "data": item}
         except PtyEngineError as first_error:
             try:
                 self._restart_after_death()
                 buffer = ""
-                async for chunk in self._stream_chunks_until_marker(prompt):
-                    buffer += chunk
-                    yield {"type": "terminal_output", "data": chunk}
+                async for item in self._stream_chunks_until_marker(prompt):
+                    if isinstance(item, dict):
+                        yield item
+                        continue
+                    buffer += item
+                    yield {"type": "terminal_output", "data": item}
             except Exception as second_error:
                 raise PtyEngineUnrecoverableError(
                     "claude PTY process died twice in a row for the same turn "

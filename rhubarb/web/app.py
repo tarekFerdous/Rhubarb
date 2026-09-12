@@ -390,6 +390,7 @@ def _session_to_dict(row) -> dict:
         "error": row["error_text"],
         "needs_github_login": bool(row["needs_github_login"]),
         "blocked": json.loads(row["blocked_json"]) if row["blocked_json"] else None,
+        "stalled": json.loads(row["stalled_json"]) if row["stalled_json"] else None,
     }
 
 
@@ -583,6 +584,43 @@ def resize_session_pty(card_id: int, body: dict):
 
     engine.resize(rows, cols)
     return {"resized": True, "rows": rows, "cols": cols}
+
+
+@app.post("/api/sessions/{card_id}/stall-reply")
+async def reply_to_stalled_session(card_id: int, body: dict):
+    """Forward a reply straight into a card's live PTY process (issue #169,
+    child of PRD #168 "Recover from a stalled turn instead of hanging the
+    turn lock forever"): while `_stream_chunks_until_marker`'s read loop is
+    still waiting on the pending read for the completion marker -- surfaced
+    to this card's SSE stream as `turn` events carrying `stalled: true` (see
+    `session_runner._run_turn`) -- a human may want to nudge the live
+    process along (e.g. resend whatever input it seems to have missed)
+    without waiting indefinitely for that original turn to either resolve
+    on its own or the engine to be torn down.
+
+    Mirrors `resize_session_pty` above in shape: a small, separate HTTP
+    endpoint (not piggybacked on the raw passthrough WebSocket) that looks
+    up this card's resident engine via `get_engine` and forwards straight
+    into its lock-protected `PtyEngine.write()` -- the exact same passthrough
+    path raw interactive typing already uses (issue #165). This does NOT go
+    through `_run_turn`'s own prompt-write machinery, does NOT start a new
+    turn, and does NOT touch the turn lock (`session_runner._get_turn_lock`)
+    a second time -- the original turn's marker-wait loop (still running
+    underneath, holding that lock) remains the single source of truth for
+    when the turn is actually done. This endpoint only ever writes bytes
+    into that same live process's stdin, exactly as a person typing directly
+    into the terminal would.
+
+    A no-op (`{"replied": False}`, not an error) if `card_id` names no live
+    resident engine -- same "nothing to do" shape as `resize_session_pty`."""
+    text = body["text"]
+
+    engine = session_runner.get_engine(card_id)
+    if engine is None:
+        return {"replied": False}
+
+    await engine.write(text)
+    return {"replied": True}
 
 
 @app.post("/api/session/start")
