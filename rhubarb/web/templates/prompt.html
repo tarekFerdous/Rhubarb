@@ -1530,13 +1530,27 @@
     // fact, already been sent through the other channel. Every button click
     // handler that submits a reply goes through this instead of calling
     // sendReply/sendImplementReply directly.
-    function submitReplyFromButton(text, sendFn, triggerBtn) {
-      if (terminalReplySendFn) {
+    //
+    // Issue #170: the echo (and closing out curated reply mode) used to
+    // happen synchronously, before `sendFn`'s network call had even started
+    // -- so a request that failed still left the terminal showing the reply
+    // as if it had gone through, with no visible sign anything went wrong.
+    // `sendFn` (sendReply/sendImplementReply) now resolves to `true` on a
+    // successful request and `false` on one that failed (in which case it
+    // has already called showGrillingError itself). Awaiting that result and
+    // only echoing/closing out curated mode when it's `true` means a failed
+    // submit shows nothing but the error path -- an honest reflection of
+    // what actually happened. `wasTerminalReply` is captured up front, before
+    // the await, so the echo decision reflects the state at submit time
+    // rather than whatever it happens to be once the request resolves.
+    async function submitReplyFromButton(text, sendFn, triggerBtn) {
+      const wasTerminalReply = terminalReplySendFn;
+      markButtonPending(triggerBtn);
+      const ok = await sendFn(text, triggerBtn);
+      if (ok && wasTerminalReply) {
         term.write(text + "\r\n");
         disableTerminalReplyInput();
       }
-      markButtonPending(triggerBtn);
-      sendFn(text, triggerBtn);
     }
 
     // Mode coexistence (issue #167): a single term.onData handler, gated on
@@ -2219,8 +2233,11 @@
       });
     }
 
+    // Issue #170: returns `true`/`false` for whether the request succeeded,
+    // so `submitReplyFromButton` (the structured-answer-box submit path) can
+    // decide whether it's honest to echo the reply into the terminal.
     async function sendReply(replyText, triggerBtn) {
-      if (!replyText.trim() || leftCardId === null) return;
+      if (!replyText.trim() || leftCardId === null) return false;
       // The automated grilling turn this reply kicks off is now in flight
       // (issue #167's passthrough-typing indicator signal) until the next
       // turn/phase/done event for this card clears it.
@@ -2235,11 +2252,13 @@
       if (data.error) {
         turnInFlight = false;
         showGrillingError(data.error);
+        return false;
       }
       // Otherwise, the reply's effect (next questions, or hand-off to the next
       // phase) arrives asynchronously over the already-open event stream, and
       // the pending button is swept away with the rest of the stale
       // interview DOM when the next render replaces it (issue #143).
+      return true;
     }
 
     function renderBlockedSession(snapshot) {
@@ -2264,8 +2283,10 @@
       enableTerminalReplyInput(sendImplementReply);
     }
 
+    // Issue #170: returns `true`/`false` for whether the request succeeded,
+    // same contract as sendReply above, for the same reason.
     async function sendImplementReply(replyText, triggerBtn) {
-      if (!replyText.trim() || leftCardId === null) return;
+      if (!replyText.trim() || leftCardId === null) return false;
       turnInFlight = true;
       const res = await fetch(`/api/sessions/${leftCardId}/implement-reply`, {
         method: "POST",
@@ -2277,12 +2298,14 @@
       if (data.error) {
         turnInFlight = false;
         showGrillingError(data.error);
+        return false;
       }
       // Otherwise, the reply's effect (re-blocked with a new question, or a
       // normal completion) arrives asynchronously over the already-open
       // event stream, same as sendReply/sendConfirmAdvance -- and the
       // pending button is swept away with the rest of the stale interview
       // DOM when the next render replaces it (issue #143).
+      return true;
     }
 
     async function sendConfirmAdvance(triggerBtn) {
