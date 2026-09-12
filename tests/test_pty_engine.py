@@ -1,6 +1,5 @@
 import asyncio
 import re
-import threading
 
 import pytest
 
@@ -717,146 +716,96 @@ def test_stream_turn_starts_the_process_automatically_if_not_already_started():
 
 
 # ---------------------------------------------------------------------------
-# Stall detection on a pending read (issue #169, child of PRD #168 "Recover
-# from a stalled turn instead of hanging the turn lock forever"): the read
-# loop must wait on the SAME pending read across any number of quiet-period
-# timeouts (never cancelling or replacing it -- a second, concurrent read
-# against the same PTY is exactly the bug this exists to avoid), yielding a
-# `stall` event each time, and must still process the eventual real chunk
-# losslessly once that same read finally resolves.
+# Turn-progress events on every chunk (issue #173, child of PRD #172 "Remove
+# the stall-detection timer; always show turn progress plus a reply box
+# instead" -- replacing issue #169/PRD #168's timer-based "stall" detection):
+# the read loop no longer has any timer/timeout wrapper -- a single per-chunk
+# blocking read, same shape as before PRD #168 -- and the SAME `stall` event
+# shape is now yielded after every chunk, unconditionally, with no judgment
+# call about whether anything is actually "stalled".
 # ---------------------------------------------------------------------------
 
 
-class _StallablePtyBackend(FakePtyBackend):
-    """Like `FakePtyBackend`, but once `chunks` is exhausted, `read()`
-    blocks on a real `threading.Event` (not an `asyncio` primitive -- this
-    method runs on a worker thread via `asyncio.to_thread`, same as the real
-    backends' own blocking `read()`) until a test explicitly releases it,
-    then returns `held_chunk`. This is what lets a test simulate a read that
-    is still genuinely pending -- not merely slow -- without blocking the
-    event loop, so `pty_engine`'s stall-timeout logic can poll it via
-    `asyncio.wait(..., timeout=...)` exactly as it would a real stalled PTY
-    read."""
-
-    def __init__(self, initial_chunks, held_chunk, release_event, *, eof_after=True):
-        super().__init__(initial_chunks, eof_after=eof_after)
-        self._held_chunk = held_chunk
-        self._release_event = release_event
-
-    def read(self, size=4096):
-        if self._chunks:
-            self.reads += 1
-            return self._chunks.pop(0)
-        self._release_event.wait()
-        self.reads += 1
-        return self._held_chunk
-
-
-def test_stall_events_fire_while_a_read_is_held_pending_and_the_real_chunk_still_arrives(monkeypatch):
-    """Core stall-detection contract: with the quiet-period timeout shrunk
-    (so this test doesn't take 5 real seconds), a read that's held pending
-    must produce more than one `stall` event -- proving the SAME pending
-    read is being re-awaited, not abandoned after the first timeout -- and,
-    once released, the real chunk (containing the completion marker) must
-    still arrive intact, ending the turn normally."""
-    import rhubarb.pty_engine as pty_engine_module
-
-    monkeypatch.setattr(pty_engine_module, "_STALL_QUIET_PERIOD_SECONDS", 0.05)
-
-    release = threading.Event()
-    backend = _StallablePtyBackend([], f"finally here\n{TURN_COMPLETE_MARKER}\n", release)
+def test_progress_event_fires_after_every_chunk_unconditionally():
+    """Each raw chunk read off the PTY must be followed by a `{"type":
+    "stall", "data": ...}` progress event -- not just some of them, and not
+    gated on any quiet period -- for the whole duration of the turn."""
+    chunks = ["Working", " on it...\n", f"Here you go.\n{TURN_COMPLETE_MARKER}\n"]
+    backend = FakePtyBackend(chunks)
     factory, _ = _fake_factory(backend)
     engine = PtyEngine(pty_factory=factory)
 
-    async def scenario():
-        events = []
-        stall_count = 0
-        async for event in engine.stream_turn("hi"):
-            events.append(event)
-            if isinstance(event, dict) and event.get("type") == "stall":
-                stall_count += 1
-                if stall_count >= 3:
-                    release.set()
-        return events
+    events = run(_collect(engine.stream_turn("hi")))
 
-    events = run(scenario())
-
-    stall_events = [e for e in events if e["type"] == "stall"]
-    # More than one -- the same pending read timed out, yielded a stall, and
-    # was waited on again, more than once, before it ever resolved.
-    assert len(stall_events) >= 3
-    for stall_event in stall_events:
-        # Buffer-so-far was empty the whole time the read was pending --
-        # nothing had been read yet.
-        assert stall_event["data"] == ""
-
-    # The real chunk still arrived, losslessly, once the pending read
-    # finally resolved -- the turn completed exactly as it would have with
-    # no stall at all.
-    assert events[-1]["type"] == "result"
-    assert events[-1]["is_error"] is False
-    assert "finally here" in events[-1]["result"]
-    assert TURN_COMPLETE_MARKER not in events[-1]["result"]
-
-    # Exactly one real read call ever resolved (the held one) -- no second,
-    # concurrent read was ever issued against the same backend while the
-    # first was still pending.
-    assert backend.reads == 1
+    progress_events = [e for e in events if isinstance(e, dict) and e.get("type") == "stall"]
+    # Exactly one progress event per chunk read -- none skipped, none extra.
+    assert len(progress_events) == len(chunks)
 
 
-def test_stall_events_carry_the_buffer_so_far_rendered_through_render_terminal_text(monkeypatch):
-    """A stall occurring after some real output has already been read must
-    carry THAT buffer-so-far (rendered, not raw) in its `data` -- not an
-    empty string -- proving it reflects what's actually been seen, not just
-    a static placeholder."""
-    import rhubarb.pty_engine as pty_engine_module
-
-    monkeypatch.setattr(pty_engine_module, "_STALL_QUIET_PERIOD_SECONDS", 0.05)
-
-    release = threading.Event()
-    backend = _StallablePtyBackend(
-        ["Working on it...\n"], f"Done now.\n{TURN_COMPLETE_MARKER}\n", release
-    )
+def test_progress_event_carries_the_buffer_so_far_rendered_through_render_terminal_text():
+    """Each progress event's `data` must be the buffer-so-far (accumulated
+    across every chunk read up to and including that one), rendered through
+    the same `_render_terminal_text` function `stream_turn`'s final `result`
+    uses -- not a static placeholder and not just the latest chunk in
+    isolation."""
+    # "\r\n" line endings (real PTY output performs the LF -> CRLF
+    # translation itself) so the second chunk's text starts at column 0 on
+    # its own new line rather than continuing mid-line after the first --
+    # and the marker arrives as its own third chunk so the second progress
+    # event's rendered buffer doesn't already include it.
+    chunks = ["Working on it...\r\n", "Done now.\r\n", f"{TURN_COMPLETE_MARKER}\n"]
+    backend = FakePtyBackend(chunks)
     factory, _ = _fake_factory(backend)
     engine = PtyEngine(pty_factory=factory)
 
-    async def scenario():
-        events = []
-        stall_count = 0
-        async for event in engine.stream_turn("hi"):
-            events.append(event)
-            if isinstance(event, dict) and event.get("type") == "stall":
-                stall_count += 1
-                if stall_count >= 2:
-                    release.set()
-        return events
+    events = run(_collect(engine.stream_turn("hi")))
 
-    events = run(scenario())
-
-    stall_events = [e for e in events if e["type"] == "stall"]
-    assert len(stall_events) >= 2
-    for stall_event in stall_events:
-        # `_render_terminal_text` keeps the trailing (empty) line the
-        # cursor moved to after the "\n" -- same rendering `stream_turn`'s
-        # own `result` text goes through.
-        assert stall_event["data"] == "Working on it...\n"
+    progress_events = [e for e in events if isinstance(e, dict) and e.get("type") == "stall"]
+    assert len(progress_events) == 3
+    assert progress_events[0]["data"] == "Working on it...\n"
+    assert progress_events[1]["data"] == "Working on it...\nDone now.\n"
 
     assert "Done now." in events[-1]["result"]
 
 
-def test_no_stall_events_fire_when_reads_resolve_faster_than_the_quiet_period():
-    """Regression guard: an ordinary fast turn (every `FakePtyBackend.read()`
-    call returns immediately, as in every other test in this file) must
-    never produce a `stall` event -- the default 5-second quiet period is
-    never hit by a read that resolves essentially instantly."""
+def test_progress_event_is_yielded_for_a_single_chunk_turn_with_no_timer_involved():
+    """Regression guard for the old timer-based design: even a turn whose
+    marker arrives in the very first chunk (no multi-chunk streaming at all)
+    must still get its one progress event -- this is unconditional per-chunk
+    behavior, not something that only kicks in after a delay."""
     backend = FakePtyBackend([f"quick reply\n{TURN_COMPLETE_MARKER}\n"])
     factory, _ = _fake_factory(backend)
     engine = PtyEngine(pty_factory=factory)
 
     events = run(_collect(engine.stream_turn("hi")))
 
-    assert not any(e["type"] == "stall" for e in events)
+    progress_events = [e for e in events if isinstance(e, dict) and e.get("type") == "stall"]
+    assert len(progress_events) == 1
     assert events[-1]["type"] == "result"
+
+
+def test_stream_chunks_until_marker_has_no_timer_wrapper_around_the_read(monkeypatch):
+    """Acceptance criterion: the read loop must be a single per-chunk
+    blocking read with no `asyncio.wait(..., timeout=...)`/`asyncio.wait_for`
+    wrapper left over from the old timer-based design -- verified by
+    replacing `asyncio.wait` with a stub that fails the test if it's ever
+    called, then running a normal multi-chunk turn through it."""
+    import rhubarb.pty_engine as pty_engine_module
+
+    def _wait_must_not_be_called(*args, **kwargs):
+        raise AssertionError("asyncio.wait must not be used by the read loop anymore")
+
+    monkeypatch.setattr(pty_engine_module.asyncio, "wait", _wait_must_not_be_called)
+
+    chunks = ["Working", " on it...\n", f"Here you go.\n{TURN_COMPLETE_MARKER}\n"]
+    backend = FakePtyBackend(chunks)
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+
+    events = run(_collect(engine.stream_turn("hi")))
+
+    assert events[-1]["type"] == "result"
+    assert not hasattr(pty_engine_module, "_STALL_QUIET_PERIOD_SECONDS")
 
 
 # ---------------------------------------------------------------------------

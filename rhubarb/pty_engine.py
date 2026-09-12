@@ -133,6 +133,31 @@ process's stdout. This is unconditional: no environment variable or config
 flag gates it, and it applies uniformly to every PTY-driven turn regardless
 of phase. It is purely a console side effect -- it changes nothing about
 what `_stream_chunks_until_marker`/`stream_turn` yield to callers.
+
+## Turn progress (issue #173, replacing issue #169's timer-based "stall"
+detection)
+
+PRD #168/issue #169 originally added a 5-second quiet-period timeout around
+the pending PTY read: if a chunk hadn't arrived within
+`_STALL_QUIET_PERIOD_SECONDS`, a `{"type": "stall", "data": <rendered
+buffer-so-far>}` event fired, on the theory that a long quiet spell meant
+the turn was stuck. In practice this produced false positives -- a grilling
+or QA-grilling round can legitimately think for longer than 5 seconds with
+nothing wrong at all -- and the frontend's stall panel would pop up mid-turn
+looking like an error when the CLI was simply still working.
+
+Issue #173 removes that timer and the judgment call it required entirely.
+`_stream_chunks_until_marker`'s read loop is back to a single, plain
+blocking read per iteration (the same shape it had before PRD #168), and it
+now yields that SAME `{"type": "stall", "data": ...}` event -- unchanged
+shape/field names, to minimize churn in `session_runner.py` and the
+frontend, which already handle it correctly -- after every chunk,
+unconditionally, for every turn, in every phase. There is no more
+distinction between "stalled" and "not stalled": the event is really just a
+turn-progress heartbeat now, always present for the whole duration of a
+turn. `stream_turn`'s live console trace print and this event now reuse the
+exact same `_render_terminal_text(buffer, self._cols)` call per chunk --
+only one render call per chunk, not two.
 """
 
 import asyncio
@@ -167,36 +192,6 @@ _MARKER_INSTRUCTION = (
 # Read chunk size for polling the PTY. Small enough not to over-buffer,
 # large enough that a normal turn doesn't need many round trips.
 _READ_CHUNK = 4096
-
-# Quiet-period timeout (issue #169, child of PRD #168 "Recover from a
-# stalled turn instead of hanging the turn lock forever"): `_stream_chunks_
-# until_marker`'s read loop previously issued one plain blocking read per
-# iteration with no timeout at all -- if the live CLI process ever went
-# quiet without printing `TURN_COMPLETE_MARKER` (suspected trigger: the
-# raw-passthrough typing feature, issue #165, interfering with the CLI
-# mid-turn -- though the fix below does not depend on knowing the exact
-# cause), that read blocked forever, and the per-card turn lock it's held
-# under in `session_runner._run_turn` never released -- every later submit
-# for that card then permanently failed with "Another turn for this session
-# is already in progress."
-#
-# `_stream_chunks_until_marker` now wraps each read in a `Task` and awaits it
-# via `asyncio.wait(..., timeout=_STALL_QUIET_PERIOD_SECONDS)` instead of a
-# bare `await`. Critically, `asyncio.wait` does NOT cancel a task that times
-# out -- unlike `asyncio.wait_for`, which would cancel (and therefore lose)
-# the pending read -- so on a timeout this only yields a `stall` event and
-# loops back to `asyncio.wait` on the exact SAME still-pending read task,
-# never issuing a second, concurrent read against the same PTY and never
-# losing whatever data eventually arrives. A stall can recur any number of
-# times on the same pending read before it finally resolves.
-#
-# A module-level constant (not hardcoded inline) so a test can monkeypatch
-# it down to a tiny value (see `tests/test_pty_engine.py`'s stall tests) and
-# exercise this path without a real multi-second sleep -- referenced by bare
-# name at call time (like `_render_terminal_text` already is elsewhere in
-# this module), so monkeypatching `pty_engine._STALL_QUIET_PERIOD_SECONDS`
-# takes effect immediately, with no reload needed.
-_STALL_QUIET_PERIOD_SECONDS = 5
 
 # Virtual screen size for `_render_terminal_text`'s terminal emulation.
 # `_VIRTUAL_SCREEN_COLUMNS` is the DEFAULT column width only -- issue #166
@@ -693,19 +688,19 @@ class PtyEngine:
         terminal watching the raw PTY stream would, without needing to
         attach a separate live-terminal-view consumer.
 
-        Stall detection (issue #169): each pending read is wrapped in a
-        `Task` and awaited via `asyncio.wait(..., timeout=
-        _STALL_QUIET_PERIOD_SECONDS)` -- NOT `asyncio.wait_for`, which would
-        cancel (and lose) the pending read on a timeout. Every time that
-        timeout elapses with the read still unresolved, this yields a
-        `{"type": "stall", "data": <buffer-so-far rendered through
-        _render_terminal_text>}` event and goes right back to waiting on the
-        SAME still-pending task -- never a second, concurrent read against
-        the same PTY, and never cancelled/replaced. This can recur any
-        number of times before the read finally resolves. Once it does, this
-        resumes exactly as before: the chunk (even an empty one, from a
-        completed-but-empty read) is folded into the buffer/marker check
-        below, with no special handling left over from having stalled.
+        Turn progress (issue #173, replacing issue #169's timer-based
+        "stall" detection): the SAME rendered buffer-so-far computed for the
+        live console trace above is also yielded to the caller, as a
+        `{"type": "stall", "data": <rendered buffer-so-far>}` event -- after
+        EVERY chunk read, unconditionally, for the whole duration of any
+        turn, in every phase. This event shape/name is unchanged from issue
+        #169 on purpose (minimizes churn in `session_runner.py` and the
+        frontend, which already handle it correctly); what changed is when
+        it fires -- no timer, no quiet-period judgment call, just "a chunk
+        was read" -- so it is really a turn-progress heartbeat now, not a
+        signal that anything is actually stuck. This is a single per-chunk
+        read with no timeout wrapper, the same shape this loop had before
+        PRD #168 introduced the quiet-period timer.
 
         Raises `PtyEngineError` if the process ends first -- callers decide
         what to do with that (see `stream_turn`, which retries this once via
@@ -732,19 +727,8 @@ class PtyEngine:
 
         buffer = ""
         while TURN_COMPLETE_MARKER not in buffer:
-            read_task = asyncio.ensure_future(asyncio.to_thread(self._proc.read, _READ_CHUNK))
-            while True:
-                done, _pending = await asyncio.wait({read_task}, timeout=_STALL_QUIET_PERIOD_SECONDS)
-                if read_task in done:
-                    break
-                # The read is still pending after a full quiet period --
-                # surface a stall event carrying what's been seen so far, and
-                # go back to waiting on this EXACT same task (not a new
-                # read).
-                yield {"type": "stall", "data": _render_terminal_text(buffer, self._cols)}
-
             try:
-                chunk = read_task.result()
+                chunk = await asyncio.to_thread(self._proc.read, _READ_CHUNK)
             except EOFError:
                 raise PtyEngineError(
                     "claude PTY process ended before printing the turn-complete marker"
@@ -756,7 +740,13 @@ class PtyEngine:
                     )
                 continue
             buffer += chunk
-            print(f"[pty live]\n{_render_terminal_text(buffer, self._cols)}")
+            rendered = _render_terminal_text(buffer, self._cols)
+            print(f"[pty live]\n{rendered}")
+            # Turn progress (issue #173): the exact same rendered text just
+            # printed above, yielded unconditionally after every chunk -- see
+            # this method's docstring for why this reuses the issue #169
+            # `stall` event shape rather than introducing a new one.
+            yield {"type": "stall", "data": rendered}
             yield chunk
 
     async def stream_turn(self, prompt: str) -> AsyncIterator[dict]:
@@ -801,14 +791,14 @@ class PtyEngine:
         retrying again -- see that class's docstring for the shape a
         caller should route into the blocked-card flow.
 
-        Stall events (issue #169): `_stream_chunks_until_marker` can also
-        yield a `{"type": "stall", ...}` dict (instead of a raw string
-        chunk) whenever the pending read has gone quiet for
-        `_STALL_QUIET_PERIOD_SECONDS`. Those are passed through here
-        unmodified, exactly like `terminal_output` -- they carry no bearing
-        on `buffer`/marker detection (nothing new was actually read) and do
-        not end this loop; the underlying read this turn is waiting on is
-        still pending underneath.
+        Turn progress events (issue #173, replacing issue #169's timer-based
+        "stall" detection): `_stream_chunks_until_marker` also yields a
+        `{"type": "stall", ...}` dict (instead of a raw string chunk) after
+        EVERY chunk it reads, unconditionally -- not just when a quiet
+        period elapses. Those are passed through here unmodified, exactly
+        like `terminal_output` -- they carry no bearing on `buffer`/marker
+        detection (nothing about marker detection depends on them) and do
+        not end this loop.
         """
         self.start()
         assert self._proc is not None
