@@ -645,6 +645,26 @@ textarea.prompt-box:focus {
   margin: 0 0 24px;
 }
 
+/* Rendered terminal output-so-far shown as context in the stall-reply state
+   (issue #171, child of PRD #168) -- preformatted/monospace since it's a
+   captured render of PTY output (possibly multi-line), scroll-capped so a
+   long capture can't blow out the rest of the interview area. */
+.stalled-context {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: var(--fg-muted);
+  background: rgba(127, 127, 127, 0.06);
+  border: 1px solid var(--card-border);
+  border-radius: 14px;
+  padding: 12px 14px;
+  margin: 0 0 20px;
+  max-height: 240px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .rescue-source-badge {
   display: inline-block;
   padding: 2px 8px;

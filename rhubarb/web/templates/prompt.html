@@ -559,9 +559,10 @@
     function showOnly(el) {
       [emptyStateEl, projectPickerEl, mainFlowEl, sessionStatusEl].forEach((e) => (e.hidden = e !== el));
       // Every state transition calls showOnly() -- disabling terminal reply
-      // input here by default means only renderInterview/renderBlockedSession
-      // (and the "keep discussing" manual-reply fallback), which each
-      // re-enable it at their own end, ever leave it on.
+      // input here by default means only renderInterview/renderBlockedSession/
+      // renderStalledSession (issue #171) (and the "keep discussing"
+      // manual-reply fallback), which each re-enable it at their own end,
+      // ever leave it on.
       disableTerminalReplyInput();
     }
 
@@ -1961,6 +1962,41 @@
     }
 
     function applyTurn(cardId, event) {
+      // Issue #171 (child of PRD #168): a stall is a heartbeat published
+      // mid-turn, not a resolved turn -- the turn lock is still held and
+      // nothing has actually completed underneath (see session_runner._run_
+      // turn's `translated["type"] == "stall"` branch, which keeps looping
+      // and never releases the lock). This check must come before EVERY
+      // phase-based branch below: a stall can happen mid-turn during any
+      // phase (grilling, implementing, qa_grilling, ...), not just a
+      // dedicated "stalled" phase -- `event.phase` here is still whatever
+      // phase this turn was already running as. It must also NOT fall
+      // through to `cardsWithTurn.add`/clearing `turnInFlight` below, since
+      // both of those track a turn's actual completion, and this one hasn't
+      // completed.
+      if (event.stalled) {
+        const prior = cardSnapshots.get(cardId) || {};
+        const snapshot = {
+          ...prior,
+          card_id: cardId,
+          session_type: cardSessionTypes.get(cardId) || prior.session_type || "do",
+          // Same {phase, context} shape `_session_to_dict` reads back out of
+          // `stalled_json` (see rhubarb/web/app.py) -- so renderStalledSession
+          // below works identically whether it's fed a live snapshot built
+          // here or one recovered from a page reload/reconnect.
+          stalled: { phase: event.phase, context: event.stalled_context },
+        };
+        cardSnapshots.set(cardId, snapshot);
+
+        if (leftCardId === cardId) {
+          setHeading("Stalled — needs your input");
+          startForm.style.display = "none";
+          showOnly(mainFlowEl);
+          renderStalledSession(snapshot);
+        }
+        return;
+      }
+
       cardsWithTurn.add(cardId);
       // This event is a turn's actual response arriving for `cardId` --
       // if that's the focused card, its automated turn is no longer in
@@ -1981,6 +2017,12 @@
         // QA-specific fields (present when phase === "qa_grilling")
         prd: event.prd || null,
         issues: event.issues || null,
+        // Issue #171: this is a genuinely resolved turn (event.stalled is
+        // falsy, or this branch wouldn't have been reached) -- clear any
+        // stall recorded on this card by an earlier event, mirroring
+        // session_runner clearing `stalled_json` back to None the moment
+        // the completion marker is finally seen.
+        stalled: null,
       };
       cardSnapshots.set(cardId, snapshot);
 
@@ -2308,6 +2350,81 @@
       return true;
     }
 
+    // Issue #171 (child of PRD #168 "Recover from a stalled turn instead of
+    // hanging the turn lock forever"): rendered whenever the focused card's
+    // latest snapshot carries a `stalled` context -- either a live `turn`
+    // event with `stalled: true` (see applyTurn above) or a persisted one
+    // recovered on reconnect/reload (see renderLeftSession below, and
+    // `_session_to_dict`'s `stalled` field in rhubarb/web/app.py). Shows the
+    // rendered terminal output captured at the moment of the stall as
+    // context, plus the same manual-reply box/button widget the other two
+    // curated-reply states already use, wired to sendStallReply instead of
+    // sendReply/sendImplementReply. Mirrors renderBlockedSession's shape.
+    //
+    // This can recur indefinitely for the same card/turn with no cap: every
+    // subsequent stall event is just another call to this same function
+    // with a fresh snapshot (applyTurn replaces cardSnapshots wholesale each
+    // time), and every call re-claims curated reply mode the same way.
+    function renderStalledSession(snapshot) {
+      interviewEl.innerHTML = "";
+      startForm.style.display = "none";
+
+      const stalled = snapshot.stalled || {};
+
+      const q = document.createElement("p");
+      q.className = "question-text";
+      q.textContent = "The live process has gone quiet mid-turn. Send a reply to nudge it along.";
+      interviewEl.appendChild(q);
+
+      if (stalled.context) {
+        const ctx = document.createElement("pre");
+        ctx.className = "stalled-context";
+        ctx.textContent = stalled.context;
+        interviewEl.appendChild(ctx);
+      }
+
+      interviewEl.appendChild(renderManualReply(sendStallReply));
+      enableTerminalReplyInput(sendStallReply);
+    }
+
+    // Issue #171: submits a reply while the focused card's turn is stalled.
+    // Unlike sendReply/sendImplementReply, this does NOT start a new turn
+    // and does NOT touch the turn lock -- it posts straight to the issue
+    // #169 stall-reply endpoint, which forwards the text directly into the
+    // live process's stdin via `PtyEngine.write()`, exactly as raw
+    // passthrough typing already does (issue #165). That endpoint forwards
+    // `text` byte-for-byte with no marker/newline handling of its own (see
+    // `reply_to_stalled_session`'s docstring in rhubarb/web/app.py) -- a
+    // trailing "\r" is appended here so the live process actually treats
+    // the line as submitted, the same as an Enter keystroke would through
+    // raw passthrough, rather than leaving it sitting unsubmitted in the
+    // process's input buffer.
+    //
+    // Returns `true`/`false`, same contract as sendReply/sendImplementReply,
+    // so submitReplyFromButton's success-gated echo (issue #170) works
+    // identically here.
+    async function sendStallReply(replyText, triggerBtn) {
+      if (!replyText.trim() || leftCardId === null) return false;
+      const res = await fetch(`/api/sessions/${leftCardId}/stall-reply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: replyText + "\r" }),
+      });
+      const data = await res.json();
+
+      if (!data.replied) {
+        showGrillingError(
+          "Could not deliver your reply -- this session's live process is no longer running."
+        );
+        return false;
+      }
+      // Otherwise, the process's own response (if any) streams in over the
+      // existing `terminal_output` SSE events, and either resolves the turn
+      // normally or stalls again -- both arrive as further `turn` events
+      // handled by applyTurn above.
+      return true;
+    }
+
     async function sendConfirmAdvance(triggerBtn) {
       if (leftCardId === null) return;
       markButtonPending(triggerBtn);
@@ -2607,6 +2724,24 @@
       // reconnects the passthrough socket; doing it here too would just be
       // an immediately-superseded connect/disconnect.
       refreshModelEffortCard();
+
+      // Issue #171: a stall can happen mid-turn during ANY phase, so this
+      // recovery check comes before every phase-based branch below, same as
+      // applyTurn's own ordering. `cardSnapshots` may hold a fresher stalled
+      // context than `session` (from the `_session_to_dict` queue fetch, or
+      // a stale rightCards entry) does -- same fallback precedent as the
+      // qa_grilling/blocked branches just below. This is what makes a page
+      // refresh mid-stall (no cardSnapshots entry yet, so `session` itself
+      // -- straight from `_session_to_dict`'s persisted `stalled` field --
+      // is used) re-show this same state instead of losing it.
+      const snap = cardSnapshots.get(session.card_id) || session;
+      if (snap.stalled) {
+        startForm.style.display = "none";
+        setHeading("Stalled — needs your input");
+        showOnly(mainFlowEl);
+        renderStalledSession(snap);
+        return;
+      }
 
       if (session.phase === "grilling") {
         startForm.style.display = "none";
