@@ -4119,31 +4119,36 @@ def test_turn_lock_is_released_after_the_turn_completes(client, tmp_path, monkey
     assert not session_runner._get_turn_lock(row_id).locked()
 
 
-def test_stall_event_keeps_the_turn_lock_held_and_does_not_end_run_turn(client, tmp_path, monkeypatch):
-    """Issue #169 (child of PRD #168 "Recover from a stalled turn instead of
-    hanging the turn lock forever"): a `stall` raw event -- `PtyEngine`
-    reporting its pending read has gone quiet, but is NOT giving up on it --
-    must be treated by `_run_turn`'s translation loop as first-class and
-    repeatable: published on the card's stream (as the existing `turn` event
-    shape, extended with `stalled`/`stalled_context`) and persisted onto the
-    row (mirroring `blocked_json`), all WITHOUT releasing the turn lock or
-    letting the in-flight `_run_turn` call return -- the underlying read is
-    still pending underneath. Once the turn genuinely resolves afterward,
-    the lock is released normally and the persisted stall context is
-    cleared, exactly as if it had never stalled."""
+def test_progress_event_keeps_the_turn_lock_held_and_does_not_end_run_turn(client, tmp_path, monkeypatch):
+    """Issue #173 (child of PRD #172 "Remove the stall-detection timer;
+    always show turn progress plus a reply box instead"): `PtyEngine` now
+    yields a `stall`-shaped progress event after every chunk it reads,
+    unconditionally, for the whole duration of any turn -- not just when a
+    quiet period elapses (the old, now-removed issue #169/PRD #168 timer
+    design). `_run_turn`'s translation loop must still treat each of these
+    as first-class and repeatable: published on the card's stream (as the
+    existing `turn` event shape, extended with `stalled`/`stalled_context`)
+    and persisted onto the row (mirroring `blocked_json`), all WITHOUT
+    releasing the turn lock or letting the in-flight `_run_turn` call
+    return -- the underlying turn is still genuinely in progress. This test
+    simulates an entirely ordinary, un-stalled multi-chunk turn (no quiet
+    period, no timer, nothing "wrong" at all) to prove the plumbing holds up
+    for the normal case, since every turn now takes this path. Once the turn
+    genuinely resolves, the lock is released normally and the persisted
+    progress context is cleared."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     release = asyncio.Event()
 
-    class StallingFakeEngine:
-        instances: list["StallingFakeEngine"] = []
+    class ProgressStreamingFakeEngine:
+        instances: list["ProgressStreamingFakeEngine"] = []
 
         def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, pty_factory=None):
             self.claude_session_id = resume_session_id or "fresh-1"
             self.started = False
             self.closed = False
-            StallingFakeEngine.instances.append(self)
+            ProgressStreamingFakeEngine.instances.append(self)
 
         def start(self):
             self.started = True
@@ -4156,13 +4161,18 @@ def test_stall_event_keeps_the_turn_lock_held_and_does_not_end_run_turn(client, 
             return self.started and not self.closed
 
         async def stream_turn(self, prompt):
+            # Two ordinary progress events -- one per chunk a real
+            # `PtyEngine` would have read off the PTY -- before the turn
+            # actually resolves. Nothing here simulates a stall/quiet
+            # period; this is just what every turn's event stream looks
+            # like now.
             yield {"type": "system", "subtype": "init", "session_id": self.claude_session_id}
-            yield {"type": "stall", "data": "still working on it..."}
-            yield {"type": "stall", "data": "still working on it..."}
+            yield {"type": "stall", "data": "Working on it...\n"}
+            yield {"type": "stall", "data": "Working on it...\nStill going...\n"}
             await release.wait()
             yield _result_event("done at last", session_id=self.claude_session_id)
 
-    monkeypatch.setattr(session_runner, "PtyEngine", StallingFakeEngine)
+    monkeypatch.setattr(session_runner, "PtyEngine", ProgressStreamingFakeEngine)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -4173,13 +4183,13 @@ def test_stall_event_keeps_the_turn_lock_held_and_does_not_end_run_turn(client, 
                 row_id, "prompt", session_id=None, cwd=cwd, model=None, effort=None, phase="grilling"
             )
         )
-        # Let the translation loop actually process both stall events
+        # Let the translation loop actually process both progress events
         # (nothing past them yet -- `release` isn't set) before asserting.
         for _ in range(10):
             await asyncio.sleep(0)
 
-        # A stall must not end the call or release the lock -- the
-        # underlying read is still genuinely pending.
+        # A progress event must not end the call or release the lock -- the
+        # turn is still genuinely in flight.
         assert not task.done()
         assert session_runner._get_turn_lock(row_id).locked()
 
@@ -4188,7 +4198,7 @@ def test_stall_event_keeps_the_turn_lock_held_and_does_not_end_run_turn(client, 
         row = db.get_session(conn, row_id)
         assert row["stalled_json"] is not None
         stalled = json.loads(row["stalled_json"])
-        assert stalled == {"phase": "grilling", "context": "still working on it..."}
+        assert stalled == {"phase": "grilling", "context": "Working on it...\nStill going...\n"}
 
         release.set()
         return await task
@@ -4201,18 +4211,18 @@ def test_stall_event_keeps_the_turn_lock_held_and_does_not_end_run_turn(client, 
     # resolves.
     assert not session_runner._get_turn_lock(row_id).locked()
 
-    # And the persisted stall context is cleared -- a later reconnect must
-    # not see a stall that's actually long over.
+    # And the persisted progress context is cleared once the turn resolves.
     row = db.get_session(conn, row_id)
     assert row["stalled_json"] is None
 
     events = live_stream._buffers.get(row_id, [])
-    stall_turn_events = [e for e in events if e["type"] == "turn" and e.get("stalled")]
-    assert len(stall_turn_events) == 2
-    for event in stall_turn_events:
-        assert event["phase"] == "grilling"
-        assert event["stalled_context"] == "still working on it..."
-    # No error was ever published just because a stall happened.
+    progress_turn_events = [e for e in events if e["type"] == "turn" and e.get("stalled")]
+    assert len(progress_turn_events) == 2
+    assert progress_turn_events[0]["phase"] == "grilling"
+    assert progress_turn_events[0]["stalled_context"] == "Working on it...\n"
+    assert progress_turn_events[1]["phase"] == "grilling"
+    assert progress_turn_events[1]["stalled_context"] == "Working on it...\nStill going...\n"
+    # No error was ever published just because ordinary progress events fired.
     assert not any(e.get("error") for e in events if e["type"] == "turn")
 
 

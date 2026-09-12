@@ -701,10 +701,17 @@ async def _run_turn(
             engine = _get_or_create_engine(
                 card_id, cwd=cwd, model=model, effort=effort, resume_session_id=session_id
             )
-            # Lazily opened, and only if a stall actually happens this turn
-            # -- most turns never do. Reused for both persisting the stall
-            # (below) and clearing it again once this turn resolves, rather
-            # than opening a fresh connection for each.
+            # Lazily opened on this turn's first `stall`-shaped progress
+            # event (see below). Issue #173 replaced the old timer-based
+            # stall detection with an unconditional per-chunk progress event
+            # -- so, unlike issue #169's original "most turns never do"
+            # assumption, this now opens on (essentially) every turn, at its
+            # first chunk. Still just ONE connection for the whole turn,
+            # though: reused for every persist below and for clearing it
+            # again once the turn resolves, never reopened per chunk -- so
+            # staying lazy here still costs nothing extra over eagerly
+            # opening it up front, and skips the connection entirely for the
+            # rare turn that dies before a single chunk is ever read.
             stall_conn = None
             stalled = False
 
@@ -713,17 +720,21 @@ async def _run_turn(
                 if translated is None:
                     continue
                 if translated["type"] == "stall":
-                    # Issue #169: the live process has gone quiet mid-turn,
-                    # but the underlying read `stream_turn` is awaiting is
-                    # still pending underneath -- this loop is NOT ending,
-                    # and the turn lock (`lock`, held for this whole `async
+                    # Issue #173 (replacing issue #169's timer-based stall
+                    # detection): this now fires after every chunk read,
+                    # unconditionally, for the whole duration of any turn --
+                    # it is a turn-progress heartbeat, not a signal that
+                    # anything is actually stuck. The underlying read
+                    # `stream_turn` is awaiting is still pending underneath
+                    # each time this fires -- this loop is NOT ending, and
+                    # the turn lock (`lock`, held for this whole `async
                     # with` block) is NOT released. Publish this as the
                     # existing `turn` event shape (extended with
                     # `stalled`/`stalled_context`) so a caller already
                     # listening for `turn` events picks it up for free, and
                     # persist the same context on the row -- mirroring how
                     # `blocked_json` is persisted -- so a later reconnect
-                    # can recover and re-show it even after this stall event
+                    # can recover and re-show it even after this event
                     # itself has scrolled out of the live SSE stream.
                     stalled = True
                     if stall_conn is None:
@@ -798,14 +809,17 @@ def _turn_event(
     path that already shows the phase label (see `prompt.html`), rather than
     a new display surface.
 
-    `stalled`/`stalled_context` (issue #169, child of PRD #168) are this
-    same `turn` event shape extended, rather than a new event type, for a
-    turn that's still genuinely in flight but has gone quiet for a full
-    `pty_engine._STALL_QUIET_PERIOD_SECONDS` -- see `_run_turn`'s
-    translation loop, the only caller that ever sets these. `stalled_context`
-    is the live-process's buffer-so-far (already rendered through
-    `_render_terminal_text`) at the moment of that stall, for a UI to show
-    what the process was doing right before it went quiet.
+    `stalled`/`stalled_context` (issue #173, replacing issue #169/PRD #168's
+    original timer-based version) are this same `turn` event shape extended,
+    rather than a new event type, for a turn that's still genuinely in
+    flight -- see `_run_turn`'s translation loop, the only caller that ever
+    sets these. Issue #173 removed the old quiet-period timer entirely: this
+    is now published after every chunk `PtyEngine` reads off the live
+    process, for the whole duration of any turn, in every phase -- a
+    continuous turn-progress heartbeat, not a signal that anything is stuck.
+    `stalled_context` is the live-process's buffer-so-far (already rendered
+    through `_render_terminal_text`) at the moment this was published, for a
+    UI to show what the process is doing right now.
     """
     if error is not None:
         error_log.log_error(project_id=project_id, card_id=card_id, phase=phase, message=error)
