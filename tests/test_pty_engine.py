@@ -1126,6 +1126,55 @@ def test_close_is_a_noop_when_never_started():
 
 
 # ---------------------------------------------------------------------------
+# stream_reply() -- the read-only counterpart to stream_turn (issue #177)
+# ---------------------------------------------------------------------------
+
+
+def test_stream_reply_writes_nothing_and_yields_terminal_output_then_result():
+    """`stream_reply` must never write to the backend itself -- the reply it
+    consumes was already written elsewhere, out of band (e.g. by the
+    `/stall-reply` endpoint's own `PtyEngine.write()` call) -- it only reads
+    until the marker appears, same event shapes `stream_turn` yields."""
+    backend = FakePtyBackend([f"Got it.\n{TURN_COMPLETE_MARKER}\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+    engine.start()
+
+    events = run(_collect(engine.stream_reply()))
+
+    assert backend.writes == []
+    assert events[0]["type"] == "terminal_output"
+    assert events[-1]["type"] == "result"
+    assert events[-1]["session_id"] == engine.claude_session_id
+    assert events[-1]["result"] == "Got it.\n"
+    assert events[-1]["is_error"] is False
+
+
+def test_stream_reply_stops_reading_as_soon_as_marker_appears_across_chunks():
+    backend = FakePtyBackend(["Part one. ", "Part two.\n", TURN_COMPLETE_MARKER, "\n"])
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+    engine.start()
+
+    events = run(_collect(engine.stream_reply()))
+
+    assert events[-1]["result"] == "Part one. Part two.\n"
+
+
+def test_stream_reply_raises_if_process_exits_before_printing_the_marker():
+    """Unlike `stream_turn`, a process death here is never retried -- there
+    is no original prompt this method could safely resend (the write
+    already happened elsewhere, out of band)."""
+    backend = FakePtyBackend(["still waiting..."], eof_after=True)
+    factory, _ = _fake_factory(backend)
+    engine = PtyEngine(pty_factory=factory)
+    engine.start()
+
+    with pytest.raises(PtyEngineError):
+        run(_collect(engine.stream_reply()))
+
+
+# ---------------------------------------------------------------------------
 # Public write() passthrough path and the shared write lock (issue #165)
 # ---------------------------------------------------------------------------
 

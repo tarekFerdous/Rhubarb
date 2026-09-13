@@ -103,7 +103,7 @@ from rhubarb.ollama_rescue import (
     should_attempt_grilling_rescue,
     should_attempt_qa_rescue,
 )
-from rhubarb.pty_engine import PtyEngine, PtyEngineUnrecoverableError
+from rhubarb.pty_engine import PtyEngine, PtyEngineError, PtyEngineUnrecoverableError
 from rhubarb.qa_parser import parse_grilling_response, parse_qa_response
 from rhubarb.question_files import delete_question_file, read_question_file
 from rhubarb.stream_translate import translate_event
@@ -1207,6 +1207,97 @@ def _draft_status_message(cwd: str | None, phase: str) -> str | None:
     return None
 
 
+async def _await_stalled_reply(
+    card_id: int, conn, row, turn: dict, *, phase: str
+) -> dict | None:
+    """Issue #177 (child of PRD #174): `turn` just resolved for `phase`
+    (`creating_prd`/`creating_issues`, driven through `_run_chain_step`),
+    but `classify_needs_input` flagged its rendered text as needing a
+    human's input before this phase can usefully proceed on its own.
+
+    Resurrects the PRD #168/#172 stall-reply plumbing that's sat dead since
+    issue #175 removed the per-chunk PTY stall mechanism that used to drive
+    it: persists `stalled_json` and publishes the same `turn` event shape
+    (`stalled=True`, `stalled_context=turn["result"]`) genuine mid-turn
+    stalls always used, so the existing, UNCHANGED frontend
+    (`renderStalledSession`/`sendStallReply`/`applyTurn`'s `event.stalled`
+    branch) shows the exact same generic reply panel for this case too --
+    the turn's own rendered text as context, no rich question/options UI.
+
+    Unlike a genuine mid-turn stall (where `_run_turn`'s own read loop is
+    still live, still holding the turn lock, and just keeps reading until
+    the marker it was already waiting for shows up), this turn has ALREADY
+    completed -- there is no live read loop left to pick up whatever the
+    human eventually types into that panel. So this function starts one:
+    it reacquires this card's turn lock (mirroring the "the turn lock is
+    NOT released" invariant a genuine stall already relies on) and awaits
+    `PtyEngine.stream_reply()` -- the read-only counterpart to `stream_turn`
+    -- which yields nothing until the live process actually responds to
+    whatever gets written into its stdin next. That next write is exactly
+    the human's reply, forwarded completely unchanged by the existing,
+    untouched `/api/sessions/{card_id}/stall-reply` endpoint (still just
+    `PtyEngine.write()`, same as a genuine mid-turn stall's reply always
+    was) -- this function makes no write of its own, and never touches that
+    endpoint's behavior.
+
+    Returns the resumed turn dict (same `{"result", "session_id", ...}`
+    shape `_run_turn` returns) once the human's reply is answered and the
+    live process prints its next completion marker -- `_run_chain_step`
+    treats this exactly like the original turn having resolved directly,
+    and proceeds with this phase's normal completion bookkeeping (no
+    second `classify_needs_input` call is made on it; one nudge-and-resume
+    cycle per chain step is all this supports).
+
+    Returns `None` if the live process dies instead while waiting (there is
+    no prompt to retry -- see `PtyEngine.stream_reply`'s own docstring):
+    this closes the card's engine, persists an explicit error, publishes it
+    plus `done`, and clears `stalled_json` -- the same shape every other
+    unrecoverable failure in this module already reports. `None` is also
+    returned (no further action -- nothing to persist or publish, the
+    engine is simply gone) if `card_id` has no live resident engine at all
+    to wait on, which should not normally happen here since the turn that
+    just resolved ran against this exact engine moments ago."""
+    db.update_session(conn, row["id"], stalled_json=json.dumps({"phase": phase, "context": turn["result"]}))
+    publish(card_id, _turn_event(phase=phase, stalled=True, stalled_context=turn["result"]))
+
+    engine = get_engine(card_id)
+    if engine is None:
+        return None
+
+    lock = _get_turn_lock(card_id)
+    async with lock:
+        holder: dict = {}
+        try:
+            async for raw_event in engine.stream_reply():
+                translated = translate_event(raw_event)
+                if translated is None:
+                    continue
+                if translated["type"] == "turn":
+                    translated["context_pct"] = _context_window_pct(raw_event)
+                    holder["turn"] = translated
+                    continue
+                publish(card_id, translated)
+        except PtyEngineError as e:
+            _close_engine(card_id)
+            message = str(e)
+            db.update_session(conn, row["id"], error_text=message, needs_github_login=0, stalled_json=None)
+            publish(
+                card_id,
+                _turn_event(
+                    phase=phase,
+                    error=message,
+                    needs_github_login=False,
+                    card_id=card_id,
+                    project_id=row["project_id"],
+                ),
+            )
+            publish(card_id, {"type": "done"})
+            return None
+
+    db.update_session(conn, row["id"], stalled_json=None)
+    return holder.get("turn")
+
+
 async def _run_chain_step(
     card_id: int, conn, row, *, phase: str, prompt: str, cwd: str | None, model: str | None, effort: str | None
 ) -> tuple[bool, str | None]:
@@ -1220,6 +1311,20 @@ async def _run_chain_step(
     draft file this phase is responsible for was actually written -- giving
     the user live feedback mid-phase instead of nothing until the chain's
     final `details` summary.
+
+    Issue #177 (child of PRD #174): right after the turn resolves (and
+    before any of the above success bookkeeping), `classify_needs_input`
+    checks whether this turn's own rendered text suggests a human should
+    weigh in before this phase auto-advances. A `None` result (Ollama
+    declined, or genuinely unavailable -- either way already handled/
+    published by `classify_needs_input` itself) or `needs_input: False`
+    changes nothing here -- this phase completes exactly as it always has.
+    A `needs_input: True` result pauses here via `_await_stalled_reply`
+    (see its docstring for the full resume story) instead of proceeding
+    straight to the success bookkeeping below; only once that resolves
+    (a human's reply was answered and the live process moved on) does this
+    function fall through to the same completion bookkeeping any other
+    resolved turn gets.
     """
     db.update_session(conn, row["id"], phase=phase, error_text=None, needs_github_login=0)
     publish(card_id, {"type": "phase", "phase": phase})
@@ -1262,6 +1367,16 @@ async def _run_chain_step(
         # flight -- `_run_turn` already published the duplicate-call error
         # itself; nothing more to do here.
         return False, None
+
+    classification = await classify_needs_input(card_id, conn, turn["result"], phase)
+    if classification is not None and classification.get("needs_input"):
+        resumed = await _await_stalled_reply(card_id, conn, row, turn, phase=phase)
+        if resumed is None:
+            # Already fully handled inside `_await_stalled_reply` (an
+            # explicit error published/persisted, or no live engine left to
+            # wait on) -- nothing further to do here.
+            return False, None
+        turn = resumed
 
     db.update_session(
         conn,
