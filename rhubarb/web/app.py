@@ -612,8 +612,27 @@ async def reply_to_stalled_session(card_id: int, body: dict):
     into the terminal would.
 
     A no-op (`{"replied": False}`, not an error) if `card_id` names no live
-    resident engine -- same "nothing to do" shape as `resize_session_pty`."""
+    resident engine -- same "nothing to do" shape as `resize_session_pty`.
+
+    Issue #179: an implement-type session parked here because
+    `session_runner.classify_needs_input` found the turn needed a human's
+    input but nothing shaped like a rich question to extract (see
+    `_finish_implement_turn`) is different from this endpoint's original
+    mid-turn-nudge case -- that turn has already completed, so nothing is
+    still reading the PTY for it, and a raw write here would go nowhere.
+    For that case (`session_type == "implement"` and `phase ==
+    "implementing"`, the exact state `_finish_implement_turn` leaves such a
+    session suspended in), this resumes through `continue_implement_job` --
+    a real new turn, run the same way a genuine `implement_blocked` reply
+    already is -- instead of writing straight into the PTY."""
     text = body["text"]
+
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    if row is not None and row["session_type"] == "implement" and row["phase"] == "implementing":
+        cwd = _active_project_cwd()
+        asyncio.create_task(session_runner.continue_implement_job(card_id, text.rstrip("\r\n"), cwd=cwd))
+        return {"replied": True}
 
     engine = session_runner.get_engine(card_id)
     if engine is None:

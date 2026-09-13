@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from rhubarb import afk_loop, db, live_stream, session_runner
+from rhubarb import afk_loop, db, live_stream, ollama_rescue, session_runner
 from rhubarb.web import app as app_module
 
 
@@ -67,3 +67,34 @@ def _isolated_error_notifications(monkeypatch):
     """Same story again, but for session_runner's per-project undismissed
     background-session-error notification queue."""
     monkeypatch.setattr(session_runner, "_error_notifications", {})
+
+
+@pytest.fixture(autouse=True)
+def _ollama_unreachable_by_default(monkeypatch):
+    """Every Ollama-backed call (`ollama_rescue._call_ollama`) that doesn't
+    receive its own `http_post` override falls back to
+    `_default_http_post`, which makes a real HTTP call to a real local
+    Ollama install. Every existing test that cares about that call's outcome
+    already passes its own fake `http_post` (see tests/test_ollama_rescue.py
+    and the classify_needs_input tests in tests/test_sessions.py) -- this
+    fixture only ever affects a caller that DIDN'T, so it can never change
+    what any of those already-passing tests exercise.
+
+    Issue #179 wires `classify_needs_input` into implementing's own turn
+    handling unconditionally (once per completed turn, not gated behind a
+    rare parse-failure trigger the way the pre-existing rescue calls are),
+    so an untouched pre-existing implement test now reaches this fallback on
+    every run. Left unpatched, on any machine that happens to have a real
+    Ollama installed and running (as opposed to one where the call fails
+    fast with a connection error), that test's outcome would depend on a
+    live, non-deterministic local model's actual judgment -- exactly the
+    flakiness a unit test must never have. Patching `_default_http_post`
+    itself (rather than, say, `classify_needs_input`) makes every such
+    fallback call fail the same fast, deterministic way a clean CI machine
+    without Ollama installed already gets for free, regardless of what
+    happens to be running on whichever machine actually runs the suite."""
+
+    def _unreachable(url, body, *, timeout):
+        raise ConnectionError("Ollama is not reachable in tests unless a test supplies its own http_post")
+
+    monkeypatch.setattr(ollama_rescue, "_default_http_post", _unreachable)

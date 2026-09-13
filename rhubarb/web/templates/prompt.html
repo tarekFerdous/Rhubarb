@@ -2158,6 +2158,46 @@
         return;
       }
 
+      // Issue #179: an implementing turn that carried no implement_blocked
+      // marker, but that Ollama's needs-input classification (see
+      // session_runner._finish_implement_turn) flagged as needing a human's
+      // input anyway, AND whose text had recognizable question/option
+      // content to extract -- rendered with the exact same rich question UI
+      // grilling's own rounds use, wired to `sendImplementReply` (a real new
+      // implementing turn, same reply path a genuine implement_blocked
+      // question already resumes through) rather than grilling's own
+      // `sendReply`. Takeover shape mirrors the `blocked` branch above: a
+      // stuck implementation needs a human regardless of which card is
+      // currently focused.
+      if (event.phase === "implementing" && event.interview && event.interview.questions && event.interview.questions.length) {
+        if (leftCardId === cardId) {
+          setHeading("Implementing — needs your input");
+          renderInterview(event.interview, sendImplementReply);
+          return;
+        }
+
+        if (leftCardId !== null && currentLeftSession) {
+          preBlockedLeftSession = currentLeftSession;
+          rightCards.set(leftCardId, currentLeftSession);
+        }
+        if (eventSource) { eventSource.close(); eventSource = null; }
+        const bgEs = backgroundSources.get(cardId);
+        if (bgEs) { backgroundSources.delete(cardId); eventSource = bgEs; }
+
+        blockedTakeoverCardId = cardId;
+        leftCardId = cardId;
+        turnInFlight = false;
+        syncPtySocket();
+        currentLeftSession = snapshot;
+        refreshModelEffortCard();
+        startForm.style.display = "none";
+        setHeading("Implementing — needs your input");
+        showOnly(mainFlowEl);
+        renderInterview(event.interview, sendImplementReply);
+        renderQueue();
+        return;
+      }
+
       if (leftCardId !== cardId) return;
 
       if (event.phase === "grilling") {
@@ -2593,7 +2633,11 @@
       return { wrap, textarea };
     }
 
-    function renderInterview(data) {
+    // `submitFn` (issue #179) lets a caller outside grilling reuse this same
+    // rich question UI with its own reply-submission function -- defaults
+    // to `sendReply` (grilling's own `/api/session/continue` path) so every
+    // pre-existing call site keeps behaving exactly as before.
+    function renderInterview(data, submitFn = sendReply) {
       interviewEl.innerHTML = "";
       const answers = {};
 
@@ -2783,7 +2827,7 @@
         submitBtn.addEventListener("click", () => {
           const lines = data.questions.map((q, i) => `${i + 1}. ${answers[q.id] || "(no answer)"}`);
           if (trailingBox.value.trim()) lines.push(`Anything else: ${trailingBox.value.trim()}`);
-          submitReplyFromButton(lines.join("\n"), sendReply, submitBtn);
+          submitReplyFromButton(lines.join("\n"), submitFn, submitBtn);
         });
         interviewEl.appendChild(submitBtn);
       } else {
@@ -2792,11 +2836,11 @@
         sendBtn.className = "glass-btn";
         sendBtn.textContent = "Send";
         sendBtn.style.marginTop = "16px";
-        sendBtn.addEventListener("click", () => submitReplyFromButton(trailingBox.value, sendReply, sendBtn));
+        sendBtn.addEventListener("click", () => submitReplyFromButton(trailingBox.value, submitFn, sendBtn));
         interviewEl.appendChild(sendBtn);
       }
 
-      enableTerminalReplyInput(sendReply);
+      enableTerminalReplyInput(submitFn);
     }
 
     function renderDetailsList(details) {

@@ -1920,6 +1920,19 @@ def test_retry_on_errored_implement_session_creates_a_new_row_and_completes(clie
         lambda prompt, **kw: iter([_result_event("Implemented PRD #12", session_id="impl-retry")]),
         fresh_ids=["pooled-retry"],
     )
+    # Issue #179: this test asserts on the retried job's *end state*
+    # immediately after `client.post` returns, with nothing draining the
+    # `asyncio.create_task`-scheduled job the retry endpoint kicks off (see
+    # `_run_and_drain`'s own docstring for why other tests need that drain
+    # at all) -- unlike every other step in this synchronous fake-engine
+    # chain, `classify_needs_input`'s real Ollama call genuinely hops
+    # through a thread-pool executor (`asyncio.to_thread`), which isn't
+    # guaranteed to resolve by the time this synchronous test client call
+    # returns. Neutralize it here (this test is about retry mechanics, not
+    # needs-input classification -- that has its own dedicated tests) the
+    # same way every other unrelated implement test already can rely on
+    # a real, unmocked call finishing fast enough not to matter.
+    monkeypatch.setattr(session_runner, "classify_needs_input", _fake_classify_needs_input(None))
 
     response = client.post(f"/api/sessions/{row_id}/retry")
     assert response.status_code == 200
@@ -5015,3 +5028,224 @@ def test_creating_prd_negative_classification_does_not_pause_the_chain(client, t
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "implemented"
+
+
+# ---------------------------------------------------------------------------
+# Issue #179 (child of PRD #174): wiring classify_needs_input into
+# implementing's own turn handling, right after the pre-existing
+# implement_blocked marker check (_parse_implement_blocked_block) concludes
+# a turn's result carries no blocked marker at all -- a pure addition, never
+# touching that check or its own marker-parsing logic.
+# ---------------------------------------------------------------------------
+
+
+def _fake_classify_needs_input(result):
+    """Build a fake stand-in for `session_runner.classify_needs_input` (an
+    async function) that always returns `result` regardless of its
+    arguments. The real call's own behavior (declined/unavailable/malformed
+    handling) is already covered by the dedicated tests above; these tests
+    only care about how `_finish_implement_turn` reacts to each possible
+    result."""
+
+    async def fake(card_id, conn, text, phase, *, http_post=None):
+        return result
+
+    return fake
+
+
+def test_start_implement_job_renders_rich_question_ui_when_classification_finds_a_question(
+    client, tmp_path, monkeypatch
+):
+    """A positive classification (`needs_input: True`) whose turn text still
+    parses into a real grilling-shaped question must render the same rich
+    question UI grilling's own rounds use (`renderInterview` on the frontend)
+    -- `interview_json` persisted and a `turn` event published for phase
+    `implementing` carrying that `interview` -- rather than falling through
+    to automatic continuation or the generic reply panel. The session stays
+    suspended (no `done`), same "waiting on a human" shape as `blocked`."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    question_text = (
+        'Question 1: "Python or Node?"\nOptions:\nOption 1: "Python"\nOption 2: "Node"\nRecommended: [1]\n'
+    )
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(question_text, session_id="impl-q1")]))
+    monkeypatch.setattr(
+        session_runner,
+        "classify_needs_input",
+        _fake_classify_needs_input({"needs_input": True, "reason": "Asked which language to use."}),
+    )
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["claude_session_id"] == "impl-q1"
+    assert row["stalled_json"] is None
+    interview = json.loads(row["interview_json"])
+    assert interview["questions"][0]["text"] == "Python or Node?"
+    assert interview["questions"][0]["options"] == ["Python", "Node"]
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e.get("type") == "turn" and e.get("phase") == "implementing"]
+    assert turn_events
+    assert turn_events[-1]["interview"]["questions"][0]["text"] == "Python or Node?"
+    # Suspended, not finished -- no `done` yet, same shape as implement_blocked.
+    assert {"type": "done"} not in events
+    assert row_id in session_runner._pty_engines
+
+
+def test_start_implement_job_falls_back_to_generic_panel_when_no_question_can_be_extracted(
+    client, tmp_path, monkeypatch
+):
+    """A positive classification whose turn text does NOT fit the
+    structured question/option shape must fall back to the pre-existing
+    generic reply panel (`renderStalledSession`/`sendStallReply` in
+    prompt.html) instead: `stalled_json` persisted and a `turn` event
+    published with `stalled: True`/`stalled_context` set to the
+    classifier's own reason, for phase `implementing`. Session stays
+    suspended (no `done`)."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    # No "Question " trigger and no recognizable structured content at all --
+    # parse_grilling_response finds nothing, and should_attempt_grilling_rescue
+    # doesn't even fire, so no Ollama rescue call is attempted either.
+    prose = "I went ahead with the OAuth approach, but I'd like you to confirm before I touch the schema."
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(prose, session_id="impl-stall1")]))
+    monkeypatch.setattr(
+        session_runner,
+        "classify_needs_input",
+        _fake_classify_needs_input({"needs_input": True, "reason": "Asked for confirmation before a schema change."}),
+    )
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["claude_session_id"] == "impl-stall1"
+    assert row["interview_json"] is None
+    stalled = json.loads(row["stalled_json"])
+    assert stalled == {"phase": "implementing", "context": "Asked for confirmation before a schema change."}
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e.get("type") == "turn" and e.get("phase") == "implementing"]
+    assert turn_events
+    assert turn_events[-1]["stalled"] is True
+    assert turn_events[-1]["stalled_context"] == "Asked for confirmation before a schema change."
+    # Suspended, not finished -- no `done` yet, same shape as implement_blocked.
+    assert {"type": "done"} not in events
+    assert row_id in session_runner._pty_engines
+
+
+def test_start_implement_job_continues_automatically_when_classification_says_no_input_needed(
+    client, tmp_path, monkeypatch
+):
+    """A negative classification (`needs_input: False`) must fall straight
+    through to today's unchanged automatic continuation -- the turn
+    completes normally (`phase: implemented`, pooled), with no `interview`/
+    `stalled` state at all, exactly as if `classify_needs_input` had never
+    been added."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    _mock_engine(
+        monkeypatch,
+        lambda prompt, **kw: iter([_result_event("Implemented PRD #5", session_id="impl-ok")]),
+        fresh_ids=["turn-engine", "pooled-1"],
+    )
+    monkeypatch.setattr(
+        session_runner,
+        "classify_needs_input",
+        _fake_classify_needs_input({"needs_input": False, "reason": None}),
+    )
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "implemented"
+    assert row["available_for_reuse"] == 1
+    assert row["interview_json"] is None
+    assert row["stalled_json"] is None
+
+    events = live_stream._buffers.get(row_id, [])
+    assert events[-1] == {"type": "done"}
+    assert any(e.get("type") == "turn" and e.get("phase") == "implemented" for e in events)
+
+
+def test_start_implement_job_continues_automatically_when_ollama_declines_or_is_unavailable(
+    client, tmp_path, monkeypatch
+):
+    """`classify_needs_input` itself already no-ops (returns `None`) when the
+    user has declined Ollama assistance, or when the call was attempted but
+    failed -- either way, `_finish_implement_turn` must treat that exactly
+    like a negative classification: fall straight through to automatic
+    continuation, no behavior change from before this wiring existed."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    _mock_engine(
+        monkeypatch,
+        lambda prompt, **kw: iter([_result_event("Implemented PRD #5", session_id="impl-ok2")]),
+        fresh_ids=["turn-engine", "pooled-2"],
+    )
+    monkeypatch.setattr(session_runner, "classify_needs_input", _fake_classify_needs_input(None))
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "implemented"
+    assert row["available_for_reuse"] == 1
+    assert row["interview_json"] is None
+    assert row["stalled_json"] is None
+
+    events = live_stream._buffers.get(row_id, [])
+    assert events[-1] == {"type": "done"}
+
+
+def test_start_implement_job_blocked_marker_takes_priority_over_classification(client, tmp_path, monkeypatch):
+    """When the turn's result DOES carry a genuine `implement_blocked`
+    marker, `classify_needs_input` must never even be called -- the
+    pre-existing blocked-marker check is untouched and still short-circuits
+    everything after it, exactly as before this issue's wiring existed."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    _mock_engine(
+        monkeypatch, lambda prompt, **kw: iter([_result_event(_IMPLEMENT_BLOCKED_BLOCK, session_id="impl-blocked2")])
+    )
+
+    def must_not_be_called(card_id, conn, text, phase, *, http_post=None):
+        raise AssertionError("classify_needs_input must not be called when a blocked marker is present")
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", must_not_be_called)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "blocked"
+    blocked = json.loads(row["blocked_json"])
+    assert blocked["question"] == "Which auth provider should the login button use?"
