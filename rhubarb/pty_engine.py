@@ -639,7 +639,7 @@ class PtyEngine:
         self._is_resume = True
         self.start()
 
-    async def _stream_chunks_until_marker(self, prompt: str) -> AsyncIterator[str]:
+    async def _stream_chunks_until_marker(self, prompt: str | None) -> AsyncIterator[str]:
         """Write `prompt` to the current process and yield each raw output
         chunk exactly as read from the PTY (issue #88 -- this is what lets a
         caller relay the real, unmodified terminal byte stream -- ANSI
@@ -672,19 +672,26 @@ class PtyEngine:
         above) rather than one atomic write, with the trailing `"\\r"` sent
         as its own separate write after `_WRITE_FINAL_DELAY_SECONDS` -- see
         those constants' docstring for why. Applied unconditionally, for
-        every prompt regardless of length or content."""
+        every prompt regardless of length or content.
+
+        `prompt=None` (issue #177) skips the write step entirely and only
+        reads -- for consuming a reply already written directly into this
+        engine's stdin out of band (see `stream_reply`, whose whole point is
+        that the write already happened through a different path)."""
         assert self._proc is not None
 
-        # Held for the whole paced sequence -- see `_write_lock`'s docstring
-        # in `__init__` for why per-chunk locking wouldn't be enough.
-        async with self._write_lock:
-            for start in range(0, len(prompt), _WRITE_CHUNK_SIZE):
-                text_chunk = prompt[start : start + _WRITE_CHUNK_SIZE]
-                await asyncio.to_thread(self._proc.write, text_chunk)
-                await asyncio.sleep(_WRITE_CHUNK_DELAY_SECONDS)
+        if prompt is not None:
+            # Held for the whole paced sequence -- see `_write_lock`'s
+            # docstring in `__init__` for why per-chunk locking wouldn't be
+            # enough.
+            async with self._write_lock:
+                for start in range(0, len(prompt), _WRITE_CHUNK_SIZE):
+                    text_chunk = prompt[start : start + _WRITE_CHUNK_SIZE]
+                    await asyncio.to_thread(self._proc.write, text_chunk)
+                    await asyncio.sleep(_WRITE_CHUNK_DELAY_SECONDS)
 
-            await asyncio.sleep(_WRITE_FINAL_DELAY_SECONDS)
-            await asyncio.to_thread(self._proc.write, "\r")
+                await asyncio.sleep(_WRITE_FINAL_DELAY_SECONDS)
+                await asyncio.to_thread(self._proc.write, "\r")
 
         buffer = ""
         while TURN_COMPLETE_MARKER not in buffer:
@@ -777,6 +784,43 @@ class PtyEngine:
         # what a round of questions/options resolves to after
         # `_render_terminal_text` collapses ANSI/cursor-movement redraws to
         # their final plain text, same text `qa_parser.py` parses.
+        print(f"[pty result]\n{clean_text}")
+        yield {"type": "result", "result": clean_text, "session_id": self.claude_session_id, "is_error": False}
+
+    async def stream_reply(self) -> AsyncIterator[dict]:
+        """Consume the live process's response to text already written
+        directly into its stdin out of band -- e.g. by the issue #169
+        `/api/sessions/{card_id}/stall-reply` endpoint's own `write()` call
+        -- rather than a prompt this method sends itself. The read-only
+        counterpart to `stream_turn` (issue #177, child of PRD #174): no
+        prompt is written here at all, only the same marker-terminated read
+        loop `stream_turn` already drives (`_stream_chunks_until_marker`,
+        called with `prompt=None`), yielding the exact same event shapes
+        (`terminal_output` chunks, then a final `result`) so a caller can
+        fold this into its existing turn-translation pipeline unchanged.
+
+        Used by `session_runner._await_stalled_reply` to let a chain-step
+        phase's normal continuation resume once `ollama_rescue.
+        classify_turn_needs_input` has flagged an already-completed turn as
+        needing a human's input and a human has since replied through the
+        generic stall-reply panel: that reply was already written straight
+        into this same engine's stdin by the unchanged stall-reply endpoint,
+        so this method only needs to wait for, and read, the response to it.
+
+        Unlike `stream_turn`, a process death here is NOT retried -- there
+        is no original prompt this method could safely resend (the write
+        already happened elsewhere, out of band, and blindly resending
+        would risk duplicating or losing whatever the human actually typed)
+        -- so a `PtyEngineError` here propagates straight to the caller."""
+        assert self._proc is not None
+
+        buffer = ""
+        async for chunk in self._stream_chunks_until_marker(None):
+            buffer += chunk
+            yield {"type": "terminal_output", "data": chunk}
+
+        text, _marker, _trailing = buffer.partition(TURN_COMPLETE_MARKER)
+        clean_text = _render_terminal_text(text, self._cols)
         print(f"[pty result]\n{clean_text}")
         yield {"type": "result", "result": clean_text, "session_id": self.claude_session_id, "is_error": False}
 

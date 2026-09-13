@@ -11,6 +11,47 @@ from rhubarb.github_publisher import GithubPublishError
 from rhubarb.pty_engine import PtyEngineUnrecoverableError
 from rhubarb.web import app as app_module
 
+# Captured at collection time, before any test's `monkeypatch` fixture ever
+# touches `session_runner.classify_needs_input` -- the genuine function, for
+# the handful of tests below that restore it deliberately (see
+# `_classify_needs_input_is_a_no_op_by_default`'s docstring).
+_REAL_CLASSIFY_NEEDS_INPUT = session_runner.classify_needs_input
+
+
+@pytest.fixture(autouse=True)
+def _classify_needs_input_is_a_no_op_by_default(monkeypatch):
+    """Issue #177: `classify_needs_input` is now wired into every
+    `_run_chain_step` call (`creating_prd`/`creating_issues`), firing after
+    EVERY resolved chain-step turn regardless of content -- unlike the
+    pre-existing grilling/QA rescue calls, which only ever fire once a
+    parser has already come back empty on suspicious-looking text. Left
+    alone, every existing test in this file that drives that chain would
+    suddenly make a REAL call to whatever Ollama install happens to be
+    running on the machine that runs these tests -- slow, and
+    non-deterministic (a genuinely different/differently-tuned local model
+    could classify the exact same turn text differently on a different
+    machine, and a positive result changes what the chain actually does).
+
+    Defaults every test in this file to a `classify_needs_input` stub that
+    always returns `None` -- the same "skip: declined or unavailable"
+    outcome the real function already gives for plenty of legitimate
+    reasons, so every existing test's chain behavior/event stream stays
+    exactly what it always has been, deterministically, with zero network
+    calls. The handful of tests that actually want to exercise real
+    `classify_needs_input` behavior restore the genuine function first
+    (`monkeypatch.setattr(session_runner, "classify_needs_input",
+    _REAL_CLASSIFY_NEEDS_INPUT)` -- see the "Needs-input classification"
+    section below); the issue #177 wiring tests instead override this stub
+    with their own scenario-specific fake. Either way, that happens in the
+    test's own body, using the same `monkeypatch` fixture instance this
+    autouse fixture already used, so it simply wins over this default for
+    the rest of that one test."""
+
+    async def _stub(card_id, conn, text, phase, *, http_post=None):
+        return None
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", _stub)
+
 
 def _init_repo(path, remote_url):
     path.mkdir()
@@ -58,11 +99,23 @@ async def _run_and_drain(coro):
     return result
 
 
-def _make_fake_engine_class(handler, *, fresh_ids=None):
+def _make_fake_engine_class(handler, *, fresh_ids=None, reply_handler=None):
     """Build a fake stand-in for the `PtyEngine` class, for monkeypatching
     `session_runner.PtyEngine` in these tests -- see `tests/test_pty_engine.py`
     for the equivalent fake-backend style one level down (the real PTY
     backend, rather than the engine built on top of it).
+
+    `reply_handler()` (issue #177), if given, stands in for
+    `PtyEngine.stream_reply` -- returns an iterable of raw event dicts (same
+    shape `handler` returns), simulating the live process's response to a
+    reply already written directly into its stdin out of band (e.g. via the
+    `/stall-reply` endpoint) rather than a prompt this engine wrote itself.
+    A test that never expects `stream_reply` to be called at all (i.e.
+    never drives a `classify_needs_input` positive result into
+    `_await_stalled_reply`) can omit it -- the fake then raises
+    `AssertionError` if it's ever actually called, the same "fail loudly on
+    an unexpected call" shape `handler`'s own `raise AssertionError` fallback
+    branches already use throughout this file.
 
     `handler(prompt, *, session_id, cwd, model, effort)` returns an iterable
     of raw event dicts -- the same shape the old `stream_prompt` fakes
@@ -127,15 +180,23 @@ def _make_fake_engine_class(handler, *, fresh_ids=None):
             ):
                 yield raw
 
+        async def stream_reply(self):
+            if reply_handler is None:
+                raise AssertionError(
+                    "stream_reply must not be called -- this test's FakeEngine was built with no reply_handler"
+                )
+            for raw in reply_handler():
+                yield raw
+
     return FakeEngine
 
 
-def _mock_engine(monkeypatch, handler, *, fresh_ids=None):
+def _mock_engine(monkeypatch, handler, *, fresh_ids=None, reply_handler=None):
     """Monkeypatch `session_runner.PtyEngine` with a fake driven by
     `handler` -- see `_make_fake_engine_class`. Returns the fake class so a
     test can inspect `.instances` (e.g. to assert an engine was/wasn't
     reconstructed, or to check constructor args)."""
-    fake_class = _make_fake_engine_class(handler, fresh_ids=fresh_ids)
+    fake_class = _make_fake_engine_class(handler, fresh_ids=fresh_ids, reply_handler=reply_handler)
     monkeypatch.setattr(session_runner, "PtyEngine", fake_class)
     return fake_class
 
@@ -4263,7 +4324,7 @@ def test_classify_needs_input_is_a_no_op_when_ollama_declined(client):
     def fake_post(url, body, *, timeout):
         raise AssertionError("Ollama must not be called when ollama_declined is true")
 
-    result = asyncio.run(session_runner.classify_needs_input(1, conn, "some turn text", "grilling", http_post=fake_post))
+    result = asyncio.run(_REAL_CLASSIFY_NEEDS_INPUT(1, conn, "some turn text", "grilling", http_post=fake_post))
 
     assert result is None
     assert live_stream._buffers.get(1, []) == []
@@ -4279,7 +4340,7 @@ def test_classify_needs_input_publishes_unavailable_notification_on_failure_when
     def timing_out_post(url, body, *, timeout):
         raise TimeoutError("Ollama took too long")
 
-    result = asyncio.run(session_runner.classify_needs_input(1, conn, "some turn text", "grilling", http_post=timing_out_post))
+    result = asyncio.run(_REAL_CLASSIFY_NEEDS_INPUT(1, conn, "some turn text", "grilling", http_post=timing_out_post))
 
     assert result is None
     events = live_stream._buffers.get(1, [])
@@ -4300,7 +4361,7 @@ def test_classify_needs_input_returns_result_and_publishes_nothing_on_success(cl
 
         return {"response": _json.dumps(payload)}
 
-    result = asyncio.run(session_runner.classify_needs_input(1, conn, "Which database?", "grilling", http_post=fake_post))
+    result = asyncio.run(_REAL_CLASSIFY_NEEDS_INPUT(1, conn, "Which database?", "grilling", http_post=fake_post))
 
     assert result == payload
     assert live_stream._buffers.get(1, []) == []
@@ -4317,7 +4378,197 @@ def test_classify_needs_input_publishes_unavailable_notification_when_response_i
     def fake_post(url, body, *, timeout):
         return {"response": "not valid json at all {{{"}
 
-    result = asyncio.run(session_runner.classify_needs_input(1, conn, "text", "grilling", http_post=fake_post))
+    result = asyncio.run(_REAL_CLASSIFY_NEEDS_INPUT(1, conn, "text", "grilling", http_post=fake_post))
 
     assert result is None
     assert live_stream._buffers.get(1, []) == [{"type": "ollama_unavailable"}]
+
+
+# ---------------------------------------------------------------------------
+# Wiring classify_needs_input into the /to-prd, /to-issues chain (issue #177,
+# child of PRD #174 -- these phases have no structured question format of
+# their own, so a positive classification must show the existing generic
+# stall-reply panel, never a rich question/options UI).
+# ---------------------------------------------------------------------------
+
+
+def test_creating_prd_turn_is_classified_before_creating_issues_starts(client, tmp_path, monkeypatch):
+    """Issue #177: `_run_chain_step` must call `classify_needs_input` with
+    this turn's own rendered text right after `creating_prd`'s turn
+    resolves, and that call must happen BEFORE `/rhubarb:to-issues` is ever
+    sent -- i.e. before the phase's normal automatic continuation. A `None`
+    (declined/unavailable) or negative result must leave the chain running
+    exactly as it always has -- no behavior change."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    seen_prompts = []
+
+    def handler(prompt, **kw):
+        if prompt == "/rhubarb:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
+        seen_prompts.append(prompt)
+        if prompt == "/rhubarb:to-prd":
+            return iter([_result_event("Wrote PRD draft.")])
+        if prompt == "/rhubarb:to-issues":
+            return iter([_result_event("Wrote issues draft.")])
+        if prompt == "/rhubarb:implement prd: 5":
+            return iter([_result_event("Implemented.")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
+
+    _mock_engine(monkeypatch, handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    monkeypatch.setattr(
+        session_runner,
+        "publish_draft",
+        lambda draft_path, cwd, on_progress=None: "PRD #5: My PRD\nIssue #6: Child one",
+    )
+
+    # Opt back into (fake) Ollama assistance for this test -- the module's
+    # own autouse fixture defaults every other test here to declined so
+    # this wiring doesn't attempt a real HTTP call unexpectedly.
+    db.set_ollama_declined(conn, False)
+
+    calls = []
+    seen_prompts_at_creating_prd_call = None
+
+    async def fake_classify(card_id, conn_arg, text, phase, *, http_post=None):
+        calls.append((card_id, phase, text))
+        if phase == "creating_prd":
+            nonlocal seen_prompts_at_creating_prd_call
+            seen_prompts_at_creating_prd_call = list(seen_prompts)
+        return None
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
+    assert calls[0] == (row_id, "creating_prd", "Wrote PRD draft.")
+    # /rhubarb:to-issues had NOT been sent yet at the moment creating_prd's
+    # turn was classified -- classification runs before the automatic
+    # continuation, not after.
+    assert seen_prompts_at_creating_prd_call == ["/rhubarb:to-prd"]
+    assert calls[1] == (row_id, "creating_issues", "Wrote issues draft.")
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "implemented"
+
+
+def test_creating_prd_positive_classification_shows_generic_stall_panel_not_rich_ui(
+    client, tmp_path, monkeypatch
+):
+    """Issue #177: `creating_prd` has no structured question format of its
+    own, so a positive `classify_needs_input` result must resurrect the
+    generic PRD #168/#172 stall-reply panel (a `turn` event carrying
+    `stalled=True` and `stalled_context` set to the turn's own rendered
+    text) -- never the rich `interview`/`blocked` question UI grilling and
+    implementing use for their own positive results (sibling issues
+    #178/#179)."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def handler(prompt, **kw):
+        if prompt == "/rhubarb:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
+        if prompt == "/rhubarb:to-prd":
+            return iter([_result_event("Wrote PRD draft, but scope is unclear.")])
+        if prompt == "/rhubarb:to-issues":
+            return iter([_result_event("Wrote issues draft.")])
+        if prompt == "/rhubarb:implement prd: 5":
+            return iter([_result_event("Implemented.")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
+
+    def reply_handler():
+        # Stands in for the live process's response once a human has
+        # replied through the generic panel (forwarded unchanged by the
+        # existing `/api/sessions/{card_id}/stall-reply` endpoint straight
+        # into this same engine's stdin) -- see `_await_stalled_reply`.
+        return [_result_event("Understood, using Postgres for scope.")]
+
+    _mock_engine(monkeypatch, handler, reply_handler=reply_handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    monkeypatch.setattr(
+        session_runner,
+        "publish_draft",
+        lambda draft_path, cwd, on_progress=None: "PRD #5: My PRD\nIssue #6: Child one",
+    )
+
+    db.set_ollama_declined(conn, False)
+
+    async def fake_classify(card_id, conn_arg, text, phase, *, http_post=None):
+        if phase == "creating_prd":
+            return {"needs_input": True, "reason": "Scope is ambiguous."}
+        return None
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
+    events = live_stream._buffers.get(row_id, [])
+    stalled_events = [e for e in events if e.get("type") == "turn" and e.get("stalled")]
+    assert len(stalled_events) == 1
+    stalled = stalled_events[0]
+    assert stalled["phase"] == "creating_prd"
+    assert stalled["stalled_context"] == "Wrote PRD draft, but scope is unclear."
+    # Never the rich question/options UI -- that's sibling issues #178/#179's
+    # own phases, not this generic panel.
+    assert stalled["interview"] is None
+    assert stalled["blocked"] is None
+
+    row = db.get_session(conn, row_id)
+    # The reply (simulated by `reply_handler`) resolved successfully, so the
+    # chain's normal continuation resumed afterward exactly like any other
+    # completed turn.
+    assert row["phase"] == "implemented"
+    assert row["stalled_json"] is None
+
+
+def test_creating_prd_negative_classification_does_not_pause_the_chain(client, tmp_path, monkeypatch):
+    """Issue #177: `needs_input: False` must leave `creating_prd` continuing
+    exactly as it does today -- no stalled event, straight into
+    `creating_issues`."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def handler(prompt, **kw):
+        if prompt == "/rhubarb:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
+        if prompt == "/rhubarb:to-prd":
+            return iter([_result_event("Wrote PRD draft.")])
+        if prompt == "/rhubarb:to-issues":
+            return iter([_result_event("Wrote issues draft.")])
+        if prompt == "/rhubarb:implement prd: 5":
+            return iter([_result_event("Implemented.")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
+
+    _mock_engine(monkeypatch, handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    monkeypatch.setattr(
+        session_runner,
+        "publish_draft",
+        lambda draft_path, cwd, on_progress=None: "PRD #5: My PRD\nIssue #6: Child one",
+    )
+
+    db.set_ollama_declined(conn, False)
+
+    async def fake_classify(card_id, conn_arg, text, phase, *, http_post=None):
+        return {"needs_input": False, "reason": None}
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
+    events = live_stream._buffers.get(row_id, [])
+    assert not any(e.get("type") == "turn" and e.get("stalled") for e in events)
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "implemented"
