@@ -1,4 +1,5 @@
 from rhubarb.ollama_rescue import (
+    classify_turn_needs_input,
     rescue_grilling_response,
     rescue_qa_response,
     should_attempt_grilling_rescue,
@@ -368,3 +369,75 @@ def test_call_ollama_prints_prompt_even_when_the_call_ultimately_fails(capsys):
 
     captured = capsys.readouterr()
     assert "malformed text that will time out" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Needs-input classification (issue #175, child of PRD #174)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_turn_needs_input_returns_valid_shape_from_ollama():
+    payload = {"needs_input": True, "reason": "Asked the user to pick an option."}
+
+    def fake_post(url, body, *, timeout):
+        assert url == "http://localhost:11434/api/generate"
+        assert body["model"] == "llama3.2:1b"
+        assert body["format"]  # a schema was passed
+        assert body["stream"] is False
+        assert "grilling" in body["prompt"]
+        return _generate_response(payload)
+
+    result = classify_turn_needs_input("Which database should we use?", "grilling", http_post=fake_post)
+
+    assert result == payload
+
+
+def test_classify_turn_needs_input_accepts_null_reason():
+    payload = {"needs_input": False, "reason": None}
+
+    def fake_post(url, body, *, timeout):
+        return _generate_response(payload)
+
+    assert classify_turn_needs_input("All done, PRD published.", "publishing", http_post=fake_post) == payload
+
+
+def test_classify_turn_needs_input_returns_none_when_needs_input_is_missing():
+    def fake_post(url, body, *, timeout):
+        return _generate_response({"reason": "no needs_input key"})
+
+    assert classify_turn_needs_input("text", "grilling", http_post=fake_post) is None
+
+
+def test_classify_turn_needs_input_returns_none_when_needs_input_is_wrong_type():
+    def fake_post(url, body, *, timeout):
+        return _generate_response({"needs_input": "yes", "reason": None})
+
+    assert classify_turn_needs_input("text", "grilling", http_post=fake_post) is None
+
+
+def test_classify_turn_needs_input_returns_none_when_reason_is_wrong_type():
+    def fake_post(url, body, *, timeout):
+        return _generate_response({"needs_input": True, "reason": 123})
+
+    assert classify_turn_needs_input("text", "grilling", http_post=fake_post) is None
+
+
+def test_classify_turn_needs_input_returns_none_on_unparseable_json():
+    def fake_post(url, body, *, timeout):
+        return {"response": "not valid json at all {{{"}
+
+    assert classify_turn_needs_input("text", "grilling", http_post=fake_post) is None
+
+
+def test_classify_turn_needs_input_returns_none_on_timeout():
+    def timing_out_post(url, body, *, timeout):
+        raise TimeoutError("Ollama took too long")
+
+    assert classify_turn_needs_input("text", "grilling", http_post=timing_out_post) is None
+
+
+def test_classify_turn_needs_input_returns_none_on_connection_failure():
+    def unreachable_post(url, body, *, timeout):
+        raise ConnectionError("nobody home")
+
+    assert classify_turn_needs_input("text", "grilling", http_post=unreachable_post) is None
