@@ -810,17 +810,23 @@ def _turn_event(
     path that already shows the phase label (see `prompt.html`), rather than
     a new display surface.
 
-    `stalled`/`stalled_context` (issue #173, replacing issue #169/PRD #168's
-    original timer-based version) are this same `turn` event shape extended,
-    rather than a new event type, for a turn that's still genuinely in
-    flight -- see `_run_turn`'s translation loop, the only caller that ever
-    sets these. Issue #173 removed the old quiet-period timer entirely: this
-    is now published after every chunk `PtyEngine` reads off the live
-    process, for the whole duration of any turn, in every phase -- a
-    continuous turn-progress heartbeat, not a signal that anything is stuck.
-    `stalled_context` is the live-process's buffer-so-far (already rendered
-    through `_render_terminal_text`) at the moment this was published, for a
-    UI to show what the process is doing right now.
+    `stalled`/`stalled_context` were originally (issue #173, replacing issue
+    #169/PRD #168's timer-based version) this same `turn` event shape
+    extended for a turn still genuinely in flight, published by `_run_turn`'s
+    translation loop on every chunk read off the live process. Issue #175
+    retired that per-chunk mechanism entirely -- `PtyEngine` no longer emits
+    any event `translate_event` maps to `"stall"`, so `_run_turn` no longer
+    ever sets these fields; that call site is dead code kept only because
+    nothing has removed it yet. `_finish_implement_turn` (issue #179, child
+    of PRD #174) is the one live caller today: it sets these on a
+    *completed* implementing turn that the local Ollama classifier
+    (`classify_needs_input`) flagged as needing a human's input but whose
+    text had no recognizable question/option content to extract -- reviving
+    the existing `renderStalledSession`/`sendStallReply` frontend panel
+    (dead since #175 for the same reason) for that fallback case. Unlike the
+    old mid-turn meaning, `stalled_context` here is a short reason string
+    from the classifier, not a live buffer-so-far snapshot -- the turn is
+    already over.
     """
     if error is not None:
         error_log.log_error(project_id=project_id, card_id=card_id, phase=phase, message=error)
@@ -1814,6 +1820,35 @@ async def _attempt_qa_corrective_retry(
     return retry_parsed, retry_turn
 
 
+async def _extract_implementing_question(text: str) -> dict | None:
+    """Try to pull recognizable question/option content out of an
+    implementing turn's rendered `text`, once `classify_needs_input` (issue
+    #179, child of PRD #174) has already decided a human needs to read this
+    turn before the session can usefully continue.
+
+    Implementing has no structured question format of its own -- unlike
+    grilling/QA-grilling, it never asks the model to write anything in the
+    `Question N: "..."` protocol (its only structured output is the
+    separate, pre-existing `implement_blocked` JSON marker, untouched by
+    this function). So this reuses grilling's own extraction chain wholesale
+    on the chance the model's prose still happens to fit that shape: first
+    `qa_parser.parse_grilling_response`'s regex parser, then (only if that
+    came back empty AND the text still looks like it was trying to ask a
+    question -- `should_attempt_grilling_rescue`'s own trigger check) the
+    same Ollama rescue call grilling falls back to.
+
+    Returns the parsed `{header, questions, footer, ...}` dict only when it
+    actually carries at least one question -- `None` otherwise, so the
+    caller can fall back to the generic reply panel instead of rendering an
+    empty rich-question UI."""
+    parsed = parse_grilling_response(text)
+    if not parsed["questions"] and should_attempt_grilling_rescue(parsed, text):
+        rescued = await asyncio.to_thread(rescue_grilling_response, text)
+        if rescued is not None:
+            parsed = rescued
+    return parsed if parsed["questions"] else None
+
+
 async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: str | None, model, effort) -> None:
     """Shared tail for both `start_implement_job`'s first turn and
     `continue_implement_job`'s resume turn: persist the turn's console
@@ -1843,9 +1878,70 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
         blocked = _parse_implement_blocked_block(turn["result"])
     if blocked is not None:
         db.update_session(
-            conn, card_id, claude_session_id=turn["session_id"], phase="blocked", blocked_json=json.dumps(blocked)
+            conn,
+            card_id,
+            claude_session_id=turn["session_id"],
+            phase="blocked",
+            blocked_json=json.dumps(blocked),
+            # Clear any stray needs-input state (issue #179) a prior turn in
+            # this same session may have left behind -- this genuine
+            # implement_blocked marker supersedes it.
+            stalled_json=None,
+            interview_json=None,
         )
         publish(card_id, _turn_event(phase="blocked", blocked=blocked))
+        return
+
+    # Issue #179 (child of PRD #174): a pure ADDITION after the existing
+    # implement_blocked marker check above -- that check, and its own
+    # marker-parsing logic, are completely untouched. This only runs once
+    # the turn's result carries no blocked marker at all, exactly where
+    # today the turn would just continue automatically. Ask the local
+    # Ollama classifier whether this turn actually needs a human's input
+    # anyway (a question buried in ordinary prose, an approval request,
+    # ...); a negative classification, a decline, or an unavailable Ollama
+    # (`classify_needs_input` returns `None` for the latter two, same as
+    # every other caller) all fall straight through to today's unchanged
+    # automatic continuation below.
+    classification = await classify_needs_input(card_id, conn, turn["result"], "implementing")
+    if classification is not None and classification.get("needs_input"):
+        extracted = await _extract_implementing_question(turn["result"])
+        if extracted is not None:
+            # Recognizable question/option content -- render it with the
+            # exact same rich question UI grilling's own rounds use.
+            db.update_session(
+                conn,
+                card_id,
+                claude_session_id=turn["session_id"],
+                interview_json=json.dumps(extracted),
+                stalled_json=None,
+            )
+            publish(card_id, _turn_event(phase="implementing", interview=extracted))
+            return
+
+        # Doesn't fit that structured shape -- fall back to the pre-existing
+        # generic reply panel from PRD #168/#172 (`renderStalledSession`/
+        # `sendStallReply` in prompt.html, backed by the `stalled`/
+        # `stalled_context` fields on the `turn` event and the `stalled_json`
+        # row column -- both already exist and are otherwise unused today
+        # since `PtyEngine` retired its per-chunk stall mechanism, issue
+        # #175). Reviving that dead path for this call site, the same way
+        # issue #177 revives it for non-Q&A phases: this turn has already
+        # completed (unlike the old mid-turn nudge this panel originally
+        # served), so `/api/sessions/{card_id}/stall-reply` resumes an
+        # implement-type session parked here through `continue_implement_job`
+        # -- a real new turn -- instead of its original raw-PTY-write
+        # behavior, which would go nowhere with no turn still reading the
+        # PTY for it.
+        reason = classification.get("reason") or "This turn may need your input before continuing."
+        db.update_session(
+            conn,
+            card_id,
+            claude_session_id=turn["session_id"],
+            stalled_json=json.dumps({"phase": "implementing", "context": reason}),
+            interview_json=None,
+        )
+        publish(card_id, _turn_event(phase="implementing", stalled=True, stalled_context=reason))
         return
 
     tracker = _read_tracker_file(cwd)
@@ -1859,6 +1955,11 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
         card_id,
         phase="implemented",
         blocked_json=None,
+        # Clear any stray needs-input state (issue #179) a prior turn in
+        # this same session may have left behind -- this turn resolved
+        # cleanly, superseding it.
+        stalled_json=None,
+        interview_json=None,
         details_json=json.dumps(details) if details is not None else None,
     )
 

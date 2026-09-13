@@ -1089,3 +1089,48 @@ def test_stall_reply_endpoint_forwards_to_the_correct_cards_engine_only(client, 
     assert resp.json() == {"replied": True}
     assert engine_a.writes == ["for A"]
     assert engine_b.writes == []
+
+
+def test_stall_reply_endpoint_resumes_an_implement_session_via_a_new_turn_instead_of_raw_write(
+    client, tmp_path, monkeypatch
+):
+    """Issue #179: a card left in `phase: implementing` with `stalled_json`
+    set by `_finish_implement_turn`'s needs-input fallback (see
+    tests/test_sessions.py) has ALREADY completed its turn -- nothing is
+    still reading its PTY, so a raw `engine.write()` (this endpoint's
+    original issue #169 behavior) would go nowhere. For that specific case
+    (session_type "implement", phase "implementing"), this endpoint must
+    resume through `continue_implement_job` -- a real new turn -- instead,
+    and must NOT touch the card's engine directly."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    card_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    db.update_session(conn, card_id, stalled_json=json.dumps({"phase": "implementing", "context": "Confirm?"}))
+
+    engine = _FakeWriteEngine()
+    monkeypatch.setattr(session_runner, "_pty_engines", {card_id: engine})
+
+    calls = []
+
+    async def fake_continue_implement_job(card_id_arg, reply, *, cwd):
+        calls.append((card_id_arg, reply, cwd))
+
+    monkeypatch.setattr(session_runner, "continue_implement_job", fake_continue_implement_job)
+
+    resp = client.post(f"/api/sessions/{card_id}/stall-reply", json={"text": "Yes, go ahead.\r"})
+
+    assert resp.json() == {"replied": True}
+    assert engine.writes == []
+    assert len(calls) == 1
+    assert calls[0][0] == card_id
+    assert calls[0][1] == "Yes, go ahead."
+
+
+def _cwd_for(project_id):
+    conn = db.get_connection()
+    return db.get_project(conn, project_id)["path"]
