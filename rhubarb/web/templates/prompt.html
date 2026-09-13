@@ -268,6 +268,21 @@
     </div>
   </div>
 
+  <!-- Ollama-unavailable notification (issue #175, child of PRD #174):
+       shown when a completed turn's needs-input classification call was
+       attempted (the user has NOT declined Ollama assistance) but failed or
+       timed out. Deliberately separate from the existing turn-event `error`
+       field -- the turn itself finished fine, only this follow-up
+       classification call failed -- so this is a standalone notification
+       with no other side effect on the turn's own normal result handling. -->
+  <div id="ollama-unavailable-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 class="modal-heading">Ollama Unavailable</h2>
+      <p class="modal-text">Ollama is currently unavailable.</p>
+      <button id="ollama-unavailable-modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
+    </div>
+  </div>
+
   <!-- First-run Ollama consent/install gate (issue #115): blocks the whole
        app -- no dismiss-by-clicking-away, no [x] -- until the user installs,
        declines, or (after a failure) explicitly skips for this session. -->
@@ -398,6 +413,8 @@
     const qaNotificationModalEl = document.getElementById("qa-notification-modal");
     const qaNotificationHeadingEl = document.getElementById("qa-notification-heading");
     const qaModalCloseBtnEl = document.getElementById("qa-modal-close-btn");
+    const ollamaUnavailableModalEl = document.getElementById("ollama-unavailable-modal");
+    const ollamaUnavailableModalCloseBtn = document.getElementById("ollama-unavailable-modal-close-btn");
     const errorLogsBtnEl = document.getElementById("error-logs-btn");
     const errorLogsModalEl = document.getElementById("error-logs-modal");
     const errorLogsPhaseSelectEl = document.getElementById("error-logs-phase-select");
@@ -1317,6 +1334,7 @@
     afkModalCloseBtn.addEventListener("click", dismissAfkNotifications);
     sessionErrorNotificationCloseBtn.addEventListener("click", dismissSessionErrorNotifications);
     qaModalCloseBtnEl.addEventListener("click", () => { qaNotificationModalEl.hidden = true; });
+    ollamaUnavailableModalCloseBtn.addEventListener("click", () => { ollamaUnavailableModalEl.hidden = true; });
     modelSelectCardEl.addEventListener("change", () => updateModel(modelSelectCardEl.value, leftCardId));
     modelSelectSettingsEl.addEventListener("change", () => updateModel(modelSelectSettingsEl.value));
     modelChangeModalCloseBtn.addEventListener("click", () => {
@@ -1908,6 +1926,15 @@
 
       if (event.type === "qa_started") {
         watchQaSession(event.qa_card_id);
+        return;
+      }
+
+      // Ollama-unavailable notification (issue #175): a completed turn's
+      // needs-input classification call was attempted but failed/timed out.
+      // Purely informational -- shown regardless of which card is currently
+      // focused, with no other side effect on this event's own card at all.
+      if (event.type === "ollama_unavailable") {
+        ollamaUnavailableModalEl.hidden = false;
         return;
       }
 

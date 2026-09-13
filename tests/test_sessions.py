@@ -4244,3 +4244,80 @@ def test_close_engine_removes_the_turn_lock(client, tmp_path, monkeypatch):
     session_runner._close_engine(row_id)
 
     assert row_id not in session_runner._turn_locks
+
+
+# ---------------------------------------------------------------------------
+# Needs-input classification wrapper (issue #175, child of PRD #174 --
+# replaces the per-chunk PTY stall mechanism with a single per-turn Ollama
+# classification, not yet wired into any phase's own turn-handling flow).
+# ---------------------------------------------------------------------------
+
+
+def test_classify_needs_input_is_a_no_op_when_ollama_declined(client):
+    """Skipped entirely -- no HTTP call attempted, nothing published -- when
+    the user has declined Ollama assistance, same precedent as the existing
+    grilling/QA rescue call sites."""
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, True)
+
+    def fake_post(url, body, *, timeout):
+        raise AssertionError("Ollama must not be called when ollama_declined is true")
+
+    result = asyncio.run(session_runner.classify_needs_input(1, conn, "some turn text", "grilling", http_post=fake_post))
+
+    assert result is None
+    assert live_stream._buffers.get(1, []) == []
+
+
+def test_classify_needs_input_publishes_unavailable_notification_on_failure_when_not_declined(client):
+    """A call failure/timeout while Ollama assistance is enabled is a
+    genuine, unexpected failure -- surfaced as a distinct `ollama_unavailable`
+    event, NOT folded into the existing turn `error` field."""
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, False)
+
+    def timing_out_post(url, body, *, timeout):
+        raise TimeoutError("Ollama took too long")
+
+    result = asyncio.run(session_runner.classify_needs_input(1, conn, "some turn text", "grilling", http_post=timing_out_post))
+
+    assert result is None
+    events = live_stream._buffers.get(1, [])
+    assert events == [{"type": "ollama_unavailable"}]
+
+
+def test_classify_needs_input_returns_result_and_publishes_nothing_on_success(client):
+    """A successful classification is returned as-is and does not publish
+    any notification -- the unavailable notification is only for a call
+    that was attempted and failed."""
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, False)
+
+    payload = {"needs_input": True, "reason": "Asked which database to use."}
+
+    def fake_post(url, body, *, timeout):
+        import json as _json
+
+        return {"response": _json.dumps(payload)}
+
+    result = asyncio.run(session_runner.classify_needs_input(1, conn, "Which database?", "grilling", http_post=fake_post))
+
+    assert result == payload
+    assert live_stream._buffers.get(1, []) == []
+
+
+def test_classify_needs_input_publishes_unavailable_notification_when_response_is_malformed(client):
+    """A malformed/invalid Ollama response is a classification failure just
+    like a timeout or connection error -- never partially trusted -- and
+    the call WAS attempted (not declined), so this still fires the
+    unavailable notification exactly like a timeout would."""
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, False)
+
+    def fake_post(url, body, *, timeout):
+        return {"response": "not valid json at all {{{"}
+
+    result = asyncio.run(session_runner.classify_needs_input(1, conn, "text", "grilling", http_post=fake_post))
+
+    assert result is None
+    assert live_stream._buffers.get(1, []) == [{"type": "ollama_unavailable"}]

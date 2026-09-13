@@ -133,31 +133,6 @@ process's stdout. This is unconditional: no environment variable or config
 flag gates it, and it applies uniformly to every PTY-driven turn regardless
 of phase. It is purely a console side effect -- it changes nothing about
 what `_stream_chunks_until_marker`/`stream_turn` yield to callers.
-
-## Turn progress (issue #173, replacing issue #169's timer-based "stall"
-detection)
-
-PRD #168/issue #169 originally added a 5-second quiet-period timeout around
-the pending PTY read: if a chunk hadn't arrived within
-`_STALL_QUIET_PERIOD_SECONDS`, a `{"type": "stall", "data": <rendered
-buffer-so-far>}` event fired, on the theory that a long quiet spell meant
-the turn was stuck. In practice this produced false positives -- a grilling
-or QA-grilling round can legitimately think for longer than 5 seconds with
-nothing wrong at all -- and the frontend's stall panel would pop up mid-turn
-looking like an error when the CLI was simply still working.
-
-Issue #173 removes that timer and the judgment call it required entirely.
-`_stream_chunks_until_marker`'s read loop is back to a single, plain
-blocking read per iteration (the same shape it had before PRD #168), and it
-now yields that SAME `{"type": "stall", "data": ...}` event -- unchanged
-shape/field names, to minimize churn in `session_runner.py` and the
-frontend, which already handle it correctly -- after every chunk,
-unconditionally, for every turn, in every phase. There is no more
-distinction between "stalled" and "not stalled": the event is really just a
-turn-progress heartbeat now, always present for the whole duration of a
-turn. `stream_turn`'s live console trace print and this event now reuse the
-exact same `_render_terminal_text(buffer, self._cols)` call per chunk --
-only one render call per chunk, not two.
 """
 
 import asyncio
@@ -664,7 +639,7 @@ class PtyEngine:
         self._is_resume = True
         self.start()
 
-    async def _stream_chunks_until_marker(self, prompt: str) -> AsyncIterator[str | dict]:
+    async def _stream_chunks_until_marker(self, prompt: str) -> AsyncIterator[str]:
         """Write `prompt` to the current process and yield each raw output
         chunk exactly as read from the PTY (issue #88 -- this is what lets a
         caller relay the real, unmodified terminal byte stream -- ANSI
@@ -687,20 +662,6 @@ class PtyEngine:
         session's screen resolve live, turn by turn, the same way a real
         terminal watching the raw PTY stream would, without needing to
         attach a separate live-terminal-view consumer.
-
-        Turn progress (issue #173, replacing issue #169's timer-based
-        "stall" detection): the SAME rendered buffer-so-far computed for the
-        live console trace above is also yielded to the caller, as a
-        `{"type": "stall", "data": <rendered buffer-so-far>}` event -- after
-        EVERY chunk read, unconditionally, for the whole duration of any
-        turn, in every phase. This event shape/name is unchanged from issue
-        #169 on purpose (minimizes churn in `session_runner.py` and the
-        frontend, which already handle it correctly); what changed is when
-        it fires -- no timer, no quiet-period judgment call, just "a chunk
-        was read" -- so it is really a turn-progress heartbeat now, not a
-        signal that anything is actually stuck. This is a single per-chunk
-        read with no timeout wrapper, the same shape this loop had before
-        PRD #168 introduced the quiet-period timer.
 
         Raises `PtyEngineError` if the process ends first -- callers decide
         what to do with that (see `stream_turn`, which retries this once via
@@ -740,13 +701,7 @@ class PtyEngine:
                     )
                 continue
             buffer += chunk
-            rendered = _render_terminal_text(buffer, self._cols)
-            print(f"[pty live]\n{rendered}")
-            # Turn progress (issue #173): the exact same rendered text just
-            # printed above, yielded unconditionally after every chunk -- see
-            # this method's docstring for why this reuses the issue #169
-            # `stall` event shape rather than introducing a new one.
-            yield {"type": "stall", "data": rendered}
+            print(f"[pty live]\n{_render_terminal_text(buffer, self._cols)}")
             yield chunk
 
     async def stream_turn(self, prompt: str) -> AsyncIterator[dict]:
@@ -790,15 +745,6 @@ class PtyEngine:
         `stream_turn` raises `PtyEngineUnrecoverableError` instead of
         retrying again -- see that class's docstring for the shape a
         caller should route into the blocked-card flow.
-
-        Turn progress events (issue #173, replacing issue #169's timer-based
-        "stall" detection): `_stream_chunks_until_marker` also yields a
-        `{"type": "stall", ...}` dict (instead of a raw string chunk) after
-        EVERY chunk it reads, unconditionally -- not just when a quiet
-        period elapses. Those are passed through here unmodified, exactly
-        like `terminal_output` -- they carry no bearing on `buffer`/marker
-        detection (nothing about marker detection depends on them) and do
-        not end this loop.
         """
         self.start()
         assert self._proc is not None
@@ -807,22 +753,16 @@ class PtyEngine:
 
         buffer = ""
         try:
-            async for item in self._stream_chunks_until_marker(prompt):
-                if isinstance(item, dict):
-                    yield item
-                    continue
-                buffer += item
-                yield {"type": "terminal_output", "data": item}
+            async for chunk in self._stream_chunks_until_marker(prompt):
+                buffer += chunk
+                yield {"type": "terminal_output", "data": chunk}
         except PtyEngineError as first_error:
             try:
                 self._restart_after_death()
                 buffer = ""
-                async for item in self._stream_chunks_until_marker(prompt):
-                    if isinstance(item, dict):
-                        yield item
-                        continue
-                    buffer += item
-                    yield {"type": "terminal_output", "data": item}
+                async for chunk in self._stream_chunks_until_marker(prompt):
+                    buffer += chunk
+                    yield {"type": "terminal_output", "data": chunk}
             except Exception as second_error:
                 raise PtyEngineUnrecoverableError(
                     "claude PTY process died twice in a row for the same turn "

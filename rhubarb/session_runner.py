@@ -97,6 +97,7 @@ from rhubarb.cli_client import ClaudeCLIError
 from rhubarb.github_publisher import GithubPublishError, publish_draft
 from rhubarb.live_stream import publish
 from rhubarb.ollama_rescue import (
+    classify_turn_needs_input,
     rescue_grilling_response,
     rescue_qa_response,
     should_attempt_grilling_rescue,
@@ -835,6 +836,46 @@ def _turn_event(
         "stalled": stalled,
         "stalled_context": stalled_context,
     }
+
+
+async def classify_needs_input(card_id: int, conn, text: str, phase: str, *, http_post=None) -> dict | None:
+    """Classify, via the local Ollama model, whether a just-completed turn's
+    rendered `text` (produced during `phase`) needs a human's input before
+    this session can usefully continue -- see `ollama_rescue.
+    classify_turn_needs_input` for the call itself and its `{needs_input,
+    reason}` result shape.
+
+    This is the mechanism only (issue #175, child of PRD #174 "replace the
+    per-chunk PTY stall mechanism with a single per-turn Ollama
+    classification"): nothing calls this yet from any phase's actual
+    turn-handling flow (grilling, QA-grilling, implementing, ...) -- sibling
+    issues #177/#178/#179 decide which phases call it and what a `True`
+    result does. It is built and directly tested here so that wiring doesn't
+    have to happen blind.
+
+    Skipped entirely -- no HTTP call attempted, nothing published -- when
+    the user has declined Ollama assistance (`db.get_ollama_declined`,
+    issue #119's opt-out), same silent no-op every other Ollama-backed
+    fallback in this codebase already gives that preference.
+
+    When Ollama assistance is NOT declined but the classification call still
+    fails or times out (`classify_turn_needs_input` returns `None`), that is
+    a genuine, unexpected failure -- Ollama was expected to answer and
+    didn't -- so this publishes a distinct `{"type": "ollama_unavailable"}`
+    event on this card's live stream (`live_stream.publish`) rather than
+    silently doing nothing. This is deliberately NOT folded into the
+    existing `turn` event's `error` field: that field means the turn ITSELF
+    failed, which isn't true here -- the turn already completed fine, only
+    this follow-up classification call failed. `prompt.html` shows a minimal
+    "Ollama is currently unavailable" modal on this event and takes no other
+    action -- a turn's own normal result handling is completely untouched by
+    this, on both success and failure."""
+    if db.get_ollama_declined(conn):
+        return None
+    result = await asyncio.to_thread(classify_turn_needs_input, text, phase, http_post=http_post)
+    if result is None:
+        publish(card_id, {"type": "ollama_unavailable"})
+    return result
 
 
 _GRILLING_CORRECTIVE_PROMPT_TEMPLATE = (
