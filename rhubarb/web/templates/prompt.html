@@ -1808,6 +1808,30 @@
           box.addEventListener("input", () => autoGrow(box));
           block.appendChild(box);
 
+          // "Something else?" override (issue #176): handlePerfectClick
+          // below reads `box.value` verbatim as this question's answer, so
+          // the override just swaps that value in/out directly instead of
+          // going through a separate answers map -- saving whatever was
+          // showing (recommended_text, or a direct edit) so it can be
+          // restored if the override is cleared back to empty.
+          let overrideActive = false;
+          let savedValue = "";
+          const { wrap: somethingElseWrap, textarea: somethingElseBox } = renderTrailingNotesBox("Something else?");
+          somethingElseBox.addEventListener("input", () => {
+            if (somethingElseBox.value.trim()) {
+              if (!overrideActive) {
+                savedValue = box.value;
+                overrideActive = true;
+              }
+              box.value = somethingElseBox.value.trim();
+            } else if (overrideActive) {
+              overrideActive = false;
+              box.value = savedValue;
+            }
+            autoGrow(box);
+          });
+          block.appendChild(somethingElseWrap);
+
           interviewEl.appendChild(block);
           // scrollHeight is only measurable once attached to the document,
           // so a programmatic pre-fill can only be sized here, after the
@@ -2602,6 +2626,11 @@
           // assigned, even though it's referenced before that assignment
           // happens further down.
           let somethingElseInput = null;
+          // True once any option button has been clicked -- "recommended"
+          // (the breathing glow on the auto-preselected option(s)) never
+          // comes back after that, even if the "Something else?" override
+          // is later typed into and cleared back to empty again (issue #176).
+          let touchedByClick = false;
 
           const updateAnswer = () => {
             // A non-empty override always wins, regardless of which option
@@ -2610,6 +2639,17 @@
             if (somethingElseInput && somethingElseInput.value.trim()) return;
             const chosen = q.options.filter((_, i) => selectedIndices.has(i + 1));
             answers[q.id] = q.kind === "multi" ? chosen.join(", ") : chosen[0] || "";
+          };
+
+          // Restores the option buttons' look from selectedIndices/
+          // recommendedIndices -- used when "Something else?" is cleared
+          // back to empty, to undo the blanket deselect below (issue #176).
+          const applyOptionVisuals = () => {
+            optWrap.querySelectorAll(".option-btn").forEach((b, i) => {
+              const n = i + 1;
+              b.classList.toggle("selected", selectedIndices.has(n));
+              b.classList.toggle("recommended", !touchedByClick && recommendedIndices.has(n));
+            });
           };
 
           q.options.forEach((opt, idx) => {
@@ -2622,6 +2662,13 @@
             if (recommendedIndices.has(n)) btn.classList.add("recommended");
 
             btn.addEventListener("click", () => {
+              touchedByClick = true;
+              // Clicking an option is the user picking it over a free-text
+              // override that might still be showing -- clear that override
+              // so the two controls stay mutually exclusive instead of both
+              // looking active at once (issue #176).
+              if (somethingElseInput && somethingElseInput.value.trim()) somethingElseInput.value = "";
+
               // Any click ends the "untouched default" state for this whole
               // question -- the recommendation no longer describes what gets
               // submitted, so it stops breathing everywhere in this group,
@@ -2655,8 +2702,16 @@
           somethingElseInput = somethingElseBox;
           somethingElseBox.addEventListener("input", () => {
             if (somethingElseBox.value.trim()) {
+              // Non-empty override -- visually deselect every option so the
+              // free-text answer is the only thing that looks active
+              // (issue #176).
+              optWrap.querySelectorAll(".option-btn").forEach((b) => b.classList.remove("selected", "recommended"));
               answers[q.id] = somethingElseBox.value.trim();
             } else {
+              // Cleared back to empty -- restore whatever selection state
+              // this question had before the override took over, and go
+              // back to submitting it as the answer.
+              applyOptionVisuals();
               updateAnswer();
             }
           });
@@ -2674,6 +2729,32 @@
             autoGrow(input);
           });
           block.appendChild(input);
+
+          // "Something else?" override (issue #176): same swap-in/swap-out
+          // pattern as the single/multi-select case above -- typing here
+          // clears whatever's showing in `input` (recommended_text, or
+          // whatever the user had typed directly into it) and becomes the
+          // answer instead; clearing it back to empty restores what was
+          // there and reverts the answer to it.
+          let overrideActive = false;
+          let savedValue = "";
+          const { wrap: somethingElseWrap, textarea: somethingElseBox } = renderTrailingNotesBox("Something else?");
+          somethingElseBox.addEventListener("input", () => {
+            if (somethingElseBox.value.trim()) {
+              if (!overrideActive) {
+                savedValue = input.value;
+                overrideActive = true;
+              }
+              input.value = "";
+              answers[q.id] = somethingElseBox.value.trim();
+            } else if (overrideActive) {
+              overrideActive = false;
+              input.value = savedValue;
+              answers[q.id] = savedValue;
+            }
+            autoGrow(input);
+          });
+          block.appendChild(somethingElseWrap);
         }
 
         interviewEl.appendChild(block);
