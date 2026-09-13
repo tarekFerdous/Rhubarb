@@ -2104,7 +2104,18 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
     # (`classify_needs_input` returns `None` for the latter two, same as
     # every other caller) all fall straight through to today's unchanged
     # automatic continuation below.
-    classification = await classify_needs_input(card_id, conn, turn["result"], "implementing")
+    #
+    # Also skipped entirely when this turn's result carries a `qa_grilling`
+    # handoff marker (`_parse_qa_grilling_block`, checked below at its own
+    # existing call site) -- that marker is itself a legitimate, already-
+    # structured signal, and the QA-handoff logic further down (its own
+    # regex/rescue/corrective-retry chain, including issue #178's own
+    # `classify_needs_input` call on a genuine QA wrap-up) must get the
+    # first and only look at this turn's text. Classifying here first would
+    # otherwise intercept a real QA handoff before that logic ever runs.
+    classification = None
+    if _parse_qa_grilling_block(turn["result"]) is None:
+        classification = await classify_needs_input(card_id, conn, turn["result"], "implementing")
     if classification is not None and classification.get("needs_input"):
         extracted = await _extract_implementing_question(turn["result"])
         if extracted is not None:
