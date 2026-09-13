@@ -2375,9 +2375,6 @@
       // (issue #167's passthrough-typing indicator signal) until the next
       // turn/phase/done event for this card clears it.
       turnInFlight = true;
-      // Issue #173: show the turn-progress/reply panel immediately, rather
-      // than waiting for a backend `stall` event to arrive.
-      showTurnProgressPanel();
       const res = await fetch("/api/session/continue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2424,9 +2421,6 @@
     async function sendImplementReply(replyText, triggerBtn) {
       if (!replyText.trim() || leftCardId === null) return false;
       turnInFlight = true;
-      // Issue #173: show the turn-progress/reply panel immediately, rather
-      // than waiting for a backend `stall` event to arrive.
-      showTurnProgressPanel();
       const res = await fetch(`/api/sessions/${leftCardId}/implement-reply`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2484,40 +2478,17 @@
       enableTerminalReplyInput(sendStallReply);
     }
 
-    // Issue #173 (child of PRD #172 "Remove the stall-detection timer;
-    // always show turn progress plus a reply box instead"): shows this same
-    // turn-progress/reply panel the INSTANT a turn starts for the focused
-    // card, driven by `turnInFlight` becoming true -- rather than waiting
-    // for a backend `stall` event to arrive (under the old timer-based
-    // design that could take several seconds; under the new unconditional
-    // per-chunk design it's normally near-instant too, but there is still
-    // no reason to wait on a network round trip when the client already
-    // knows a turn just started).
-    // Reuses `renderStalledSession` completely unchanged -- same shape
-    // `applyTurn`'s `stalled` branch already builds and renders -- just
-    // with no context yet (nothing has streamed in for this new turn),
-    // which `renderStalledSession` already handles (it only shows the
-    // context `<pre>` when `stalled.context` is truthy). The very next
-    // `stall` event for this turn (there will be one after the first PTY
-    // chunk is read) replaces this via applyTurn's existing branch, same as
-    // any later one; and the moment the turn actually resolves, applyTurn's
-    // normal (non-stalled) branch replaces this panel with that phase's real
-    // completion UI, exactly as issue #171 already established.
-    function showTurnProgressPanel() {
-      if (leftCardId === null) return;
-      const prior = cardSnapshots.get(leftCardId) || {};
-      const snapshot = {
-        ...prior,
-        card_id: leftCardId,
-        session_type: cardSessionTypes.get(leftCardId) || prior.session_type || "do",
-        stalled: { phase: prior.phase || null, context: null },
-      };
-      cardSnapshots.set(leftCardId, snapshot);
-      setHeading("Stalled — needs your input");
-      startForm.style.display = "none";
-      showOnly(mainFlowEl);
-      renderStalledSession(snapshot);
-    }
+    // Issue #173's client-side `showTurnProgressPanel()` (which used to show
+    // this panel the instant any reply was submitted, driven by
+    // `turnInFlight` alone, no backend signal needed) was removed as part of
+    // PRD #174: that PRD retired the per-chunk "always show progress"
+    // design entirely in favor of only showing this panel when the backend's
+    // `classify_needs_input` judgment (issues #177/#178/#179) actually says
+    // a turn needs a human's input. `renderStalledSession` below is still
+    // reused for that backend-driven case, unchanged -- it's only ever
+    // invoked now via `applyTurn`'s `stalled` branch or a persisted
+    // reconnect, never proactively from the client the moment a reply is
+    // sent.
 
     // Issue #171: submits a reply while the focused card's turn is stalled.
     // Unlike sendReply/sendImplementReply, this does NOT start a new turn
@@ -2561,9 +2532,6 @@
       if (leftCardId === null) return;
       markButtonPending(triggerBtn);
       turnInFlight = true;
-      // Issue #173: show the turn-progress/reply panel immediately, rather
-      // than waiting for a backend `stall` event to arrive.
-      showTurnProgressPanel();
       const res = await fetch("/api/session/continue", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
