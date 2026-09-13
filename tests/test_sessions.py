@@ -992,6 +992,230 @@ def test_grilling_turn_corrective_retry_failure_publishes_explicit_error(client,
     assert turn_events[-1]["phase"] == "grilling"
 
 
+# ---------------------------------------------------------------------------
+# Ollama needs-input classification wired into grilling (issue #178, child of
+# PRD #174) -- the last-resort check run right before treating a round as a
+# genuine "no more questions" wrap-up, after the existing file/terminal-text/
+# Ollama-rescue chain (and, where attempted, the PRD #157 corrective retry)
+# has already concluded there are no questions.
+# ---------------------------------------------------------------------------
+
+
+def test_grilling_turn_needs_input_classification_renders_rich_ui_on_genuine_wrapup(client, tmp_path, monkeypatch):
+    """A round that looks like a genuine "no more questions" wrap-up (no
+    "Question " trigger at all, so the existing chain never even attempts a
+    corrective retry) must still be handed to the Ollama needs-input
+    classifier before being treated as done. When it says a human's input is
+    still needed, and a second Ollama extraction attempt on the same text
+    actually produces question content, that rich content -- not the plain
+    wrap-up gate -- is what gets published/persisted."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    wrapup_text = "Thanks, that's everything I need."
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(wrapup_text)]))
+
+    rescued = {
+        "header": "",
+        "footer": "",
+        "questions": [
+            {
+                "id": "q1",
+                "text": "Actually, one more thing -- which database?",
+                "kind": "open",
+                "options": None,
+                "recommended": None,
+                "recommended_text": None,
+            }
+        ],
+    }
+    seen = {}
+
+    async def fake_classify(card_id, conn, text, phase, **kw):
+        seen["text"] = text
+        seen["phase"] = phase
+        return {"needs_input": True, "reason": "Still waiting on a database choice."}
+
+    def fake_rescue(raw_text):
+        seen["rescue_raw_text"] = raw_text
+        return rescued
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+    monkeypatch.setattr(session_runner, "rescue_grilling_response", fake_rescue)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    assert seen["text"] == wrapup_text
+    assert seen["phase"] == "grilling"
+    assert seen["rescue_raw_text"] == wrapup_text
+
+    row = db.get_session(conn, row_id)
+    assert row["error_text"] is None
+    interview = json.loads(row["interview_json"])
+    assert interview == rescued
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e["type"] == "turn"]
+    assert turn_events[-1]["interview"] == rescued
+
+
+def test_grilling_turn_needs_input_classification_false_falls_through_to_wrapup(client, tmp_path, monkeypatch):
+    """A negative classification (no human input actually needed) must fall
+    through to today's unchanged "ready to proceed?" wrap-up -- and must
+    never even attempt the extraction rescue call."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("Thanks, that's everything I need.")]))
+
+    async def fake_classify(card_id, conn, text, phase, **kw):
+        return {"needs_input": False, "reason": "This is a genuine wrap-up."}
+
+    def fake_rescue(raw_text):
+        raise AssertionError("extraction must not be attempted when needs_input is false")
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+    monkeypatch.setattr(session_runner, "rescue_grilling_response", fake_rescue)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["error_text"] is None
+    interview = json.loads(row["interview_json"])
+    assert interview["questions"] == []
+
+
+def test_grilling_turn_needs_input_declined_or_unavailable_falls_through_to_wrapup(client, tmp_path, monkeypatch):
+    """A declined/unavailable classification (`classify_needs_input` itself
+    already returns `None` for both cases) must fall through to today's
+    unchanged wrap-up, exactly like an explicit negative classification."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("Thanks, that's everything I need.")]))
+
+    async def fake_classify(card_id, conn, text, phase, **kw):
+        return None
+
+    def fake_rescue(raw_text):
+        raise AssertionError("extraction must not be attempted when classification is unavailable")
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+    monkeypatch.setattr(session_runner, "rescue_grilling_response", fake_rescue)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["error_text"] is None
+    interview = json.loads(row["interview_json"])
+    assert interview["questions"] == []
+
+
+def test_grilling_turn_needs_input_true_but_extraction_fails_falls_through_to_wrapup(client, tmp_path, monkeypatch):
+    """A positive classification whose extraction attempt still comes up
+    empty must fall through to today's unchanged wrap-up -- extraction
+    failing is treated exactly like a negative classification."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("Thanks, that's everything I need.")]))
+
+    async def fake_classify(card_id, conn, text, phase, **kw):
+        return {"needs_input": True, "reason": "Looks unfinished."}
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+    monkeypatch.setattr(session_runner, "rescue_grilling_response", lambda raw_text: None)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["error_text"] is None
+    interview = json.loads(row["interview_json"])
+    assert interview["questions"] == []
+
+
+def test_grilling_turn_needs_input_classification_rescues_after_corrective_retry_also_failed(
+    client, tmp_path, monkeypatch
+):
+    """Issue #178 explicitly covers this case too: once the PRD #157
+    corrective retry has already run and its own result *also* failed to
+    parse, the needs-input classifier gets one last look at that retry's
+    own text before the session gives up with an explicit error. A positive
+    classification with successfully extracted question content must render
+    the rich question UI instead of that explicit error."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    malformed_text = 'Question 1: the quote never closes, so the regex parser finds nothing here.\n'
+    still_malformed_retry_text = 'Question 1: still no closing quote after the retry either\n'
+    calls = []
+
+    def handler(prompt, **kw):
+        calls.append(prompt)
+        if "did not parse" in prompt:
+            return iter([_result_event(still_malformed_retry_text, session_id="s2")])
+        return iter([_result_event(malformed_text, session_id="s1")])
+
+    _mock_engine(monkeypatch, handler)
+
+    rescued = {
+        "header": "",
+        "footer": "",
+        "questions": [
+            {
+                "id": "q1",
+                "text": "Extracted after the retry failed to parse too",
+                "kind": "open",
+                "options": None,
+                "recommended": None,
+                "recommended_text": None,
+            }
+        ],
+    }
+
+    def fake_rescue(raw_text):
+        # The existing chain's own rescue attempt (on the original malformed
+        # text) must still come back empty -- otherwise the corrective retry
+        # would never fire in the first place. Only the new issue #178
+        # extraction attempt, on the retry's own text, succeeds.
+        if raw_text == still_malformed_retry_text:
+            return rescued
+        return None
+
+    async def fake_classify(card_id, conn, text, phase, **kw):
+        assert text == still_malformed_retry_text
+        assert phase == "grilling"
+        return {"needs_input": True, "reason": "The retry still looks like it wants an answer."}
+
+    monkeypatch.setattr(session_runner, "rescue_grilling_response", fake_rescue)
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    assert len(calls) == 2, "expected exactly one corrective retry turn, in addition to the original"
+
+    row = db.get_session(conn, row_id)
+    assert row["error_text"] is None
+    assert row["claude_session_id"] == "s2"
+    interview = json.loads(row["interview_json"])
+    assert interview == rescued
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e["type"] == "turn"]
+    assert turn_events[-1]["interview"] == rescued
+    assert turn_events[-1]["error"] is None
+
+
 def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, tmp_path, monkeypatch):
     """Issue #33: the explicit "Yes, proceed" path (confirm_advance=True)
     must go straight to /rhubarb:to-prd -> /rhubarb:to-issues -> details, resuming the
@@ -2699,6 +2923,225 @@ def test_qa_corrective_retry_publishes_explicit_error_when_still_unparseable(cli
 
     errors = error_log.query_errors(project_id, log_path=log_path)
     assert any(e["phase"] == "qa_grilling" and e["card_id"] == row_id for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# Ollama needs-input classification wired into QA-grilling (issue #178, child
+# of PRD #174) -- mirrors the grilling tests above, applied to the
+# QA-grilling handoff's own fallback chain instead.
+# ---------------------------------------------------------------------------
+
+
+def _qa_tracker(cwd):
+    tracker = {
+        "prd": {"number": 7, "title": "Tracked PRD"},
+        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
+        "qa_changes": [],
+        "status": "implemented",
+    }
+    claude_dir = Path(cwd) / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+
+
+def test_qa_needs_input_classification_renders_rich_ui_on_genuine_wrapup(client, tmp_path, monkeypatch):
+    """A QA handoff round that looks like a genuine "no more QA questions"
+    wrap-up (no "QA session for PRD" trigger at all, so the existing chain
+    never even attempts a corrective retry) must still be handed to the
+    Ollama needs-input classifier before the QA session is created with an
+    empty issues list. When it says a human's input is still needed, and a
+    second Ollama extraction attempt on the same text actually produces
+    issue/question content, that rich content is what the new QA session is
+    started with instead."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _qa_tracker(cwd)
+
+    wrapup_text = _QA_BLOCK + "\n\nEverything checks out, no further QA questions."
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(wrapup_text, session_id="qa-session-id")]))
+
+    rescued = {
+        "prd": None,
+        "issues": [
+            {
+                "number": 8,
+                "title": "Child",
+                "questions": [{"id": "issue8-q1", "text": "Actually, one more check needed", "recommended_text": None}],
+            }
+        ],
+    }
+    seen = {}
+
+    async def fake_classify(card_id, conn, text, phase, **kw):
+        seen["phase"] = phase
+        return {"needs_input": True, "reason": "Still worth a follow-up check."}
+
+    def fake_rescue(raw_text):
+        seen["rescue_raw_text"] = raw_text
+        return rescued
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+    monkeypatch.setattr(session_runner, "rescue_qa_response", fake_rescue)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    assert seen["phase"] == "qa_grilling"
+    assert seen["rescue_raw_text"] == wrapup_text
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    qa_row = next(s for s in sessions if s["session_type"] == "qa")
+    qa_events = live_stream._buffers.get(qa_row["id"], [])
+    qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
+    assert qa_turn_events[0]["issues"] == rescued["issues"]
+
+
+def test_qa_needs_input_classification_false_falls_through_to_wrapup(client, tmp_path, monkeypatch):
+    """A negative classification must fall through to today's unchanged QA
+    handoff -- a QA session still created, but with an empty issues list --
+    and must never even attempt the extraction rescue call."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _qa_tracker(cwd)
+
+    _mock_engine(
+        monkeypatch,
+        lambda prompt, **kw: iter([_result_event(_QA_BLOCK + "\n\nAll good, nothing further.", session_id="qa-session-id")]),
+    )
+
+    async def fake_classify(card_id, conn, text, phase, **kw):
+        return {"needs_input": False, "reason": "Genuinely done."}
+
+    def fake_rescue(raw_text):
+        raise AssertionError("extraction must not be attempted when needs_input is false")
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+    monkeypatch.setattr(session_runner, "rescue_qa_response", fake_rescue)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    qa_row = next(s for s in sessions if s["session_type"] == "qa")
+    qa_events = live_stream._buffers.get(qa_row["id"], [])
+    qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
+    assert qa_turn_events[0]["issues"] == []
+
+
+def test_qa_needs_input_true_but_extraction_fails_falls_through_to_wrapup(client, tmp_path, monkeypatch):
+    """A positive classification whose extraction attempt still comes up
+    empty must fall through to today's unchanged QA handoff wrap-up."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _qa_tracker(cwd)
+
+    _mock_engine(
+        monkeypatch,
+        lambda prompt, **kw: iter([_result_event(_QA_BLOCK + "\n\nAll good, nothing further.", session_id="qa-session-id")]),
+    )
+
+    async def fake_classify(card_id, conn, text, phase, **kw):
+        return {"needs_input": True, "reason": "Looks unfinished."}
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+    monkeypatch.setattr(session_runner, "rescue_qa_response", lambda raw_text: None)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    qa_row = next(s for s in sessions if s["session_type"] == "qa")
+    qa_events = live_stream._buffers.get(qa_row["id"], [])
+    qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
+    assert qa_turn_events[0]["issues"] == []
+
+
+def test_qa_needs_input_classification_rescues_after_corrective_retry_also_failed(client, tmp_path, monkeypatch):
+    """Once the QA-grilling corrective retry (issue #159) has already run
+    and its own result *also* failed to parse, the needs-input classifier
+    gets one last look at that retry's own text before the session gives up
+    with an explicit error. A positive classification with successfully
+    extracted issue/question content must create the QA session with that
+    content instead of publishing that explicit error."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _qa_tracker(cwd)
+
+    malformed_qa_text = _QA_BLOCK + "\n\nQA session for PRD 7: this is malformed, no quoted title at all\n"
+    still_malformed_retry_text = "QA session for PRD 7: still no quoted title, still broken\n"
+    seen_prompts = []
+
+    def handler(prompt, **kw):
+        seen_prompts.append(prompt)
+        if len(seen_prompts) == 1:
+            return iter([_result_event(malformed_qa_text, session_id="qa-session-id")])
+        return iter([_result_event(still_malformed_retry_text, session_id="qa-session-id-retry")])
+
+    _mock_engine(monkeypatch, handler)
+
+    rescued = {
+        "prd": None,
+        "issues": [
+            {
+                "number": 8,
+                "title": "Child",
+                "questions": [{"id": "issue8-q1", "text": "Extracted after the retry failed too", "recommended_text": None}],
+            }
+        ],
+    }
+
+    def fake_rescue(raw_text):
+        if raw_text == still_malformed_retry_text:
+            return rescued
+        return None
+
+    async def fake_classify(card_id, conn, text, phase, **kw):
+        assert text == still_malformed_retry_text
+        assert phase == "qa_grilling"
+        return {"needs_input": True, "reason": "The retry still looks unfinished."}
+
+    monkeypatch.setattr(session_runner, "rescue_qa_response", fake_rescue)
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    assert len(seen_prompts) == 2, "expected exactly one corrective retry turn, in addition to the original"
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    qa_row = next(s for s in sessions if s["session_type"] == "qa")
+    assert qa_row["claude_session_id"] == "qa-session-id-retry"
+
+    impl_row = db.get_session(conn, row_id)
+    assert impl_row["error_text"] is None
+
+    qa_events = live_stream._buffers.get(qa_row["id"], [])
+    qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
+    assert qa_turn_events[0]["issues"] == rescued["issues"]
 
 
 def test_start_implement_job_pools_session_normally_when_no_qa_block(client, tmp_path, monkeypatch):

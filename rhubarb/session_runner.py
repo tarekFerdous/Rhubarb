@@ -988,6 +988,36 @@ async def _run_grilling_corrective_retry(
     return turn, parsed
 
 
+async def _maybe_extract_needs_input_grilling(card_id: int, conn, text: str) -> dict | None:
+    """Issue #178: the last-resort check `_run_grilling_turn` runs right
+    before treating a round as a genuine "no more questions" wrap-up --
+    after its existing file/terminal-text/Ollama-rescue chain (and, where
+    attempted, the PRD #157 corrective retry) has already concluded
+    `text` carries no parseable questions.
+
+    Asks the local Ollama needs-input classifier (`classify_needs_input`)
+    whether a human's input is actually still needed for this turn. If it
+    says yes, makes one more attempt at structured extraction from the same
+    `text` via `rescue_grilling_response` -- the same Ollama rescue
+    extraction the existing chain already uses, just tried again here as a
+    second, independent attempt now that the classifier has flagged this
+    text as worth another look.
+
+    Returns the extracted `{header, questions, footer, source}` dict only
+    when *both* the classifier says input is needed *and* extraction
+    actually produced at least one question. Returns `None` in every other
+    case -- classifier declined/unavailable/says no input needed, or
+    extraction still came up empty -- which callers treat exactly like a
+    genuine wrap-up, unchanged."""
+    classification = await classify_needs_input(card_id, conn, text, "grilling")
+    if classification is None or not classification.get("needs_input"):
+        return None
+    rescued = await asyncio.to_thread(rescue_grilling_response, text)
+    if rescued is None or not rescued["questions"]:
+        return None
+    return rescued
+
+
 async def _run_grilling_turn(
     card_id: int,
     conn,
@@ -1113,45 +1143,64 @@ async def _run_grilling_turn(
         console_text = console_text + "\n\n" + retry_turn["result"]
 
         if not retry_parsed["questions"]:
-            # The corrective retry also failed to produce anything
-            # parseable -- stop trying automatically. Publish/persist an
-            # explicit error through the same `_turn_event` path every
-            # other grilling error already uses (which also feeds the
-            # app-wide error log, see `error_log.log_error`), instead of
-            # falling back to the generic "ready to proceed?" wrap-up gate
-            # -- that gate would misrepresent a parse failure as grilling
-            # being genuinely done.
-            message = (
-                "This grilling round's questions did not parse, and a "
-                "corrective retry asking the model to reformat them also "
-                "failed to produce parseable questions. Stopping "
-                "automatically rather than risk silently treating this as "
-                "\"no more questions\"."
+            # Issue #178: the corrective retry also failed to produce
+            # anything parseable via the existing chain -- before giving up,
+            # ask Ollama's needs-input classifier whether this retry's own
+            # result actually still needs a human's input and, if so, make
+            # one more attempt at structured extraction from it.
+            rescued_via_classifier = await _maybe_extract_needs_input_grilling(
+                card_id, conn, retry_turn["result"]
             )
-            db.update_session(
-                conn,
-                card_id,
-                model=model,
-                effort=effort,
-                claude_session_id=retry_turn["session_id"],
-                console_text=console_text,
-                error_text=message,
-                needs_github_login=0,
-            )
-            publish(
-                card_id,
-                _turn_event(
-                    phase="grilling",
-                    error=message,
-                    needs_github_login=False,
-                    card_id=card_id,
-                    project_id=row["project_id"],
-                ),
-            )
-            return None
-
-        turn = retry_turn
-        parsed = retry_parsed
+            if rescued_via_classifier is not None:
+                turn = retry_turn
+                parsed = rescued_via_classifier
+            else:
+                # Stop trying automatically. Publish/persist an explicit
+                # error through the same `_turn_event` path every other
+                # grilling error already uses (which also feeds the
+                # app-wide error log, see `error_log.log_error`), instead of
+                # falling back to the generic "ready to proceed?" wrap-up
+                # gate -- that gate would misrepresent a parse failure as
+                # grilling being genuinely done.
+                message = (
+                    "This grilling round's questions did not parse, and a "
+                    "corrective retry asking the model to reformat them also "
+                    "failed to produce parseable questions. Stopping "
+                    "automatically rather than risk silently treating this as "
+                    "\"no more questions\"."
+                )
+                db.update_session(
+                    conn,
+                    card_id,
+                    model=model,
+                    effort=effort,
+                    claude_session_id=retry_turn["session_id"],
+                    console_text=console_text,
+                    error_text=message,
+                    needs_github_login=0,
+                )
+                publish(
+                    card_id,
+                    _turn_event(
+                        phase="grilling",
+                        error=message,
+                        needs_github_login=False,
+                        card_id=card_id,
+                        project_id=row["project_id"],
+                    ),
+                )
+                return None
+        else:
+            turn = retry_turn
+            parsed = retry_parsed
+    elif not parsed["questions"]:
+        # Issue #178: the chain concluded no questions without even
+        # attempting the corrective retry above (not suspicious) -- same
+        # last-resort Ollama needs-input check before treating this as a
+        # genuine wrap-up.
+        rescued_via_classifier = await _maybe_extract_needs_input_grilling(card_id, conn, turn["result"])
+        if rescued_via_classifier is not None:
+            parsed = rescued_via_classifier
 
     db.update_session(
         conn,
@@ -1866,6 +1915,34 @@ async def _fail_qa_corrective_retry(card_id: int, conn, row, cwd: str | None, me
     await _drain_implement_queue(row["project_id"], cwd)
 
 
+async def _maybe_extract_needs_input_qa(card_id: int, conn, text: str) -> dict | None:
+    """Issue #178: the QA-grilling equivalent of
+    `_maybe_extract_needs_input_grilling` -- the last-resort check run right
+    before treating a QA round as genuinely having no more questions, after
+    the existing file/terminal-text/Ollama-rescue chain (and, where
+    attempted, the PRD #157-style corrective retry -- `_attempt_qa_corrective_retry`
+    here) has already concluded `text` carries no parseable issues.
+
+    Asks the local Ollama needs-input classifier (`classify_needs_input`,
+    phase `"qa_grilling"`) whether a human's input is actually still needed.
+    If so, makes one more attempt at structured extraction from the same
+    `text` via `rescue_qa_response` -- the same Ollama rescue extraction the
+    existing chain already uses.
+
+    Returns the extracted `{prd, issues, source}` dict only when *both* the
+    classifier says input is needed *and* extraction actually produced at
+    least one issue. Returns `None` in every other case, which callers
+    treat exactly like a genuine "no more QA questions" conclusion,
+    unchanged."""
+    classification = await classify_needs_input(card_id, conn, text, "qa_grilling")
+    if classification is None or not classification.get("needs_input"):
+        return None
+    rescued = await asyncio.to_thread(rescue_qa_response, text)
+    if rescued is None or not rescued["issues"]:
+        return None
+    return rescued
+
+
 async def _attempt_qa_corrective_retry(
     card_id: int, conn, row, *, broken_text: str, session_id: str, cwd: str | None, model, effort
 ) -> tuple[dict, dict] | None:
@@ -1914,6 +1991,15 @@ async def _attempt_qa_corrective_retry(
         retry_parsed = parse_qa_response(retry_turn["result"])
 
     if not retry_parsed["issues"]:
+        # Issue #178: the corrective retry also failed to produce anything
+        # parseable via the existing chain -- before giving up, ask
+        # Ollama's needs-input classifier whether this retry's own result
+        # actually still needs a human's input and, if so, make one more
+        # attempt at structured extraction from it.
+        rescued_via_classifier = await _maybe_extract_needs_input_qa(card_id, conn, retry_turn["result"])
+        if rescued_via_classifier is not None:
+            return rescued_via_classifier, retry_turn
+
         # The corrective retry ran, but its own result still didn't parse --
         # stop trying automatically and surface this loudly instead of
         # silently handing off a broken/empty QA round.
@@ -2034,6 +2120,14 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
             qa_parsed, qa_turn = retry_result
             retried_console_text = console_text + "\n\n" + qa_turn["result"]
             db.update_session(conn, card_id, console_text=retried_console_text, context_pct=qa_turn.get("context_pct"))
+        elif not qa_parsed["issues"]:
+            # Issue #178: the chain concluded no QA questions without even
+            # attempting the corrective retry above (not suspicious) -- same
+            # last-resort Ollama needs-input check before treating this as a
+            # genuine "no more QA questions" wrap-up.
+            rescued_via_classifier = await _maybe_extract_needs_input_qa(card_id, conn, turn["result"])
+            if rescued_via_classifier is not None:
+                qa_parsed = rescued_via_classifier
 
         qa_issues = qa_parsed["issues"]
         qa_row_id = db.create_session(
