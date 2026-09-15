@@ -10,8 +10,8 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from rhubarb import afk_loop, db, error_log, live_stream, ollama_installer, session_runner
-from rhubarb.cli_client import ClaudeCLIError, get_auth_status
+from rhubarb import afk_loop, caveman_installer, db, error_log, headroom_installer, live_stream, ollama_installer, parser_session, session_runner
+from rhubarb.cli_client import ClaudeCLIError, get_auth_status, set_headroom_proxy_active
 from rhubarb.folder_picker import pick_folder
 from rhubarb.prd_list import compute_prd_list
 from rhubarb.projects import scan_projects
@@ -22,11 +22,50 @@ from rhubarb.terminal import open_terminal_running
 
 BASE_DIR = Path(__file__).parent
 
+# --- Headroom proxy management (issue #200) ----------------------------------
+# One long-lived `headroom proxy` subprocess kept alive for the duration of
+# the Rhubarb process when Headroom is enabled and present. Started on app
+# startup (if eligible), after a successful install, or when the Settings
+# toggle is turned on; stopped when the toggle is turned off or on shutdown.
+
+_headroom_proxy: subprocess.Popen | None = None
+
+
+def _start_headroom_proxy() -> None:
+    """Start a background `headroom proxy` process if one isn't already
+    running. Sets the `_headroom_proxy_active` flag in `cli_client` so
+    that new `claude` subprocess spawns pick up `ANTHROPIC_BASE_URL`."""
+    global _headroom_proxy
+    if _headroom_proxy is not None and _headroom_proxy.poll() is None:
+        return  # already running
+    _headroom_proxy = subprocess.Popen(
+        ["headroom", "proxy"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    set_headroom_proxy_active(True)
+
+
+def _stop_headroom_proxy() -> None:
+    """Terminate the background `headroom proxy` process and clear the
+    `_headroom_proxy_active` flag so new spawns stop getting the env var."""
+    global _headroom_proxy
+    set_headroom_proxy_active(False)
+    if _headroom_proxy is not None:
+        _headroom_proxy.terminate()
+        _headroom_proxy = None
+
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     live_stream.set_loop(asyncio.get_running_loop())
     db.recover_interrupted_implement_sessions(db.get_connection())
+    # Issue #200: start the Headroom proxy on startup if the user hasn't
+    # declined it and it's already installed -- so new sessions immediately
+    # get `ANTHROPIC_BASE_URL` without needing a toggle round-trip.
+    _conn = db.get_connection()
+    if not db.get_headroom_declined(_conn) and headroom_installer.check_headroom_presence() == headroom_installer.PRESENCE_PRESENT:
+        _start_headroom_proxy()
     afk_task = asyncio.create_task(
         afk_loop.run_forever(
             get_active_project_id=lambda: _active_project_id,
@@ -38,7 +77,13 @@ async def _lifespan(app: FastAPI):
     afk_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await afk_task
+    _stop_headroom_proxy()
     db.cleanup_sessions_on_shutdown(db.get_connection())
+    # Issue #189: every live per-project parser session is torn down only
+    # here, on Rhubarb's own process exit -- never on a project close/switch
+    # (see `open_project`'s wiring above) -- so this shutdown hook is the
+    # one and only place that ever happens.
+    parser_session.close_all_parser_sessions()
 
 
 app = FastAPI(lifespan=_lifespan)
@@ -289,6 +334,119 @@ def set_ollama_declined(body: dict):
     return {"ollama_declined": declined}
 
 
+@app.get("/api/headroom-status")
+def headroom_status():
+    """Polled by the first-run gate (and the Settings toggle) to decide
+    whether to show the Headroom install prompt. Plain `def` route so
+    FastAPI runs it in a worker thread -- `check_headroom_presence`'s
+    blocking subprocess call never blocks the event loop."""
+    conn = db.get_connection()
+    return {
+        "presence": headroom_installer.check_headroom_presence(),
+        "declined": db.get_headroom_declined(conn),
+    }
+
+
+@app.post("/api/headroom-install")
+def start_headroom_install():
+    """Runs the install to completion and returns the result. Plain `def`
+    route (worker thread) -- a real install can take minutes but never
+    blocks the event loop or concurrent sessions. On success, starts the
+    Headroom proxy immediately so new sessions pick up ANTHROPIC_BASE_URL
+    without a restart."""
+    try:
+        presence = headroom_installer.check_headroom_presence()
+        if presence == headroom_installer.PRESENCE_NOT_PRESENT:
+            headroom_installer.install_for_platform()
+        _start_headroom_proxy()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/settings/headroom-declined")
+def set_headroom_declined_endpoint(body: dict):
+    conn = db.get_connection()
+    declined = bool(body["headroom_declined"])
+    db.set_headroom_declined(conn, declined)
+    if declined:
+        _stop_headroom_proxy()
+    elif headroom_installer.check_headroom_presence() == headroom_installer.PRESENCE_PRESENT:
+        _start_headroom_proxy()
+    return {"headroom_declined": declined}
+
+
+@app.get("/api/caveman-status")
+def caveman_status():
+    """Polled by the first-run gate (and the Settings toggle) to decide
+    whether to show the Caveman install prompt. Plain `def` route so
+    FastAPI runs it in a worker thread -- `check_caveman_presence`'s
+    blocking subprocess call never blocks the event loop."""
+    conn = db.get_connection()
+    return {
+        "presence": caveman_installer.check_caveman_presence(),
+        "declined": db.get_caveman_declined(conn),
+    }
+
+
+@app.post("/api/caveman-install")
+def start_caveman_install():
+    """Runs the skill install to completion and returns the result. Plain
+    `def` route (worker thread) -- never blocks the event loop or concurrent
+    sessions. No proxy to manage: once installed globally, the skill is
+    available to any `claude` invocation Rhubarb spawns automatically."""
+    try:
+        presence = caveman_installer.check_caveman_presence()
+        if presence == caveman_installer.PRESENCE_NOT_PRESENT:
+            caveman_installer.install_caveman()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/settings/caveman-declined")
+def set_caveman_declined_endpoint(body: dict):
+    conn = db.get_connection()
+    declined = bool(body["caveman_declined"])
+    db.set_caveman_declined(conn, declined)
+    if declined:
+        # Best-effort: silently ignore if caveman isn't installed or the
+        # remove command fails (e.g. the skill was never installed in the
+        # first place).
+        try:
+            caveman_installer.disable_caveman()
+        except Exception:
+            pass
+    return {"caveman_declined": declined}
+
+
+async def _warm_project_engines(project_id: int, *, cwd: str | None, model: str | None, effort: str | None) -> None:
+    """Fire-and-forget engine warm-up for a just-opened project, scheduled
+    as ONE background task from `open_project` (rather than two separate
+    `asyncio.create_task` calls) so this stays exactly as light a scheduling
+    footprint on the event loop as the original single-warm version was.
+
+    - Standby `StreamJsonEngine` (issue #136, adapted to stream-json by
+      issue #184): so the first `/do` a user starts doesn't pay the "wait
+      for claude to open" spawn cost inline. A brand-new session always
+      begins in the grilling phase (`db.create_session`'s own
+      `phase="grilling"` default), and grilling now runs on
+      `StreamJsonEngine`, matching what `start_session` actually claims for
+      a fresh session's first turn. The old `ensure_standby_engine`
+      (PtyEngine) standby machinery is left completely intact for any other
+      caller -- it's simply not used for this purpose any more, since
+      nothing else ever starts a brand-new session.
+    - Parser session (issue #189, lifecycle slice of PRD #187 -- `gh issue
+      view 187`): lazily creates this project's persistent parser session
+      on first open, reused (same subprocess, same session_id) on every
+      later open. Unlike the standby above, this session is NOT closed by
+      `close_project` below -- its lifetime is independent of project focus
+      and it lives until Rhubarb itself exits (see `parser_session.
+      close_all_parser_sessions`, wired into `_lifespan`'s shutdown)."""
+    await session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model=model, effort=effort)
+    await parser_session.ensure_parser_session(project_id, cwd=cwd, model=model, effort=effort)
+
+
 @app.post("/api/projects/{project_id}/open")
 async def open_project(project_id: int):
     global _active_project_id
@@ -302,23 +460,11 @@ async def open_project(project_id: int):
     afk_loop.record_activity(project_id)
     row = db.get_project(conn, project_id)
 
-    # Pre-warm a standby engine for this project (issue #136) so the first
-    # /do a user starts doesn't pay the "wait for claude to open" spawn cost
-    # inline -- fire-and-forget, never blocks this response.
-    #
-    # Issue #184: a brand-new session always begins in the grilling phase
-    # (`db.create_session`'s own `phase="grilling"` default), and grilling
-    # now runs on `StreamJsonEngine`, not `PtyEngine` -- so the standby this
-    # warms is the `StreamJsonEngine` one (`ensure_standby_stream_json_engine`),
-    # matching what `start_session` below actually claims for a fresh
-    # session's first turn. The old `ensure_standby_engine` (PtyEngine)
-    # standby machinery is left completely intact for any other caller --
-    # it's simply not used for this purpose any more, since nothing else
-    # ever starts a brand-new session.
+    # Pre-warm this project's engines -- fire-and-forget, never blocks this
+    # response (see `_warm_project_engines`'s own docstring for what each
+    # warm does and why they're one task, not two).
     asyncio.create_task(
-        session_runner.ensure_standby_stream_json_engine(
-            project_id, cwd=row["path"], model=db.get_model(conn), effort=db.DEFAULT_EFFORT
-        )
+        _warm_project_engines(project_id, cwd=row["path"], model=db.get_model(conn), effort=db.DEFAULT_EFFORT)
     )
 
     return {
@@ -454,6 +600,44 @@ def get_session_error_notifications(project_id: int):
 def dismiss_session_error_notifications(project_id: int):
     session_runner.dismiss_error_notifications(project_id)
     return {"dismissed": True}
+
+
+@app.get("/api/projects/{project_id}/parsed-results")
+async def get_parsed_results_endpoint(project_id: int, since: int = 0):
+    """Issue #193 ("Route parsed results to the focused card or a toast",
+    slice of PRD #187 -- `gh issue view 193`/`gh issue view 187`): the poll
+    endpoint `prompt.html`'s `pollParsedResults` uses to learn about new
+    parser-session results (issue #192's `drain_needs_input_queue`/
+    `get_parsed_results`) so it can route each one to the focused left card
+    or a toast.
+
+    Nothing else in the app drives issue #192's queue-drain loop end-to-end
+    yet, so this request does it inline: fully drains whatever is currently
+    queued for `project_id` (a no-op, returning immediately, if the queue is
+    empty -- see `drain_needs_input_queue`'s own docstring) before reading
+    back the accumulated results list. `get_parsed_results` is purely
+    additive/append-only (see its docstring), so a plain integer `since`
+    offset is a safe "what's new since my last poll" cursor: nothing already
+    returned ever moves, changes, or disappears out from under it. The
+    response's `total` is the offset to pass as `since` on the caller's next
+    poll.
+
+    Deliberately NOT a persistent background `asyncio.create_task` kicked
+    off from `open_project`/`_warm_project_engines` instead: this project's
+    own test convention (`tests/test_parser_session.py`'s `_run_and_drain`
+    helper, and every test built on it) awaits *every* asyncio task still
+    pending after `open_project` returns -- a genuinely never-ending loop
+    task scheduled from there would hang that helper, and every test using
+    it, forever. Draining once per poll, synchronously within this request,
+    gets the same "keeps up with the queue" behavior (the frontend polls
+    every few seconds) without needing any background-task lifecycle
+    (start-once-per-project bookkeeping, cancellation on shutdown, ...) at
+    all.
+    """
+    async for _ in parser_session.drain_needs_input_queue(project_id):
+        pass
+    results = parser_session.get_parsed_results(project_id)
+    return {"results": results[since:], "total": len(results)}
 
 
 @app.get("/api/projects/{project_id}/errors")
@@ -766,6 +950,20 @@ async def retry_session(card_id: int):
     cwd = _active_project_cwd()
     asyncio.create_task(session_runner.retry_session_job(card_id, cwd))
 
+    return {"card_id": card_id}
+
+
+@app.post("/api/sessions/{card_id}/continue-do")
+async def continue_do(card_id: int, body: dict):
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    if row is None:
+        return {"error": "Session not found"}
+    if row["session_type"] != "do" or row["phase"] != "details":
+        return {"error": "Session is not at the do-finished pause point"}
+    cwd = _active_project_cwd()
+    prompt = body.get("prompt", "")
+    asyncio.create_task(session_runner.start_do_continue_job(card_id, prompt, cwd=cwd))
     return {"card_id": card_id}
 
 

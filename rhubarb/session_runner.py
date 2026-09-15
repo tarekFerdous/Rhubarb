@@ -92,7 +92,7 @@ def _rejoin_wrapped_json_strings(candidate: str) -> str:
         i += 1
     return "".join(out)
 
-from rhubarb import db, error_log
+from rhubarb import db, error_log, parser_session
 from rhubarb.cli_client import ClaudeCLIError
 from rhubarb.github_publisher import GithubPublishError, publish_draft
 from rhubarb.live_stream import publish
@@ -137,11 +137,10 @@ _DETAIL_RE = re.compile(r"\b(PRD|Issue)\s*#(\d+)\s*[:\-]\s*(.+)", re.IGNORECASE)
 # Context-window budget: before starting the next phase in a session chain,
 # `_maybe_clear_for_next_phase` checks the row's last-recorded `context_pct`
 # against the relevant cutoff below and starts a fresh PtyEngine first if
-# it's over. Both are pre-phase gates only -- a phase already running is
+# it's over. The gate is a pre-phase check only -- a phase already running is
 # never interrupted even if it crosses its cutoff while in flight.
-# Placeholders pending real /rhubarb:implement and /rhubarb:qa context-growth
-# telemetry (this repo's own measurements only ever covered the /do chain)
-# -- expect these to move.
+# Placeholder pending real /rhubarb:implement and /rhubarb:qa context-growth
+# telemetry -- expect this to move.
 #
 # NOTE (issue #87): `PtyEngine`'s turn-complete-marker protocol carries no
 # usage/token-count data (interactive mode has no `--output-format
@@ -154,8 +153,14 @@ _DETAIL_RE = re.compile(r"\b(PRD|Issue)\s*#(\d+)\s*[:\-]\s*(.+)", re.IGNORECASE)
 # they already handle an unknown `context_pct` (safe-by-default), so a
 # future engine enhancement that recovers usage data would make them live
 # again with no further changes needed here.
-_DO_TO_IMPLEMENT_CONTEXT_CUTOFF = 0.40
 _IMPLEMENT_TO_QA_CONTEXT_CUTOFF = 0.68
+
+# Context-window gate for the do-finished Continue button (issue #198, child
+# of PRD #195): before starting a new grilling round on the same do session,
+# `start_do_continue_job` checks whether the row's recorded `context_pct`
+# exceeds this and, if so, spawns a fresh `StreamJsonEngine` for a clean
+# conversation instead of reusing the old, near-limit one.
+_DO_CONTINUE_CONTEXT_CUTOFF = 0.40
 
 # A session that just finished /rhubarb:qa (closed its issues/PRD) is only
 # fully closed if its context usage is over this -- under it, it's marked
@@ -198,7 +203,7 @@ def _context_window_pct(raw_result_event: dict) -> float | None:
 # One resident PtyEngine ("tab") per card_id, kept alive across every turn
 # for that card's session -- across grilling -> to-prd -> to-issues ->
 # implement, since those all continue the same claude conversation on the
-# same card_id today (see `_auto_continue_implement_and_qa`). Replaces
+# same card_id. Replaces
 # cli_client's old `_persistent_processes` pool: that pool was also
 # card_id-keyed, but only ever used by the /do chain, and only kept a
 # `-p`-style subprocess open (not a true interactive PTY) with its own
@@ -778,6 +783,24 @@ async def _run_grilling_turn_stream_json(
     parsed = parse_grilling_response(turn["result"])
     console_text = row["console_text"] + "\n\n" + turn["result"] if row["console_text"] else turn["result"]
 
+    if not parsed["questions"]:
+        # Issue #191 (child of PRD #187): this engine's own question-parsing
+        # is deliberately simple -- no file-preference read, no Ollama
+        # rescue-extraction fallback, no corrective retry (see this
+        # function's own docstring) -- but a turn that came back with no
+        # parseable questions still needs the same needs-input classifier
+        # every other phase now runs through the shared
+        # `handle_turn_completed` hook, so a genuinely open question this
+        # turn's prose contains (just not in the `Question N: "..."`
+        # format) gets gated and, if flagged, queued onto this project's
+        # needs-input queue for its parser session (issue #192) instead of
+        # silently being treated as "no more questions". This call makes NO
+        # UI decision of its own -- no rich extraction attempt, no stalled
+        # panel, matching this engine's deliberately simple contract -- it's
+        # gating + queueing only; `parsed` and this function's own return
+        # value below are completely unaffected by its result.
+        await handle_turn_completed(card_id, conn, row, turn["result"], "grilling")
+
     db.update_session(
         conn,
         card_id,
@@ -1197,6 +1220,51 @@ async def classify_needs_input(card_id: int, conn, text: str, phase: str, *, htt
     return result
 
 
+async def handle_turn_completed(
+    card_id: int, conn, row, text: str, phase: str, *, http_post=None
+) -> dict | None:
+    """The single shared "on turn complete" hook (issue #191, child of PRD
+    #187) every phase's turn-handling code now calls once a turn has fully
+    resolved, consolidating what used to be separate, duplicated per-phase
+    call sites straight to `classify_needs_input`: grilling's own
+    `_maybe_extract_needs_input_grilling`, QA-grilling's symmetric
+    `_maybe_extract_needs_input_qa`, `_finish_implement_turn`'s direct call
+    for implementing (including the parallel per-issue implementation
+    sessions `/implement` can run concurrently -- they run through this same
+    `_finish_implement_turn` tail, just N at once), and `_run_chain_step`'s
+    direct call for the `creating_prd`/`creating_issues` (/to-prd, /to-issues)
+    chain. A future session type only needs to call this one function, not
+    copy-paste its own `classify_needs_input` wiring.
+
+    Runs the existing Ollama needs-input classifier on `text` exactly as
+    `classify_needs_input` always has -- same skip-when-declined/publish-
+    `ollama_unavailable`-on-failure behavior, completely unchanged (see that
+    function's own docstring).
+
+    ADDITIONALLY -- issue #191's actual new behavior: when the classifier
+    flags this turn as possibly needing input, enqueues it (this turn's own
+    raw `text`, tagged with `card_id` and `phase`) onto
+    `row["project_id"]`'s FIFO needs-input queue
+    (`parser_session.enqueue_needs_input_turn`, keyed by project id exactly
+    like that module's own parser-session registry -- issue #189). A turn
+    the classifier does NOT flag (a negative result, or `None` from a
+    decline/failure) is never enqueued.
+
+    This is gating + queueing ONLY (issue #191) -- nothing dequeues/consumes
+    that queue yet; that's issue #192, deliberately out of scope here. This
+    function also makes no UI decision of its own: it returns the exact same
+    classification dict `classify_needs_input` always returned, so every
+    existing call site keeps deciding for itself what a positive result
+    means for ITS phase (rich question extraction for grilling/QA-grilling/
+    implementing, the generic stall-reply panel for creating_prd/
+    creating_issues) -- completely unchanged from before this hook existed.
+    """
+    classification = await classify_needs_input(card_id, conn, text, phase, http_post=http_post)
+    if classification is not None and classification.get("needs_input"):
+        parser_session.enqueue_needs_input_turn(row["project_id"], card_id=card_id, phase=phase, text=text)
+    return classification
+
+
 _GRILLING_CORRECTIVE_PROMPT_TEMPLATE = (
     'Your last reply for this round of grilling questions did not parse -- '
     'it did not match the required `Question N: "..."` format (with '
@@ -1307,20 +1375,22 @@ async def _run_grilling_corrective_retry(
     return turn, parsed
 
 
-async def _maybe_extract_needs_input_grilling(card_id: int, conn, text: str) -> dict | None:
+async def _maybe_extract_needs_input_grilling(card_id: int, conn, row, text: str) -> dict | None:
     """Issue #178: the last-resort check `_run_grilling_turn` runs right
     before treating a round as a genuine "no more questions" wrap-up --
     after its existing file/terminal-text/Ollama-rescue chain (and, where
     attempted, the PRD #157 corrective retry) has already concluded
     `text` carries no parseable questions.
 
-    Asks the local Ollama needs-input classifier (`classify_needs_input`)
-    whether a human's input is actually still needed for this turn. If it
-    says yes, makes one more attempt at structured extraction from the same
-    `text` via `rescue_grilling_response` -- the same Ollama rescue
-    extraction the existing chain already uses, just tried again here as a
-    second, independent attempt now that the classifier has flagged this
-    text as worth another look.
+    Asks the local Ollama needs-input classifier, via the shared
+    `handle_turn_completed` hook (issue #191), whether a human's input is
+    actually still needed for this turn -- that hook also enqueues this turn
+    onto the project's needs-input queue when it says yes, alongside the
+    classification itself. If it says yes, makes one more attempt at
+    structured extraction from the same `text` via `rescue_grilling_response`
+    -- the same Ollama rescue extraction the existing chain already uses,
+    just tried again here as a second, independent attempt now that the
+    classifier has flagged this text as worth another look.
 
     Returns the extracted `{header, questions, footer, source}` dict only
     when *both* the classifier says input is needed *and* extraction
@@ -1328,7 +1398,7 @@ async def _maybe_extract_needs_input_grilling(card_id: int, conn, text: str) -> 
     case -- classifier declined/unavailable/says no input needed, or
     extraction still came up empty -- which callers treat exactly like a
     genuine wrap-up, unchanged."""
-    classification = await classify_needs_input(card_id, conn, text, "grilling")
+    classification = await handle_turn_completed(card_id, conn, row, text, "grilling")
     if classification is None or not classification.get("needs_input"):
         return None
     rescued = await asyncio.to_thread(rescue_grilling_response, text)
@@ -1468,7 +1538,7 @@ async def _run_grilling_turn(
             # result actually still needs a human's input and, if so, make
             # one more attempt at structured extraction from it.
             rescued_via_classifier = await _maybe_extract_needs_input_grilling(
-                card_id, conn, retry_turn["result"]
+                card_id, conn, row, retry_turn["result"]
             )
             if rescued_via_classifier is not None:
                 turn = retry_turn
@@ -1517,7 +1587,7 @@ async def _run_grilling_turn(
         # attempting the corrective retry above (not suspicious) -- same
         # last-resort Ollama needs-input check before treating this as a
         # genuine wrap-up.
-        rescued_via_classifier = await _maybe_extract_needs_input_grilling(card_id, conn, turn["result"])
+        rescued_via_classifier = await _maybe_extract_needs_input_grilling(card_id, conn, row, turn["result"])
         if rescued_via_classifier is not None:
             parsed = rescued_via_classifier
 
@@ -1681,18 +1751,19 @@ async def _run_chain_step(
     final `details` summary.
 
     Issue #177 (child of PRD #174): right after the turn resolves (and
-    before any of the above success bookkeeping), `classify_needs_input`
-    checks whether this turn's own rendered text suggests a human should
-    weigh in before this phase auto-advances. A `None` result (Ollama
-    declined, or genuinely unavailable -- either way already handled/
-    published by `classify_needs_input` itself) or `needs_input: False`
-    changes nothing here -- this phase completes exactly as it always has.
-    A `needs_input: True` result pauses here via `_await_stalled_reply`
-    (see its docstring for the full resume story) instead of proceeding
-    straight to the success bookkeeping below; only once that resolves
-    (a human's reply was answered and the live process moved on) does this
-    function fall through to the same completion bookkeeping any other
-    resolved turn gets.
+    before any of the above success bookkeeping), the shared
+    `handle_turn_completed` hook (issue #191) checks whether this turn's own
+    rendered text suggests a human should weigh in before this phase
+    auto-advances -- and, if so, enqueues it onto this project's needs-input
+    queue alongside the classification. A `None` result (Ollama declined, or
+    genuinely unavailable -- either way already handled/published by
+    `classify_needs_input` itself) or `needs_input: False` changes nothing
+    here -- this phase completes exactly as it always has. A `needs_input:
+    True` result pauses here via `_await_stalled_reply` (see its docstring
+    for the full resume story) instead of proceeding straight to the success
+    bookkeeping below; only once that resolves (a human's reply was answered
+    and the live process moved on) does this function fall through to the
+    same completion bookkeeping any other resolved turn gets.
     """
     db.update_session(conn, row["id"], phase=phase, error_text=None, needs_github_login=0)
     publish(card_id, {"type": "phase", "phase": phase})
@@ -1736,7 +1807,7 @@ async def _run_chain_step(
         # itself; nothing more to do here.
         return False, None
 
-    classification = await classify_needs_input(card_id, conn, turn["result"], phase)
+    classification = await handle_turn_completed(card_id, conn, row, turn["result"], phase)
     if classification is not None and classification.get("needs_input"):
         resumed = await _await_stalled_reply(card_id, conn, row, turn, phase=phase)
         if resumed is None:
@@ -1820,70 +1891,18 @@ async def _run_publish_step(card_id: int, conn, row, *, cwd: str | None) -> bool
 
 async def _finish_chain(card_id: int, conn, claude_session_id: str, cwd: str | None) -> None:
     """`/rhubarb:do` just reached `details` (PRD + issues published). Publishes
-    the `details` turn event, then hands off to `_auto_continue_implement_and_qa`
-    instead of the old immediate `/clear`-and-pool -- that function decides
-    whether to continue in this same tab or start a fresh one (the
-    context-window budget gate), and starts `/rhubarb:implement` automatically."""
+    the `details` turn event then stops -- the resident engine stays alive and
+    idle, waiting on the user's next action (Continue or Close session via the
+    do-finished banner, issue #195). Implementation is never started
+    automatically from here; the user either clicks a PRD in "To be
+    implemented," the AFK self-implement timer picks it up, or they click
+    Continue to start a fresh grilling round on the same card."""
     row = db.get_session(conn, card_id)
     details = parse_details(row["console_text"])
     db.update_session(
         conn, card_id, phase="details", details_json=json.dumps(details), claude_session_id=claude_session_id
     )
-
     publish(card_id, _turn_event(phase="details", details=details))
-
-    await _auto_continue_implement_and_qa(card_id, conn, cwd)
-
-
-async def _auto_continue_implement_and_qa(card_id: int, conn, cwd: str | None) -> None:
-    """Continue a session past `details` straight into `/rhubarb:implement`
-    (and, if that phase's own Phase 5 hands off to `/qa`, into that too --
-    already-automatic today via `_parse_qa_grilling_block`/`start_qa_job`,
-    unchanged here) instead of pooling the session for a later manual PRD
-    click.
-
-    Does *not* publish `minimize` -- the left card stays focused on this
-    session as it transitions into `implementing`. The frontend shows a
-    "Proceed" banner once it sees the `implementing` phase with a PRD, and
-    only calls `minimizeLeftCardToBackground` when the user clicks it
-    (issue #146). This session's `phase`/`turn`/`done` events otherwise keep
-    flowing exactly as they do for a manually started `/implement`.
-
-    Unlike the old subprocess-per-turn model, this card's resident tab (see
-    `_pty_engines`) is left running across this transition when a PRD was
-    found -- `/rhubarb:implement` continues in the exact same tab as the /do
-    chain that led here, just under a new `session_type`/`phase` on the row;
-    only the context-window budget gate (`_maybe_clear_for_next_phase`) ever
-    tears it down and starts fresh, same as for any other phase transition.
-
-    Falls back to the old pool-and-wait behavior if `parse_details` in
-    `_finish_chain` came up with no PRD number to implement, rather than
-    getting the session stuck mid-transition -- this path pools the session
-    (and does close this card's tab; see `_clear_for_reuse`), since nothing
-    else is going to run on this `card_id` until a human picks a PRD."""
-    row = db.get_session(conn, card_id)
-    details = json.loads(row["details_json"]) if row["details_json"] else None
-    prd = details.get("prd") if details else None
-
-    if prd is None:
-        # model/effort here match a brand-new /do's own resolution (issue
-        # #136) -- db.get_model/DEFAULT_EFFORT, not this finishing session's
-        # own row -- so the standby _clear_for_reuse keeps alive actually
-        # matches what claim_standby_engine compares against later.
-        new_session_id = await _clear_for_reuse(
-            card_id, project_id=row["project_id"], cwd=cwd, model=db.get_model(conn), effort=db.DEFAULT_EFFORT
-        )
-        db.mark_session_available(conn, card_id, new_session_id)
-        publish(card_id, {"type": "done"})
-        return
-
-    session_id = await _maybe_clear_for_next_phase(
-        card_id, conn, row, cwd=cwd, cutoff=_DO_TO_IMPLEMENT_CONTEXT_CUTOFF
-    )
-    db.update_session(
-        conn, card_id, phase="implementing", session_type="implement", claude_session_id=session_id
-    )
-    await start_implement_job(card_id, prd["number"], cwd=cwd)
 
 
 async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
@@ -1926,6 +1945,45 @@ async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
         return
 
     await _finish_chain(card_id, conn, claude_session_id, cwd)
+
+
+async def start_do_continue_job(card_id: int, prompt: str, *, cwd: str | None) -> None:
+    """Start a fresh grilling round on a /do session sitting at
+    `phase="details"` -- the Continue button on the do-finished banner
+    (issue #198, child of PRD #195). Keeps the model/effort already recorded
+    on the row unchanged (no re-prompt).
+
+    Context-budget gate: if the row's `context_pct` is over
+    `_DO_CONTINUE_CONTEXT_CUTOFF`, tears down the resident `StreamJsonEngine`
+    and spawns a fresh one (persisting the new session id and resetting
+    `context_pct` to None) so the new grilling round starts in a clean
+    conversation. At or under the cutoff the existing engine/conversation is
+    reused unchanged."""
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    if row is None:
+        return
+
+    model = row["model"]
+    effort = row["effort"]
+
+    context_pct = row["context_pct"]
+    if context_pct is not None and context_pct > _DO_CONTINUE_CONTEXT_CUTOFF:
+        _close_stream_json_engine(card_id)
+        engine = await asyncio.to_thread(
+            _spawn_fresh_stream_json_engine, cwd=cwd, model=model, effort=effort
+        )
+        _stream_json_engines[card_id] = engine
+        db.update_session(conn, card_id, claude_session_id=engine.claude_session_id, context_pct=None)
+        row = db.get_session(conn, card_id)
+
+    db.update_session(conn, card_id, phase="grilling")
+    row = db.get_session(conn, card_id)
+
+    await _run_grilling_turn_stream_json(
+        card_id, conn, row, f"/rhubarb:do {prompt}", cwd=cwd, model=model, effort=effort,
+        publish_when_empty=True,
+    )
 
 
 async def start_session_job(card_id: int, prompt: str, *, cwd: str | None) -> None:
@@ -2282,7 +2340,7 @@ async def _fail_qa_corrective_retry(card_id: int, conn, row, cwd: str | None, me
     await _drain_implement_queue(row["project_id"], cwd)
 
 
-async def _maybe_extract_needs_input_qa(card_id: int, conn, text: str) -> dict | None:
+async def _maybe_extract_needs_input_qa(card_id: int, conn, row, text: str) -> dict | None:
     """Issue #178: the QA-grilling equivalent of
     `_maybe_extract_needs_input_grilling` -- the last-resort check run right
     before treating a QA round as genuinely having no more questions, after
@@ -2290,18 +2348,20 @@ async def _maybe_extract_needs_input_qa(card_id: int, conn, text: str) -> dict |
     attempted, the PRD #157-style corrective retry -- `_attempt_qa_corrective_retry`
     here) has already concluded `text` carries no parseable issues.
 
-    Asks the local Ollama needs-input classifier (`classify_needs_input`,
-    phase `"qa_grilling"`) whether a human's input is actually still needed.
-    If so, makes one more attempt at structured extraction from the same
-    `text` via `rescue_qa_response` -- the same Ollama rescue extraction the
-    existing chain already uses.
+    Asks the local Ollama needs-input classifier, via the shared
+    `handle_turn_completed` hook (issue #191, phase `"qa_grilling"`), whether
+    a human's input is actually still needed -- that hook also enqueues this
+    turn onto the project's needs-input queue when it says yes. If so, makes
+    one more attempt at structured extraction from the same `text` via
+    `rescue_qa_response` -- the same Ollama rescue extraction the existing
+    chain already uses.
 
     Returns the extracted `{prd, issues, source}` dict only when *both* the
     classifier says input is needed *and* extraction actually produced at
     least one issue. Returns `None` in every other case, which callers
     treat exactly like a genuine "no more QA questions" conclusion,
     unchanged."""
-    classification = await classify_needs_input(card_id, conn, text, "qa_grilling")
+    classification = await handle_turn_completed(card_id, conn, row, text, "qa_grilling")
     if classification is None or not classification.get("needs_input"):
         return None
     rescued = await asyncio.to_thread(rescue_qa_response, text)
@@ -2363,7 +2423,7 @@ async def _attempt_qa_corrective_retry(
         # Ollama's needs-input classifier whether this retry's own result
         # actually still needs a human's input and, if so, make one more
         # attempt at structured extraction from it.
-        rescued_via_classifier = await _maybe_extract_needs_input_qa(card_id, conn, retry_turn["result"])
+        rescued_via_classifier = await _maybe_extract_needs_input_qa(card_id, conn, row, retry_turn["result"])
         if rescued_via_classifier is not None:
             return rescued_via_classifier, retry_turn
 
@@ -2459,12 +2519,17 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
     # marker-parsing logic, are completely untouched. This only runs once
     # the turn's result carries no blocked marker at all, exactly where
     # today the turn would just continue automatically. Ask the local
-    # Ollama classifier whether this turn actually needs a human's input
-    # anyway (a question buried in ordinary prose, an approval request,
-    # ...); a negative classification, a decline, or an unavailable Ollama
-    # (`classify_needs_input` returns `None` for the latter two, same as
-    # every other caller) all fall straight through to today's unchanged
-    # automatic continuation below.
+    # Ollama classifier, via the shared `handle_turn_completed` hook (issue
+    # #191 -- which also enqueues this turn onto the project's needs-input
+    # queue when it says yes), whether this turn actually needs a human's
+    # input anyway (a question buried in ordinary prose, an approval
+    # request, ...); a negative classification, a decline, or an
+    # unavailable Ollama (`classify_needs_input` returns `None` for the
+    # latter two, same as every other caller) all fall straight through to
+    # today's unchanged automatic continuation below. This same path (and
+    # its enqueue) also covers the parallel per-issue implementation
+    # sessions `/implement` can run concurrently -- they run through this
+    # exact `_finish_implement_turn` tail, just N at once.
     #
     # Also skipped entirely when this turn's result carries a `qa_grilling`
     # handoff marker (`_parse_qa_grilling_block`, checked below at its own
@@ -2476,7 +2541,7 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
     # otherwise intercept a real QA handoff before that logic ever runs.
     classification = None
     if _parse_qa_grilling_block(turn["result"]) is None:
-        classification = await classify_needs_input(card_id, conn, turn["result"], "implementing")
+        classification = await handle_turn_completed(card_id, conn, row, turn["result"], "implementing")
     if classification is not None and classification.get("needs_input"):
         extracted = await _extract_implementing_question(turn["result"])
         if extracted is not None:
@@ -2598,7 +2663,7 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
             # attempting the corrective retry above (not suspicious) -- same
             # last-resort Ollama needs-input check before treating this as a
             # genuine "no more QA questions" wrap-up.
-            rescued_via_classifier = await _maybe_extract_needs_input_qa(card_id, conn, turn["result"])
+            rescued_via_classifier = await _maybe_extract_needs_input_qa(card_id, conn, row, turn["result"])
             if rescued_via_classifier is not None:
                 qa_parsed = rescued_via_classifier
 

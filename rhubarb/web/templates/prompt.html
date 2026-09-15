@@ -87,6 +87,11 @@
     <div class="card left">
       <button id="settings-gear" class="gear-btn" type="button" title="Settings">&#9881;</button>
       <button id="preview-question-file-btn" class="gear-btn" type="button" title="Preview .claude/rhubarb_question.md">&#128269;</button>
+      <!-- Manual test hook (issue #188): raises a sample toast, alternating
+           normal/failure, so the component is independently verifiable
+           before any real trigger exists. Same disposable debug-button
+           convention as preview-question-file-btn above. -->
+      <button id="toast-debug-btn" class="gear-btn" type="button" title="Raise test toast (issue #188 debug)">&#128276;</button>
       <h1 class="brand" id="brand-heading">What are we doing?</h1>
       <p class="user-line">{{ email }}</p>
       <div id="active-project-line" class="active-project-line" hidden>
@@ -116,6 +121,13 @@
         <div id="implementing-banner" class="implementing-banner" hidden>
           <p id="implementing-banner-text" class="implementing-banner-text"></p>
           <button id="implementing-banner-proceed-btn" class="glass-btn implementing-banner-btn" type="button">Proceed</button>
+        </div>
+        <div id="do-finished-banner" class="implementing-banner" hidden>
+          <p class="implementing-banner-text">Want to do something right away?</p>
+          <div class="do-finished-banner-actions">
+            <button id="do-finished-continue-btn" class="glass-btn implementing-banner-btn" type="button">Continue</button>
+            <button id="do-finished-close-session-btn" class="glass-btn implementing-banner-btn" type="button">Close session</button>
+          </div>
         </div>
         <p id="phase-label" class="phase-label"></p>
         <p id="phase-status-message" class="phase-status-message" hidden></p>
@@ -159,6 +171,18 @@
     </div>
   </div>
 
+  <!-- Toast notification stack (issue #188, slice of PRD #187): cross-
+       session alert component, layered above the .split layout (and above
+       every modal below) in a fixed bottom-right stack. Purely display here
+       -- nothing raises a real toast yet, since the actual trigger (a
+       parser-session result for a non-focused card) is wired up in the
+       still-blocked issues #192-#194. Until then it's exercised via the
+       manual debug button (`toast-debug-btn`, wired near the other gear
+       buttons below) and the console-callable window.__testRaiseToast() test
+       hook -- see the "Toast notifications" script section near the bottom
+       of this file for raiseToast()/dismissToast()/renderToasts(). -->
+  <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
+
   <div id="settings-modal" class="modal-overlay" hidden>
     <div class="modal">
       <h2 class="modal-heading">Root Directory</h2>
@@ -186,6 +210,18 @@
         Enable Ollama-assisted parsing
       </label>
       <p id="ollama-toggle-error" class="modal-warning-text" hidden></p>
+
+      <label class="modal-checkbox-label">
+        <input id="headroom-enabled-toggle" type="checkbox" class="modal-checkbox-input" />
+        Enable Headroom proxy
+      </label>
+      <p id="headroom-toggle-error" class="modal-warning-text" hidden></p>
+
+      <label class="modal-checkbox-label">
+        <input id="caveman-enabled-toggle" type="checkbox" class="modal-checkbox-input" />
+        Enable Caveman skill
+      </label>
+      <p id="caveman-toggle-error" class="modal-warning-text" hidden></p>
 
       <label for="model-select-settings" class="modal-field-label">Model</label>
       <select id="model-select-settings" class="modal-select-input">
@@ -347,6 +383,56 @@
     </div>
   </div>
 
+  <!-- First-run Headroom consent/install gate (issue #200): blocks the whole
+       app -- no dismiss-by-clicking-away, no [x] -- until the user installs,
+       declines, or (after a failure) explicitly skips for this session. -->
+  <div id="headroom-gate-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 class="modal-heading">Route traffic through Headroom</h2>
+      <p class="modal-text">
+        Rhubarb can route claude CLI traffic through Headroom's local proxy for
+        caching and compression. Headroom runs fully locally and only intercepts
+        traffic when active.
+      </p>
+      <p id="headroom-gate-error" class="modal-warning-text" hidden></p>
+      <div id="headroom-gate-actions" class="ready-to-proceed-actions">
+        <button id="headroom-gate-install-btn" class="glass-btn" type="button">Install</button>
+        <button id="headroom-gate-decline-btn" class="glass-btn" type="button">No thanks</button>
+      </div>
+      <p id="headroom-gate-progress-text" class="modal-text" hidden>Installing… this can take a few minutes.</p>
+      <div id="headroom-gate-retry-actions" class="ready-to-proceed-actions" hidden>
+        <button id="headroom-gate-retry-btn" class="glass-btn" type="button">Retry</button>
+        <button id="headroom-gate-skip-btn" class="glass-btn" type="button">Skip for now</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- First-run Caveman consent/install gate (issue #201): blocks the whole
+       app -- no dismiss-by-clicking-away, no [x] -- until the user installs,
+       declines, or (after a failure) explicitly skips for this session.
+       Sequenced after the Headroom gate resolves. -->
+  <div id="caveman-gate-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 class="modal-heading">Caveman skill for Claude Code</h2>
+      <p class="modal-text">
+        Rhubarb can install the Caveman skill globally so every Claude Code
+        session it spawns has it available. Caveman is a community skill by
+        JuliusBrussee, installed via <code>npx skills add</code> and available
+        offline once installed.
+      </p>
+      <p id="caveman-gate-error" class="modal-warning-text" hidden></p>
+      <div id="caveman-gate-actions" class="ready-to-proceed-actions">
+        <button id="caveman-gate-install-btn" class="glass-btn" type="button">Install</button>
+        <button id="caveman-gate-decline-btn" class="glass-btn" type="button">No thanks</button>
+      </div>
+      <p id="caveman-gate-progress-text" class="modal-text" hidden>Installing…</p>
+      <div id="caveman-gate-retry-actions" class="ready-to-proceed-actions" hidden>
+        <button id="caveman-gate-retry-btn" class="glass-btn" type="button">Retry</button>
+        <button id="caveman-gate-skip-btn" class="glass-btn" type="button">Skip for now</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Confirmation for the session-queue close button (issue #122): a
        closed session's PtyEngine is killed outright, so this warns before
        an irreversible action. -->
@@ -404,6 +490,9 @@
     const implementingBannerEl = document.getElementById("implementing-banner");
     const implementingBannerTextEl = document.getElementById("implementing-banner-text");
     const implementingBannerProceedBtn = document.getElementById("implementing-banner-proceed-btn");
+    const doFinishedBannerEl = document.getElementById("do-finished-banner");
+    const doFinishedContinueBtnEl = document.getElementById("do-finished-continue-btn");
+    const doFinishedCloseSessionBtnEl = document.getElementById("do-finished-close-session-btn");
     const activeProjectLineEl = document.getElementById("active-project-line");
     const activeProjectNameEl = document.getElementById("active-project-name");
     const settingsModalEl = document.getElementById("settings-modal");
@@ -426,6 +515,28 @@
     const ollamaGateRetryActionsEl = document.getElementById("ollama-gate-retry-actions");
     const ollamaGateRetryBtnEl = document.getElementById("ollama-gate-retry-btn");
     const ollamaGateSkipBtnEl = document.getElementById("ollama-gate-skip-btn");
+    const headroomEnabledToggleEl = document.getElementById("headroom-enabled-toggle");
+    const headroomToggleErrorEl = document.getElementById("headroom-toggle-error");
+    const headroomGateModalEl = document.getElementById("headroom-gate-modal");
+    const headroomGateErrorEl = document.getElementById("headroom-gate-error");
+    const headroomGateActionsEl = document.getElementById("headroom-gate-actions");
+    const headroomGateInstallBtnEl = document.getElementById("headroom-gate-install-btn");
+    const headroomGateDeclineBtnEl = document.getElementById("headroom-gate-decline-btn");
+    const headroomGateProgressTextEl = document.getElementById("headroom-gate-progress-text");
+    const headroomGateRetryActionsEl = document.getElementById("headroom-gate-retry-actions");
+    const headroomGateRetryBtnEl = document.getElementById("headroom-gate-retry-btn");
+    const headroomGateSkipBtnEl = document.getElementById("headroom-gate-skip-btn");
+    const cavemanEnabledToggleEl = document.getElementById("caveman-enabled-toggle");
+    const cavemanToggleErrorEl = document.getElementById("caveman-toggle-error");
+    const cavemanGateModalEl = document.getElementById("caveman-gate-modal");
+    const cavemanGateErrorEl = document.getElementById("caveman-gate-error");
+    const cavemanGateActionsEl = document.getElementById("caveman-gate-actions");
+    const cavemanGateInstallBtnEl = document.getElementById("caveman-gate-install-btn");
+    const cavemanGateDeclineBtnEl = document.getElementById("caveman-gate-decline-btn");
+    const cavemanGateProgressTextEl = document.getElementById("caveman-gate-progress-text");
+    const cavemanGateRetryActionsEl = document.getElementById("caveman-gate-retry-actions");
+    const cavemanGateRetryBtnEl = document.getElementById("caveman-gate-retry-btn");
+    const cavemanGateSkipBtnEl = document.getElementById("caveman-gate-skip-btn");
     const closeSessionModalEl = document.getElementById("close-session-modal");
     const closeSessionLabelEl = document.getElementById("close-session-label");
     const closeSessionCancelBtnEl = document.getElementById("close-session-cancel-btn");
@@ -483,6 +594,8 @@
     let knownParallelImplementation = null;
     let knownTerminalViewHidden = null;
     let knownOllamaDeclined = false;
+    let knownHeadroomDeclined = false;
+    let knownCavemanDeclined = false;
     let knownModel = null;
     let knownEffort = null;
     // card_id's that have received at least one turn -- gates whether
@@ -685,6 +798,7 @@
       rightCards.clear();
       backgroundSources.forEach((es) => es.close());
       backgroundSources.clear();
+      resetParsedResultsRouting();
 
       resetPromptBox();
       startForm.style.display = "";
@@ -945,6 +1059,7 @@
       resetPromptBox();
       startForm.style.display = "";
       interviewEl.innerHTML = "";
+      resetParsedResultsRouting();
       activeProjectLineEl.hidden = true;
       prdButtonRowEl.innerHTML = "";
       prdCardEl.hidden = true;
@@ -1010,6 +1125,10 @@
       terminalViewHiddenToggleEl.checked = knownTerminalViewHidden ?? false;
       ollamaEnabledToggleEl.checked = !knownOllamaDeclined;
       ollamaToggleErrorEl.hidden = true;
+      headroomEnabledToggleEl.checked = !knownHeadroomDeclined;
+      headroomToggleErrorEl.hidden = true;
+      cavemanEnabledToggleEl.checked = !knownCavemanDeclined;
+      cavemanToggleErrorEl.hidden = true;
       modelSelectSettingsEl.value = knownModel ?? "claude-sonnet-4-6";
       effortSelectSettingsEl.value = knownEffort ?? "auto";
       settingsModalEl.hidden = false;
@@ -1193,6 +1312,229 @@
         // Left as not-declined (the toggle just reverted visually) so the
         // next app startup's gate check offers to try again, rather than
         // silently treating a transient install failure as a permanent no.
+      }
+    });
+
+    // --- Headroom consent/install gate (issue #200) -----------------------
+    // _afterHeadroomGate() is the single choke point called whenever the
+    // Headroom gate is fully resolved (no modal needed, or the user has
+    // acted -- installed, declined, or skipped). It triggers the Caveman
+    // gate check (issue #201), sequenced to run after Headroom, not in
+    // parallel. Guard prevents it from being called more than once per page
+    // load (e.g. install success followed by a stray skip click).
+    let _headroomGateDone = false;
+    function _afterHeadroomGate() {
+      if (_headroomGateDone) return;
+      _headroomGateDone = true;
+      checkCavemanGate();
+    }
+
+    async function checkHeadroomGate() {
+      const res = await fetch("/api/headroom-status");
+      const status = await res.json();
+      knownHeadroomDeclined = status.declined;
+      if (!status.declined && status.presence !== "present") {
+        headroomGateActionsEl.hidden = false;
+        headroomGateErrorEl.hidden = true;
+        headroomGateProgressTextEl.hidden = true;
+        headroomGateRetryActionsEl.hidden = true;
+        headroomGateModalEl.hidden = false;
+        // _afterHeadroomGate is called by the button handlers below once
+        // the user acts (install/decline/skip).
+      } else {
+        // No modal needed -- proceed to Caveman gate immediately.
+        _afterHeadroomGate();
+      }
+    }
+
+    async function runHeadroomInstall() {
+      const res = await fetch("/api/headroom-install", { method: "POST" });
+      return res.json();
+    }
+
+    headroomGateInstallBtnEl.addEventListener("click", async () => {
+      headroomGateActionsEl.hidden = true;
+      headroomGateErrorEl.hidden = true;
+      headroomGateProgressTextEl.hidden = false;
+
+      const data = await runHeadroomInstall();
+
+      headroomGateProgressTextEl.hidden = true;
+      if (data.ok) {
+        headroomGateModalEl.hidden = true;
+        _afterHeadroomGate();
+      } else {
+        headroomGateErrorEl.textContent = `Install failed: ${data.error || "unknown error"}`;
+        headroomGateErrorEl.hidden = false;
+        headroomGateRetryActionsEl.hidden = false;
+      }
+    });
+
+    headroomGateDeclineBtnEl.addEventListener("click", async () => {
+      await fetch("/api/settings/headroom-declined", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ headroom_declined: true }),
+      });
+      knownHeadroomDeclined = true;
+      headroomGateModalEl.hidden = true;
+      _afterHeadroomGate();
+    });
+
+    headroomGateRetryBtnEl.addEventListener("click", async () => {
+      headroomGateRetryActionsEl.hidden = true;
+      headroomGateErrorEl.hidden = true;
+      headroomGateProgressTextEl.hidden = false;
+
+      const data = await runHeadroomInstall();
+
+      headroomGateProgressTextEl.hidden = true;
+      if (data.ok) {
+        headroomGateModalEl.hidden = true;
+        _afterHeadroomGate();
+      } else {
+        headroomGateErrorEl.textContent = `Install failed: ${data.error || "unknown error"}`;
+        headroomGateErrorEl.hidden = false;
+        headroomGateRetryActionsEl.hidden = false;
+      }
+    });
+
+    headroomGateSkipBtnEl.addEventListener("click", () => {
+      // Deliberately NOT persisted -- "skip for now", not decline: the gate
+      // reappears on the next app startup.
+      headroomGateModalEl.hidden = true;
+      _afterHeadroomGate();
+    });
+
+    headroomEnabledToggleEl.addEventListener("change", async () => {
+      const enabled = headroomEnabledToggleEl.checked;
+      headroomToggleErrorEl.hidden = true;
+
+      await fetch("/api/settings/headroom-declined", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ headroom_declined: !enabled }),
+      });
+      knownHeadroomDeclined = !enabled;
+
+      if (!enabled) return;
+
+      const statusRes = await fetch("/api/headroom-status");
+      const status = await statusRes.json();
+      if (status.presence === "present") return;
+
+      headroomEnabledToggleEl.disabled = true;
+      const data = await runHeadroomInstall();
+      headroomEnabledToggleEl.disabled = false;
+
+      if (!data.ok) {
+        headroomEnabledToggleEl.checked = false;
+        headroomToggleErrorEl.textContent = `Install failed: ${data.error || "unknown error"}. Headroom proxy not active.`;
+        headroomToggleErrorEl.hidden = false;
+        // Left as not-declined so the next startup's gate check offers to try
+        // again rather than treating a transient install failure as a permanent no.
+      }
+    });
+
+    // --- Caveman consent/install gate (issue #201) ------------------------
+    // Sequenced after the Headroom gate: `_afterHeadroomGate()` triggers
+    // `checkCavemanGate()` once the Headroom gate is fully resolved.
+
+    async function checkCavemanGate() {
+      const res = await fetch("/api/caveman-status");
+      const status = await res.json();
+      knownCavemanDeclined = status.declined;
+      if (!status.declined && status.presence !== "present") {
+        cavemanGateActionsEl.hidden = false;
+        cavemanGateErrorEl.hidden = true;
+        cavemanGateProgressTextEl.hidden = true;
+        cavemanGateRetryActionsEl.hidden = true;
+        cavemanGateModalEl.hidden = false;
+      }
+    }
+
+    async function runCavemanInstall() {
+      const res = await fetch("/api/caveman-install", { method: "POST" });
+      return res.json();
+    }
+
+    cavemanGateInstallBtnEl.addEventListener("click", async () => {
+      cavemanGateActionsEl.hidden = true;
+      cavemanGateErrorEl.hidden = true;
+      cavemanGateProgressTextEl.hidden = false;
+
+      const data = await runCavemanInstall();
+
+      cavemanGateProgressTextEl.hidden = true;
+      if (data.ok) {
+        cavemanGateModalEl.hidden = true;
+      } else {
+        cavemanGateErrorEl.textContent = `Install failed: ${data.error || "unknown error"}`;
+        cavemanGateErrorEl.hidden = false;
+        cavemanGateRetryActionsEl.hidden = false;
+      }
+    });
+
+    cavemanGateDeclineBtnEl.addEventListener("click", async () => {
+      await fetch("/api/settings/caveman-declined", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ caveman_declined: true }),
+      });
+      knownCavemanDeclined = true;
+      cavemanGateModalEl.hidden = true;
+    });
+
+    cavemanGateRetryBtnEl.addEventListener("click", async () => {
+      cavemanGateRetryActionsEl.hidden = true;
+      cavemanGateErrorEl.hidden = true;
+      cavemanGateProgressTextEl.hidden = false;
+
+      const data = await runCavemanInstall();
+
+      cavemanGateProgressTextEl.hidden = true;
+      if (data.ok) {
+        cavemanGateModalEl.hidden = true;
+      } else {
+        cavemanGateErrorEl.textContent = `Install failed: ${data.error || "unknown error"}`;
+        cavemanGateErrorEl.hidden = false;
+        cavemanGateRetryActionsEl.hidden = false;
+      }
+    });
+
+    cavemanGateSkipBtnEl.addEventListener("click", () => {
+      // Deliberately NOT persisted -- "skip for now", not decline: the gate
+      // reappears on the next app startup.
+      cavemanGateModalEl.hidden = true;
+    });
+
+    cavemanEnabledToggleEl.addEventListener("change", async () => {
+      const enabled = cavemanEnabledToggleEl.checked;
+      cavemanToggleErrorEl.hidden = true;
+
+      await fetch("/api/settings/caveman-declined", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ caveman_declined: !enabled }),
+      });
+      knownCavemanDeclined = !enabled;
+
+      if (!enabled) return;
+
+      const statusRes = await fetch("/api/caveman-status");
+      const status = await statusRes.json();
+      if (status.presence === "present") return;
+
+      cavemanEnabledToggleEl.disabled = true;
+      const data = await runCavemanInstall();
+      cavemanEnabledToggleEl.disabled = false;
+
+      if (!data.ok) {
+        cavemanEnabledToggleEl.checked = false;
+        cavemanToggleErrorEl.textContent = `Install failed: ${data.error || "unknown error"}. Caveman skill not active.`;
+        cavemanToggleErrorEl.hidden = false;
+        // Left as not-declined so the next startup's gate check offers to try
+        // again rather than treating a transient install failure as a permanent no.
       }
     });
 
@@ -1417,6 +1759,18 @@
       showOnly(mainFlowEl);
       setHeading("Preview: rhubarb_question.md");
       renderInterview(data.interview);
+    });
+    document.getElementById("toast-debug-btn").addEventListener("click", () => {
+      const variant = toastIdCounter % 2 === 0 ? "normal" : "failure";
+      const identifier = leftCardId !== null ? leftCardId : `debug-${Date.now()}`;
+      raiseToast({
+        message:
+          variant === "failure"
+            ? `Debug: session ${identifier} needs input (parsing degraded)`
+            : `Debug: session ${identifier} needs input`,
+        identifier,
+        variant,
+      });
     });
     document.getElementById("open-root-btn").addEventListener("click", openSettingsModal);
     document.getElementById("modal-close-btn").addEventListener("click", closeSettingsModal);
@@ -2417,6 +2771,17 @@
       setHeading(headingForPhase(event.phase));
       showOnly(sessionStatusEl);
       renderSessionStatus(snapshot);
+
+      // Issue #196 (child of PRD #195): a /do session reaching `details` means
+      // the PRD + issues just landed on GitHub -- refresh the "To be
+      // implemented" list immediately, since no `done` event fires for this
+      // session type anymore (the session stays alive and idle at this pause
+      // point). Previously loadPrdList() was called in finishCard() for
+      // `session_type === "do"`, but finishCard is only triggered by a `done`
+      // event, which /do no longer sends at this point.
+      if (snapshot.session_type === "do" && event.phase === "details") {
+        loadPrdList();
+      }
     }
 
     function minimizeLeftCardToBackground(cardId, es) {
@@ -2508,11 +2873,12 @@
 
       renderQueue();
 
-      // A finishing `do` session means the grilling -> PRD -> issues chain
-      // just completed; a finishing `implement` session means a PRD just
-      // got implemented; a finishing `qa` session means issues were closed.
-      // All three make the "To be implemented" list stale.
-      if (snapshot.session_type === "do" || snapshot.session_type === "implement" || snapshot.session_type === "qa") {
+      // A finishing `implement` session means a PRD just got implemented; a
+      // finishing `qa` session means issues were closed. Both make the "To be
+      // implemented" list stale. A `do` session no longer sends a `done` event
+      // here -- its loadPrdList() fires in applyTurn when `details` arrives
+      // (issue #196, child of PRD #195).
+      if (snapshot.session_type === "implement" || snapshot.session_type === "qa") {
         loadPrdList();
       }
     }
@@ -3040,12 +3406,19 @@
       const prd = session && !session.error && session.phase === "implementing" ? session.details?.prd : null;
       if (!prd) {
         implementingBannerEl.hidden = true;
-        return;
+      } else {
+        implementingBannerTextEl.textContent =
+          `PRD #${prd.number}: ${prd.title} is currently being implemented. This session will keep ` +
+          `implementing in the background — click Proceed to start a new session now.`;
+        implementingBannerEl.hidden = false;
       }
-      implementingBannerTextEl.textContent =
-        `PRD #${prd.number}: ${prd.title} is currently being implemented. This session will keep ` +
-        `implementing in the background — click Proceed to start a new session now.`;
-      implementingBannerEl.hidden = false;
+
+      // Issue #197 (child of PRD #195): show the do-finished banner when a /do
+      // session is sitting at the `details` pause point, derived purely from
+      // session_type/phase so it re-appears correctly on reload/reconnect.
+      const showDoFinished = session && !session.error &&
+        session.session_type === "do" && session.phase === "details";
+      doFinishedBannerEl.hidden = !showDoFinished;
     }
 
     function renderSessionStatus(session) {
@@ -3217,7 +3590,7 @@
     }
 
     function openCloseSessionModal(cardId) {
-      const session = rightCards.get(cardId);
+      const session = rightCards.get(cardId) || (cardId === leftCardId ? currentLeftSession : null);
       closeSessionTargetCardId = cardId;
       closeSessionLabelEl.textContent = session ? queueLabelForSession(session) : "";
       closeSessionModalEl.hidden = false;
@@ -3240,11 +3613,56 @@
       cardSnapshots.delete(cardId);
       const bgEs = backgroundSources.get(cardId);
       if (bgEs) { bgEs.close(); backgroundSources.delete(cardId); }
+
+      // Issue #197 (child of PRD #195): when the closed card is the focused
+      // left card (e.g. a /do session at the do-finished pause point), reset
+      // the left card to the empty "What are we doing?" state -- same reset
+      // the queue's close button already triggers via finishCard when a
+      // session ends naturally, but without a done event the card stays put
+      // until we explicitly clear it here.
+      if (cardId === leftCardId) {
+        if (eventSource) { eventSource.close(); eventSource = null; }
+        leftCardId = null;
+        turnInFlight = false;
+        syncPtySocket();
+        currentLeftSession = null;
+        resetGrillingFeed();
+        setLiveTerminalFeedMode(false);
+        refreshModelEffortCard();
+        resetPromptBox();
+        startForm.style.display = "";
+        interviewEl.innerHTML = "";
+        setHeading("What are we doing?");
+        showOnly(mainFlowEl);
+      }
+
       renderQueue();
     }
 
     closeSessionCancelBtnEl.addEventListener("click", dismissCloseSessionModal);
     closeSessionConfirmBtnEl.addEventListener("click", confirmCloseSession);
+
+    // Issue #197: Close session button on the do-finished banner -- reuses the
+    // existing confirmation modal wired to the focused left card.
+    doFinishedCloseSessionBtnEl.addEventListener("click", () => {
+      if (leftCardId !== null) openCloseSessionModal(leftCardId);
+    });
+
+    // Issue #198: Continue button -- show the prompt box so the user can type
+    // a new prompt; form submission detects the do-details state and routes to
+    // the continue-do endpoint instead of creating a new session.
+    doFinishedContinueBtnEl.addEventListener("click", () => {
+      resetPromptBox();
+      startForm.style.display = "";
+      showOnly(sessionStatusEl);
+      // Keep session-status visible (shows the details list above the form)
+      // but also show the form itself -- form is inside main-flow, so switch
+      // to main-flow and show everything, then make the form visible.
+      interviewEl.innerHTML = "";
+      showOnly(mainFlowEl);
+      setHeading("What are we doing?");
+      startForm.querySelector("textarea").focus();
+    });
 
     function focusCard(cardId) {
       const session = rightCards.get(cardId);
@@ -3264,6 +3682,14 @@
       renderLeftSession(session);
       renderQueue();
       connectStream(cardId);
+      // Issue #193: if a parser-session result was held for this card while
+      // it wasn't focused (raised as a toast at the time -- see
+      // `routeParsedResult` below), show it now that the card has become
+      // focused -- whether this focusCard() call came from clicking that
+      // very toast (`window.onToastClick`, below) or from any other route
+      // (e.g. clicking this card in the session list), since every route
+      // to becoming focused funnels through this one function.
+      showHeldParsedResultIfAny(cardId);
     }
 
     async function retryCard(cardId) {
@@ -3308,6 +3734,38 @@
       const prompt = startForm.prompt.value;
       const submitBtn = startForm.querySelector("button");
       submitBtn.disabled = true;
+
+      // Issue #198 (child of PRD #195): when the currently focused left card
+      // is a /do session sitting at `details` (the do-finished pause point),
+      // Continue showed this form -- route the submission to the continue-do
+      // endpoint against the same card, not the new-session endpoint.
+      const isContinuingDo = currentLeftSession?.session_type === "do" &&
+        currentLeftSession?.phase === "details";
+
+      if (isContinuingDo) {
+        const res = await fetch(`/api/sessions/${leftCardId}/continue-do`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ prompt }),
+        });
+        const data = await res.json();
+        submitBtn.disabled = false;
+        if (data.error) {
+          showGrillingError(data.error);
+          return;
+        }
+        // The stream for this leftCardId is already open -- no new connectStream
+        // needed. Set up grilling UI state same as a brand-new session.
+        turnInFlight = true;
+        currentLeftSession = { card_id: leftCardId, phase: "grilling", interview: { header: "", questions: [], footer: "" } };
+        refreshModelEffortCard();
+        lastRenderedQuestionFileContent = null;
+        startForm.style.display = "none";
+        setHeading(headingForPhase("grilling"));
+        renderInterview({ header: "", questions: [], footer: "" });
+        return;
+      }
+
       const res = await fetch("/api/session/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3375,6 +3833,7 @@
     let sessionQueueIntervalId = null;
     let ptyTabCountIntervalId = null;
     let questionFileIntervalId = null;
+    let parsedResultsIntervalId = null;
     // Content of the last `.claude/rhubarb_question.md` round actually
     // rendered from the poll below -- `null` whenever no file is currently
     // showing (reset the moment a poll tick finds none, e.g. right after the
@@ -3421,6 +3880,13 @@
       ptyTabCountIntervalId = setInterval(refreshPtyTabCount, 3000);
       pollQuestionFileTick();
       questionFileIntervalId = setInterval(pollQuestionFileTick, 1000);
+      // Issue #193: poll for new parser-session results (issue #192) and
+      // route each one to the focused card or a toast -- see
+      // `pollParsedResultsTick`/`routeParsedResult` further down this
+      // section, defined alongside the toast component (#188) they build
+      // on.
+      pollParsedResultsTick();
+      parsedResultsIntervalId = setInterval(pollParsedResultsTick, 2000);
     }
 
     function stopPolls() {
@@ -3440,6 +3906,10 @@
         clearInterval(questionFileIntervalId);
         questionFileIntervalId = null;
       }
+      if (parsedResultsIntervalId) {
+        clearInterval(parsedResultsIntervalId);
+        parsedResultsIntervalId = null;
+      }
     }
 
     function updatePolls() {
@@ -3449,8 +3919,272 @@
 
     document.addEventListener("visibilitychange", updatePolls);
 
+    // --- Toast notifications (issue #188, slice of PRD #187) ---------------
+    // Reusable cross-session alert component. Nothing in the app raises a
+    // real toast yet -- the actual trigger (a parser-session result for a
+    // session card the user isn't currently focused on) is wired up in the
+    // still-blocked issues #192-#194. Until then this is exercised via the
+    // `toast-debug-btn` click handler above and the console-callable
+    // window.__testRaiseToast() test hook at the bottom of this section.
+    const TOAST_VISIBLE_CAP = 4;
+    const TOAST_AUTO_DISMISS_MS = 8000;
+    const toastStackEl = document.getElementById("toast-stack");
+    let toastIdCounter = 0;
+    // FIFO, oldest first. Only the first TOAST_VISIBLE_CAP entries are ever
+    // rendered as full toast cards -- the rest are represented by the
+    // "+N more" affordance, so a burst beyond the cap collapses instead of
+    // dropping or silently replacing an earlier toast. As visible slots free
+    // up (dismissed manually, by click, or by timeout), the next-oldest
+    // overflowed toast is promoted into view on the next render.
+    let toasts = [];
+
+    // Raises a toast. `identifier` is opaque to this component -- callers
+    // pass whatever they want echoed back on click (e.g. a session/card id);
+    // `variant` is "normal" or anything else falls back to "normal", with
+    // "failure" as the one other recognized value. Returns the internal
+    // toastId, useful if a caller ever wants to dismiss it early.
+    function raiseToast({ message, identifier = null, variant = "normal" } = {}) {
+      const toast = {
+        toastId: ++toastIdCounter,
+        message: String(message ?? ""),
+        identifier,
+        variant: variant === "failure" ? "failure" : "normal",
+        timeoutId: null,
+      };
+      toast.timeoutId = setTimeout(() => dismissToast(toast.toastId), TOAST_AUTO_DISMISS_MS);
+      toasts.push(toast);
+      renderToasts();
+      return toast.toastId;
+    }
+
+    // Manual dismissal (the close button) and timeout dismissal both funnel
+    // through here, so neither path can leave a stale entry in `toasts` or a
+    // dangling timer behind.
+    function dismissToast(toastId) {
+      const idx = toasts.findIndex((t) => t.toastId === toastId);
+      if (idx === -1) return;
+      clearTimeout(toasts[idx].timeoutId);
+      toasts.splice(idx, 1);
+      renderToasts();
+    }
+
+    // Fires whatever a later slice wants to happen on click (issues
+    // #192-#194: focus the corresponding session's card). Both a plain
+    // callback hook (window.onToastClick, if a later slice sets one) and a
+    // DOM CustomEvent are provided -- this issue only needs the hook to
+    // exist and carry the identifier, not to actually focus anything.
+    function handleToastClick(toast) {
+      document.dispatchEvent(
+        new CustomEvent("rhubarb:toast-click", {
+          detail: { identifier: toast.identifier, variant: toast.variant, message: toast.message },
+        })
+      );
+      if (typeof window.onToastClick === "function") {
+        window.onToastClick(toast.identifier, toast);
+      }
+      // A clicked toast has been acted on -- dismiss it rather than leaving
+      // it to linger until its timeout.
+      dismissToast(toast.toastId);
+    }
+
+    function renderToasts() {
+      if (!toastStackEl) return;
+      toastStackEl.innerHTML = "";
+      const visible = toasts.slice(0, TOAST_VISIBLE_CAP);
+      const overflowCount = toasts.length - visible.length;
+
+      visible.forEach((toast) => {
+        const el = document.createElement("div");
+        el.className = `toast toast-${toast.variant}`;
+        el.setAttribute("role", "status");
+
+        const icon = document.createElement("span");
+        icon.className = "toast-icon";
+        icon.textContent = toast.variant === "failure" ? "⚠" : "●";
+        el.appendChild(icon);
+
+        const text = document.createElement("span");
+        text.className = "toast-message";
+        text.textContent = toast.message;
+        el.appendChild(text);
+
+        const closeBtn = document.createElement("button");
+        closeBtn.type = "button";
+        closeBtn.className = "toast-close";
+        closeBtn.textContent = "×";
+        closeBtn.title = "Dismiss";
+        closeBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          dismissToast(toast.toastId);
+        });
+        el.appendChild(closeBtn);
+
+        el.addEventListener("click", () => handleToastClick(toast));
+        toastStackEl.appendChild(el);
+      });
+
+      if (overflowCount > 0) {
+        const more = document.createElement("div");
+        more.className = "toast toast-overflow";
+        more.textContent = `+${overflowCount} more`;
+        toastStackEl.appendChild(more);
+      }
+    }
+
+    // Console-callable test hook (issue #188): usage from devtools --
+    //   window.__testRaiseToast("Something happened", "session-42", "failure")
+    // `identifier` and `variant` are both optional (variant defaults to
+    // "normal").
+    window.__testRaiseToast = function (message, identifier, variant) {
+      return raiseToast({ message, identifier, variant });
+    };
+
+    // --- Parser-session result routing (issue #193, slice of PRD #187) -----
+    // Connects issue #192's per-project parsed-results feed (drained,
+    // server-side, by `GET /api/projects/{id}/parsed-results` -- see
+    // `rhubarb/web/app.py`'s `get_parsed_results_endpoint`) to this page: a
+    // successfully-parsed result for the session currently focused in the
+    // left card updates that card in place using the exact same rendering
+    // path (`renderInterview`) grilling/implementing questions already use;
+    // a result for any OTHER session is held and announced with a toast
+    // (issue #188) instead, and shown the moment that session's card
+    // actually becomes focused -- via the toast click or any other route to
+    // focusCard() (see the `showHeldParsedResultIfAny` call inside
+    // `focusCard` above).
+    //
+    // Issue #194 ("Fallback to legacy extraction on parser failure, with
+    // retry-per-turn", `gh issue view 194`) extends `routeParsedResult`
+    // below: when the backend's primary parser-session extraction fails for
+    // an item, `parser_session._fallback_or_failure` attempts the
+    // pre-existing regex/Ollama-rescue pipeline on that one item's raw text
+    // and tags whatever it gets back with `"source": "fallback"` --
+    // `ok: true` (a question was recovered -- fed through this exact same
+    // focused-card/held-toast routing a `"source": "parser_session"` result
+    // already gets) or `ok: false` (nothing was recoverable even by the
+    // fallback -- nothing to route). Either way, `"source": "fallback"`
+    // means the primary path failed, so a failure-variant toast is ALWAYS
+    // raised alongside whatever routing (or lack of it) happens, per #194's
+    // "visible rather than silent" requirement -- see `routeParsedResult`.
+
+    // How many of a project's accumulated parsed results (server-side,
+    // append-only -- see `parser_session.get_parsed_results`) this tab has
+    // already consumed; passed back as `since` on every poll so a result is
+    // never routed twice. Reset on every project switch by
+    // `resetParsedResultsRouting` (called from `activateProject`/
+    // `closeActiveProject`) since a fresh project's own result list starts
+    // back at offset 0 server-side too.
+    let parsedResultsOffset = 0;
+
+    // source_session_id (card_id) -> the most recent successfully-parsed
+    // result held for that card because it wasn't focused when it arrived.
+    // Only the latest is kept per card (a newer result supersedes an older
+    // still-unseen one for the same card, same as every other "latest state
+    // for this card" map in this file, e.g. `cardSnapshots`) -- every held
+    // result still gets its own toast when it arrives, so none are dropped
+    // from the user's notification stream even though only the latest ends
+    // up actually displayed once the card is focused.
+    let heldParsedResults = new Map();
+
+    function resetParsedResultsRouting() {
+      parsedResultsOffset = 0;
+      heldParsedResults = new Map();
+    }
+
+    // Reshapes a tagged parser-session result into the {header, questions,
+    // footer} shape `renderInterview` already expects (issue #192
+    // deliberately reuses that exact schema -- see parser_session.py's own
+    // docstring on "Output schema") and shows it on the currently-focused
+    // left card, through `renderInterview` itself -- the same function
+    // every other parsed-question surface (grilling, implementing-needs-
+    // input, the rhubarb_question.md preview) already renders through, so
+    // this is not a second, parallel rendering mechanism.
+    function showParsedResultOnFocusedCard(result) {
+      const interview = { header: result.header, questions: result.questions, footer: result.footer };
+      // Grilling's own reply path (`sendReply`, `/api/session/continue`) is
+      // the default -- matches every pre-existing `renderInterview(...)`
+      // call site that doesn't pass its own `submitFn`. An implementing
+      // session's needs-input reply goes through its own endpoint instead
+      // (`sendImplementReply`, mirroring the existing implementing-takeover
+      // branch in `applyTurn` above) since answer delivery stays on
+      // "whatever mechanism already delivers answers today" per PRD #187 --
+      // the parser session itself is extract-only.
+      const submitFn =
+        currentLeftSession && currentLeftSession.phase === "implementing" ? sendImplementReply : sendReply;
+      startForm.style.display = "none";
+      showOnly(mainFlowEl);
+      renderInterview(interview, submitFn);
+    }
+
+    // Called every time a card becomes focused (from `focusCard`, and from
+    // the poll tick below as a safety net for focus changes that don't go
+    // through `focusCard`, e.g. an automatic blocked/QA takeover) -- shows
+    // and clears this card's held result, if any. A no-op if nothing is
+    // held for `cardId`, so it's safe to call unconditionally.
+    function showHeldParsedResultIfAny(cardId) {
+      const result = heldParsedResults.get(cardId);
+      if (!result) return;
+      heldParsedResults.delete(cardId);
+      showParsedResultOnFocusedCard(result);
+    }
+
+    // Routes one tagged result to the focused card or a toast, per issue
+    // #193's acceptance criteria, extended by issue #194 (see this
+    // section's header comment) for results tagged `"source": "fallback"`.
+    function routeParsedResult(result) {
+      const cardId = result.source_session_id;
+      const session = rightCards.get(cardId);
+      const label = session ? queueLabelForSession(session) : `Session #${cardId}`;
+
+      if (result.ok) {
+        if (cardId === leftCardId) {
+          showParsedResultOnFocusedCard(result);
+        } else {
+          heldParsedResults.set(cardId, result);
+          raiseToast({ message: `${label} needs your input`, identifier: cardId, variant: "normal" });
+        }
+      }
+
+      if (result.source === "fallback") {
+        // Issue #194: the primary parser-session extraction failed for this
+        // turn -- always surface that degradation, whether or not the
+        // legacy fallback pipeline managed to recover a usable question
+        // (`result.ok`) for the routing above to have just shown/held.
+        const message = result.ok
+          ? `${label}: parser had trouble, showing a best-effort extracted question -- please double-check it`
+          : `${label}: failed to extract a question for this turn -- check the session directly`;
+        raiseToast({ message, identifier: cardId, variant: "failure" });
+      }
+    }
+
+    async function pollParsedResultsTick() {
+      if (!activeProject) return;
+      const res = await fetch(`/api/projects/${activeProject.id}/parsed-results?since=${parsedResultsOffset}`);
+      const data = await res.json();
+      parsedResultsOffset = data.total ?? parsedResultsOffset;
+      (data.results || []).forEach((result) => routeParsedResult(result));
+      // Safety net for the "focused by another route" acceptance criterion:
+      // some ways a card becomes the focused left card don't go through
+      // focusCard() at all (e.g. the automatic blocked/QA-grilling takeover
+      // branches in applyTurn, which set leftCardId directly) -- checking
+      // the currently-focused card's held result on every poll tick, too,
+      // guarantees it still gets shown even then, not just via focusCard's
+      // own call.
+      if (leftCardId !== null) showHeldParsedResultIfAny(leftCardId);
+    }
+
+    // Issue #188 deliberately left `window.onToastClick` undefined for this
+    // later slice -- clicking a toast focuses the session it identifies.
+    // `focusCard` itself then shows this card's held result (see the
+    // `showHeldParsedResultIfAny` call inside it above), so this hook does
+    // not need to do anything else.
+    window.onToastClick = function (identifier) {
+      if (identifier === null || identifier === undefined) return;
+      focusCard(identifier);
+    };
+
     loadAppState();
     checkOllamaGate();
+    checkHeadroomGate();
   </script>
 </body>
 </html>

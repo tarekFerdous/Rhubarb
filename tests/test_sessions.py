@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from rhubarb import db, error_log, live_stream, pty_engine, session_runner, stream_json_engine
+from rhubarb import db, error_log, live_stream, parser_session, pty_engine, session_runner, stream_json_engine
 from rhubarb.cli_client import ClaudeCLIError
 from rhubarb.github_publisher import GithubPublishError
 from rhubarb.pty_engine import PtyEngineUnrecoverableError
@@ -69,6 +69,18 @@ def _open_project(client, tmp_path, name):
     client.post("/api/settings/root-dir", json={"root_dir": str(root), "confirm": True})
     project_id = client.get("/api/app-state").json()["projects"][0]["id"]
     client.post(f"/api/projects/{project_id}/open")
+    # `open_project` fire-and-forgets its own pre-warm of this project's
+    # standby `StreamJsonEngine` (issue #136/#184) -- a background task
+    # whose completion timing relative to this synchronous helper returning
+    # is not guaranteed either way (TestClient may or may not pump the
+    # event loop far enough for it to finish first). No test in this file
+    # is testing THAT ambient pre-warm itself (the tests that actually cover
+    # it call `ensure_standby_stream_json_engine` explicitly, well after
+    # this point) -- so clear it here for a deterministic, known-empty
+    # starting registry, the same guarantee `_isolated_standby_stream_json_
+    # engines` (conftest.py) already gives every test BEFORE `_open_project`
+    # runs, now also given AFTER it.
+    session_runner._standby_stream_json_engines.clear()
     return project_id
 
 
@@ -230,6 +242,16 @@ def _mock_engine(monkeypatch, handler, *, fresh_ids=None, reply_handler=None):
     `test_stream_turn_events_are_compatible_with_translate_event`)."""
     fake_class = _make_fake_engine_class(handler, fresh_ids=fresh_ids, reply_handler=reply_handler)
     monkeypatch.setattr(session_runner, "PtyEngine", fake_class)
+    monkeypatch.setattr(session_runner, "StreamJsonEngine", fake_class)
+    return fake_class
+
+
+def _mock_stream_json_engine(monkeypatch, handler, *, fresh_ids=None, reply_handler=None):
+    """Monkeypatch ONLY `session_runner.StreamJsonEngine` with the fake class
+    driven by `handler` -- for tests that exercise code paths that exclusively
+    use `StreamJsonEngine` (e.g. `start_do_continue_job`), where patching
+    `PtyEngine` too would be misleading."""
+    fake_class = _make_fake_engine_class(handler, fresh_ids=fresh_ids, reply_handler=reply_handler)
     monkeypatch.setattr(session_runner, "StreamJsonEngine", fake_class)
     return fake_class
 
@@ -672,9 +694,8 @@ def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, 
     """Issue #33: the explicit "Yes, proceed" path (confirm_advance=True)
     must go straight to /rhubarb:to-prd -> /rhubarb:to-issues -> details, resuming the
     session's existing claude_session_id, WITHOUT sending another grilling
-    CLI turn first. Since #75, `details` auto-continues straight into
-    /rhubarb:implement -- this test's handler covers that turn too and asserts
-    the chain lands on `implemented`, not `details`."""
+    CLI turn first. Issue #196 (child of PRD #195): the chain now pauses at
+    `details` instead of auto-continuing into /rhubarb:implement."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -688,9 +709,7 @@ def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, 
             return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/rhubarb:to-issues":
             return iter([_result_event("Wrote issues draft.")])
-        if prompt == "/rhubarb:implement prd: 5":
-            return iter([_result_event("Implemented.")])
-        raise AssertionError(f"unexpected grilling-style prompt {prompt!r} during confirm_advance")
+        raise AssertionError(f"unexpected prompt {prompt!r} -- do chain must not auto-implement")
 
     _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
@@ -703,19 +722,19 @@ def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, 
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
-    # The two chain prompts ran, followed by the auto-continued implement
-    # turn -- no grilling reply was ever sent.
-    assert seen_prompts == ["/rhubarb:to-prd", "/rhubarb:to-issues", "/rhubarb:implement prd: 5"]
+    # Only the two chain prompts -- no /rhubarb:implement, no grilling reply.
+    assert seen_prompts == ["/rhubarb:to-prd", "/rhubarb:to-issues"]
 
     row = db.get_session(conn, row_id)
-    assert row["phase"] == "implemented"
+    assert row["phase"] == "details"
+    assert row["session_type"] == "do"
     details = json.loads(row["details_json"])
     assert details["prd"] == {"number": 5, "title": "My PRD"}
     assert details["issues"] == [{"number": 6, "title": "Child one"}]
-    assert row["available_for_reuse"] == 1
+    assert row["available_for_reuse"] == 0
 
     events = live_stream._buffers.get(row_id, [])
-    assert events[-1] == {"type": "done"}
+    assert not any(e.get("type") == "done" for e in events)
     assert any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
     assert any(e == {"type": "phase", "phase": "creating_issues"} for e in events)
     assert any(e.get("type") == "turn" and e.get("phase") == "details" for e in events)
@@ -979,23 +998,23 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
     row = db.get_session(conn, row_id)
     assert row["phase"] == "grilling"
 
-    # Explicit "Yes, proceed" is what actually advances the chain -- since
-    # #75, straight through into an auto-continued /rhubarb:implement turn too
-    # (this test's fallback branch answers that prompt the same generic way).
+    # Explicit "Yes, proceed" advances to details and pauses -- no auto-implement
+    # (issue #196, child of PRD #195).
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
     row = db.get_session(conn, row_id)
-    assert row["phase"] == "implemented"
+    assert row["phase"] == "details"
+    assert row["session_type"] == "do"
     details = json.loads(row["details_json"])
     assert details["prd"] == {"number": 5, "title": "My PRD"}
     assert details["issues"] == [
         {"number": 6, "title": "Child one"},
         {"number": 7, "title": "Child two"},
     ]
-    assert row["available_for_reuse"] == 1
+    assert row["available_for_reuse"] == 0
 
     events = live_stream._buffers.get(row_id, [])
-    assert events[-1] == {"type": "done"}
+    assert not any(e.get("type") == "done" for e in events)
     assert any(e.get("type") == "turn" and e.get("phase") == "details" for e in events)
     assert any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
     assert "$" not in json.dumps(events)
@@ -1003,8 +1022,10 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
 
 def test_confirm_advance_runs_publishing_phase_with_no_extra_cli_calls(client, tmp_path, monkeypatch):
     """Issue #58: the chain must sequence phase:creating_prd -> phase:creating_issues
-    -> phase:publishing -> turn(details) -> done, and github_publisher.publish_draft
-    (not a Claude CLI turn) must be what actually creates the GitHub issues."""
+    -> phase:publishing -> turn(details), and github_publisher.publish_draft
+    (not a Claude CLI turn) must be what actually creates the GitHub issues.
+    Issue #196 (child of PRD #195): the chain pauses at details; no done event
+    and no implement turn fires automatically."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -1018,9 +1039,7 @@ def test_confirm_advance_runs_publishing_phase_with_no_extra_cli_calls(client, t
             return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/rhubarb:to-issues":
             return iter([_result_event("Wrote issues draft.")])
-        if prompt == "/rhubarb:implement prd: 5":
-            return iter([_result_event("Implemented.")])
-        raise AssertionError(f"unexpected prompt {prompt!r}")
+        raise AssertionError(f"unexpected prompt {prompt!r} -- must not auto-implement")
 
     _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
@@ -1037,27 +1056,25 @@ def test_confirm_advance_runs_publishing_phase_with_no_extra_cli_calls(client, t
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
-    # /rhubarb:to-prd, /rhubarb:to-issues, and the auto-continued implement turn
-    # went through the Claude CLI -- publishing did not.
-    assert seen_prompts == ["/rhubarb:to-prd", "/rhubarb:to-issues", "/rhubarb:implement prd: 5"]
+    # /rhubarb:to-prd and /rhubarb:to-issues went through the CLI; publishing did not.
+    assert seen_prompts == ["/rhubarb:to-prd", "/rhubarb:to-issues"]
     assert len(seen_publish_calls) == 1
 
     row = db.get_session(conn, row_id)
-    assert row["phase"] == "implemented"
+    assert row["phase"] == "details"
+    assert row["session_type"] == "do"
+    assert row["available_for_reuse"] == 0
     details = json.loads(row["details_json"])
     assert details["prd"] == {"number": 5, "title": "My PRD"}
     assert details["issues"] == [{"number": 6, "title": "Child one"}]
-    assert row["available_for_reuse"] == 1
 
     events = live_stream._buffers.get(row_id, [])
     chain_phases = [
         e["phase"] for e in events if e.get("type") == "phase" and e["phase"] != "grilling"
     ]
-    assert chain_phases == ["creating_prd", "creating_issues", "publishing", "implementing"]
-    assert events[-1] == {"type": "done"}
+    assert chain_phases == ["creating_prd", "creating_issues", "publishing"]
+    assert not any(e.get("type") == "done" for e in events)
     assert any(e.get("type") == "turn" and e.get("phase") == "details" for e in events)
-    # Issue #146: the do-to-implement handoff no longer auto-minimizes the
-    # left card -- the frontend shows a "Proceed" banner instead.
     assert not any(e.get("type") == "minimize" for e in events)
 
 
@@ -1139,7 +1156,7 @@ def test_retry_on_publishing_phase_reruns_publisher_and_completes(client, tmp_pa
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
 
     row = db.get_session(conn, row_id)
-    assert row["phase"] == "implemented"
+    assert row["phase"] == "details"
     assert row["error_text"] is None
     details = json.loads(row["details_json"])
     assert details["prd"] == {"number": 9, "title": "Retried PRD"}
@@ -1357,7 +1374,7 @@ def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypa
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
 
     row = db.get_session(conn, row_id)
-    assert row["phase"] == "implemented"
+    assert row["phase"] == "details"
     assert row["error_text"] is None
     details = json.loads(row["details_json"])
     assert details["prd"] == {"number": 9, "title": "Retried PRD"}
@@ -1493,7 +1510,7 @@ def test_retry_on_creating_prd_phase_is_unaffected_by_implement_branch(client, t
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
 
     row = db.get_session(conn, row_id)
-    assert row["phase"] == "implemented"
+    assert row["phase"] == "details"
     assert row["error_text"] is None
     details = json.loads(row["details_json"])
     assert details["prd"] == {"number": 30, "title": "Regression PRD"}
@@ -1776,27 +1793,19 @@ def test_serial_mode_queues_second_prd_and_drains_it_when_first_finishes(client,
 
 
 def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch):
+    """Pool entries are scoped per project: a session marked available in
+    project A must never be claimed for project B. Tests the DB-level scoping
+    contract directly, independent of how a session ends up in the pool."""
     project_a = _open_project(client, tmp_path, "proj_a")
     cwd_a = _cwd_for(project_a)
 
-    def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
-            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-        if prompt in ("/rhubarb:to-prd", "/rhubarb:to-issues"):
-            return iter([_result_event("wrote draft")])
-        return iter([_result_event("done")])
-
-    _mock_engine(monkeypatch, handler, fresh_ids=["turn-engine", "pooled-session"])
+    # Seed the pool for project A directly via the DB (PRD #195: /do sessions
+    # no longer auto-pool themselves at details -- they pause for user input
+    # instead. The pool is still used by /implement sessions, so we test the
+    # scoping contract here without going through the /do flow.)
     conn = db.get_connection()
-    row_id = db.create_session(conn, project_a)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd_a))
-
-    monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #1: p\nIssue #2: i")
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd_a, confirm_advance=True))
-
-    row = db.get_session(conn, row_id)
-    assert row["available_for_reuse"] == 1
-    assert row["claude_session_id"] == "pooled-session"
+    pool_row_id = db.create_session(conn, project_a)
+    db.update_session(conn, pool_row_id, phase="done", available_for_reuse=1, claude_session_id="pooled-session")
 
     seen_session_ids = []
 
@@ -3936,14 +3945,12 @@ def test_maybe_clear_for_next_phase_clears_when_over_cutoff(client, tmp_path, mo
     assert session_runner._pty_engines[row_id] is fake_class.instances[0]
 
 
-def test_finish_chain_does_not_publish_minimize_and_still_starts_implementing(client, tmp_path, monkeypatch):
-    """Issue #146: the do-to-implement handoff no longer auto-minimizes the
-    left card -- the frontend now shows a "Proceed" banner instead and only
-    minimizes on an explicit click. `/rhubarb:implement` must still start
-    immediately in the same tab/session regardless: the `implementing` phase
-    (and, since this mock engine completes synchronously, the resulting
-    `implement` session_type) must still show up, just with no `minimize`
-    event anywhere in the stream."""
+def test_finish_chain_pauses_at_details_instead_of_starting_implementing(client, tmp_path, monkeypatch):
+    """Issue #196 (child of PRD #195): a /do session that reaches `details`
+    must stop there and stay there -- no automatic transition to `implementing`,
+    no `done` event, no `minimize` event. The resident engine stays alive and
+    idle. Manually starting implementation from "To be implemented" still works
+    (that path is unchanged -- see start_or_queue_implement)."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -3954,7 +3961,7 @@ def test_finish_chain_does_not_publish_minimize_and_still_starts_implementing(cl
             return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/rhubarb:to-issues":
             return iter([_result_event("Wrote issues draft.")])
-        return iter([_result_event("Implemented.")])
+        raise AssertionError(f"unexpected prompt {prompt!r} -- must not auto-implement")
 
     _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
@@ -3965,21 +3972,24 @@ def test_finish_chain_does_not_publish_minimize_and_still_starts_implementing(cl
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "details"
+    assert row["session_type"] == "do"
+    assert row["available_for_reuse"] == 0
+
     events = live_stream._buffers.get(row_id, [])
     event_types = [e["type"] for e in events]
     assert "minimize" not in event_types
-
-    phases = [e["phase"] for e in events if e.get("type") == "phase"]
-    assert "implementing" in phases
-
-    row = db.get_session(conn, row_id)
-    assert row["session_type"] == "implement"
+    assert "done" not in event_types
+    assert any(e.get("type") == "turn" and e.get("phase") == "details" for e in events)
 
 
-def test_finish_chain_falls_back_to_pooling_when_no_prd_was_parsed(client, tmp_path, monkeypatch):
-    """If parse_details comes up with no PRD number (e.g. an unexpected
-    /rhubarb:to-issues result shape), the session must not get stuck --
-    it falls back to the old clear-and-pool-immediately behavior."""
+def test_finish_chain_pauses_at_details_even_when_no_prd_was_parsed(client, tmp_path, monkeypatch):
+    """Issue #196 (child of PRD #195): when publish succeeds but parse_details
+    finds no PRD number, the session still pauses at `details` and stays there
+    -- it is NOT pooled for reuse, NOT given a done event, and the resident
+    engine is NOT torn down. Both cases (PRD found vs. not found) now share
+    one code path: stop at details and wait."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -3990,9 +4000,9 @@ def test_finish_chain_falls_back_to_pooling_when_no_prd_was_parsed(client, tmp_p
             return iter([_result_event("Wrote PRD draft.")])
         if prompt == "/rhubarb:to-issues":
             return iter([_result_event("no PRD/issue numbers in here at all")])
-        raise AssertionError(f"unexpected prompt {prompt!r} -- must not auto-continue without a PRD")
+        raise AssertionError(f"unexpected prompt {prompt!r}")
 
-    _mock_engine(monkeypatch, handler, fresh_ids=["turn-engine", "s2"])
+    _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
@@ -4003,14 +4013,13 @@ def test_finish_chain_falls_back_to_pooling_when_no_prd_was_parsed(client, tmp_p
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "details"
-    assert row["available_for_reuse"] == 1
-    assert row["claude_session_id"] == "s2"
+    assert row["session_type"] == "do"
+    assert row["available_for_reuse"] == 0
 
     events = live_stream._buffers.get(row_id, [])
     assert not any(e.get("type") == "minimize" for e in events)
-    assert events[-1] == {"type": "done"}
-    # No PRD to implement -- this card's tab was closed when pooled.
-    assert row_id not in session_runner._pty_engines
+    assert not any(e.get("type") == "done" for e in events)
+    assert any(e.get("type") == "turn" and e.get("phase") == "details" for e in events)
 
 
 def test_dismiss_error_notifications_clears_the_project_queue(client, tmp_path):
@@ -4021,6 +4030,100 @@ def test_dismiss_error_notifications_clears_the_project_queue(client, tmp_path):
 
     session_runner.dismiss_error_notifications(project_id)
     assert session_runner.get_error_notifications(project_id) == []
+
+
+# ---------------------------------------------------------------------------
+# start_do_continue_job (issue #198, child of PRD #195): the Continue button
+# on the do-finished banner starts a fresh grilling round on the same card.
+# ---------------------------------------------------------------------------
+
+
+def test_start_do_continue_job_reuses_existing_engine_under_cutoff(client, tmp_path, monkeypatch):
+    """When context_pct is at or under the cutoff, the existing StreamJsonEngine
+    is reused -- no new engine is spawned and the claude_session_id is
+    unchanged. The new grilling round uses the same model/effort already on
+    the row."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    do_prompts = []
+
+    def handler(prompt, **kw):
+        do_prompts.append(prompt)
+        if "/rhubarb:do" in prompt:
+            return iter([_result_event("❓ **Q1** - **Scope**: a question?", session_id="sess-1")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
+
+    _mock_stream_json_engine(monkeypatch, handler, fresh_ids=["sess-1"])
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+
+    # Land the session at details with a low context_pct.
+    db.update_session(conn, row_id, phase="details", session_type="do", claude_session_id="sess-1", context_pct=0.20)
+
+    asyncio.run(session_runner.start_do_continue_job(row_id, "next idea", cwd=cwd))
+
+    # Same session id -- engine was reused, not replaced.
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "grilling"
+    assert row["claude_session_id"] == "sess-1"
+
+    # The grilling prompt was sent.
+    assert any("/rhubarb:do next idea" in p for p in do_prompts)
+
+
+def test_start_do_continue_job_spawns_fresh_engine_over_cutoff(client, tmp_path, monkeypatch):
+    """When context_pct exceeds the cutoff, the old StreamJsonEngine is torn
+    down and a fresh one is spawned. The new claude_session_id is persisted
+    and context_pct is reset to None before the grilling turn runs."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def handler(prompt, **kw):
+        if "/rhubarb:do" in prompt:
+            return iter([_result_event("❓ **Q1** - **Scope**: a question?", session_id="fresh-id")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
+
+    _mock_stream_json_engine(monkeypatch, handler, fresh_ids=["old-id", "fresh-id"])
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+
+    # Land at details with context_pct well over the cutoff.
+    db.update_session(conn, row_id, phase="details", session_type="do", claude_session_id="old-id", context_pct=0.85)
+
+    asyncio.run(session_runner.start_do_continue_job(row_id, "another idea", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "grilling"
+    # Old session is gone; the new engine's id was persisted.
+    assert row["claude_session_id"] != "old-id"
+
+
+def test_start_do_continue_job_keeps_model_and_effort_from_row(client, tmp_path, monkeypatch):
+    """Continue uses the model/effort already on the row, not the global setting."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    db.set_model(conn, "claude-opus-5")
+
+    seen_models = []
+    seen_efforts = []
+
+    def handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
+        seen_models.append(model)
+        seen_efforts.append(effort)
+        return iter([_result_event("❓ **Q1** - **Scope**: a question?")])
+
+    _mock_stream_json_engine(monkeypatch, handler)
+    row_id = db.create_session(conn, project_id)
+    db.update_session(conn, row_id, phase="details", session_type="do", model="claude-haiku-4-5-20251001", effort="low", context_pct=0.10)
+
+    asyncio.run(session_runner.start_do_continue_job(row_id, "prompt", cwd=cwd))
+
+    # Must have used the row's model/effort, not the global setting.
+    assert seen_models == ["claude-haiku-4-5-20251001"]
+    assert seen_efforts == ["low"]
 
 
 # ---------------------------------------------------------------------------
@@ -4464,7 +4567,7 @@ def test_creating_prd_turn_is_classified_before_creating_issues_starts(client, t
     assert calls[1] == (row_id, "creating_issues", "Wrote issues draft.")
 
     row = db.get_session(conn, row_id)
-    assert row["phase"] == "implemented"
+    assert row["phase"] == "details"
 
 
 def test_creating_prd_positive_classification_shows_generic_stall_panel_not_rich_ui(
@@ -4535,7 +4638,7 @@ def test_creating_prd_positive_classification_shows_generic_stall_panel_not_rich
     # The reply (simulated by `reply_handler`) resolved successfully, so the
     # chain's normal continuation resumed afterward exactly like any other
     # completed turn.
-    assert row["phase"] == "implemented"
+    assert row["phase"] == "details"
     assert row["stalled_json"] is None
 
 
@@ -4581,7 +4684,7 @@ def test_creating_prd_negative_classification_does_not_pause_the_chain(client, t
     assert not any(e.get("type") == "turn" and e.get("stalled") for e in events)
 
     row = db.get_session(conn, row_id)
-    assert row["phase"] == "implemented"
+    assert row["phase"] == "details"
 
 
 # ---------------------------------------------------------------------------
@@ -5186,3 +5289,349 @@ def test_grilling_multiline_composed_reply_under_new_engine_completes_as_a_singl
     assert row["phase"] == "grilling"
     interview = json.loads(row["interview_json"])
     assert interview["questions"] == []
+
+
+# ---------------------------------------------------------------------------
+# `handle_turn_completed` -- the shared "on turn complete" hook (issue #191,
+# child of PRD #187) every phase's turn-handling code now calls instead of
+# calling `classify_needs_input` directly, so a positive classification also
+# enqueues the turn onto its project's needs-input queue
+# (`parser_session.enqueue_needs_input_turn`/`get_needs_input_queue`, the
+# registry issue #189 built) -- consolidating what used to be separate,
+# duplicated per-phase call sites (grilling, qa-grilling, implementing,
+# creating_prd/creating_issues) behind one place. `classify_needs_input`'s
+# own behavior (declined/unavailable/malformed handling, the
+# `ollama_unavailable` notification) is already fully covered by the
+# dedicated tests above and is untouched here -- these tests cover only the
+# ADDITIONAL enqueue behavior this hook layers on top.
+# ---------------------------------------------------------------------------
+
+
+def test_handle_turn_completed_enqueues_when_classifier_flags_needs_input(client, monkeypatch):
+    # This whole file's own autouse `_classify_needs_input_is_a_no_op_by_default`
+    # fixture stubs `session_runner.classify_needs_input` to always return
+    # `None` -- restore the genuine function so these tests actually drive
+    # `handle_turn_completed`'s real classification call via `http_post`,
+    # same precedent as the dedicated `classify_needs_input` tests above.
+    monkeypatch.setattr(session_runner, "classify_needs_input", _REAL_CLASSIFY_NEEDS_INPUT)
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, False)
+    row = {"project_id": 7}
+    payload = {"needs_input": True, "reason": "Asked which database to use."}
+
+    def fake_post(url, body, *, timeout):
+        return {"response": json.dumps(payload)}
+
+    result = asyncio.run(
+        session_runner.handle_turn_completed(3, conn, row, "Which database?", "grilling", http_post=fake_post)
+    )
+
+    assert result == payload
+    assert parser_session.get_needs_input_queue(7) == [
+        {"project_id": 7, "card_id": 3, "phase": "grilling", "text": "Which database?"}
+    ]
+
+
+def test_handle_turn_completed_does_not_enqueue_when_classification_is_negative(client, monkeypatch):
+    monkeypatch.setattr(session_runner, "classify_needs_input", _REAL_CLASSIFY_NEEDS_INPUT)
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, False)
+    row = {"project_id": 7}
+
+    def fake_post(url, body, *, timeout):
+        return {"response": json.dumps({"needs_input": False, "reason": None})}
+
+    result = asyncio.run(
+        session_runner.handle_turn_completed(3, conn, row, "All done.", "implementing", http_post=fake_post)
+    )
+
+    assert result == {"needs_input": False, "reason": None}
+    assert parser_session.get_needs_input_queue(7) == []
+
+
+def test_handle_turn_completed_does_not_enqueue_when_ollama_declined(client, monkeypatch):
+    monkeypatch.setattr(session_runner, "classify_needs_input", _REAL_CLASSIFY_NEEDS_INPUT)
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, True)
+    row = {"project_id": 7}
+
+    def fake_post(url, body, *, timeout):
+        raise AssertionError("Ollama must not be called when ollama_declined is true")
+
+    result = asyncio.run(
+        session_runner.handle_turn_completed(3, conn, row, "text", "creating_prd", http_post=fake_post)
+    )
+
+    assert result is None
+    assert parser_session.get_needs_input_queue(7) == []
+
+
+def test_handle_turn_completed_does_not_enqueue_when_classification_call_fails(client, monkeypatch):
+    """A genuinely unexpected classification failure (timeout, connection
+    error, malformed response) must not enqueue anything -- there is no
+    trustworthy classification to act on, same as a negative one. The
+    pre-existing `ollama_unavailable` notification behavior is completely
+    unchanged by this hook."""
+    monkeypatch.setattr(session_runner, "classify_needs_input", _REAL_CLASSIFY_NEEDS_INPUT)
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, False)
+    row = {"project_id": 7}
+
+    def timing_out_post(url, body, *, timeout):
+        raise TimeoutError("Ollama took too long")
+
+    result = asyncio.run(
+        session_runner.handle_turn_completed(3, conn, row, "text", "creating_issues", http_post=timing_out_post)
+    )
+
+    assert result is None
+    assert parser_session.get_needs_input_queue(7) == []
+    assert live_stream._buffers.get(3, []) == [{"type": "ollama_unavailable"}]
+
+
+def test_handle_turn_completed_fifo_order_across_concurrent_sessions_same_project(client, monkeypatch):
+    """Multiple concurrent sessions under the SAME project must enqueue in
+    the order their turns actually completed -- no loss, no reordering."""
+    monkeypatch.setattr(session_runner, "classify_needs_input", _REAL_CLASSIFY_NEEDS_INPUT)
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, False)
+    row = {"project_id": 9}
+
+    def fake_post(url, body, *, timeout):
+        return {"response": json.dumps({"needs_input": True, "reason": None})}
+
+    async def _drive_three():
+        await session_runner.handle_turn_completed(101, conn, row, "first turn", "grilling", http_post=fake_post)
+        await session_runner.handle_turn_completed(
+            102, conn, row, "second turn", "implementing", http_post=fake_post
+        )
+        await session_runner.handle_turn_completed(101, conn, row, "third turn", "grilling", http_post=fake_post)
+
+    asyncio.run(_drive_three())
+
+    queue = parser_session.get_needs_input_queue(9)
+    assert [item["card_id"] for item in queue] == [101, 102, 101]
+    assert [item["text"] for item in queue] == ["first turn", "second turn", "third turn"]
+    assert [item["phase"] for item in queue] == ["grilling", "implementing", "grilling"]
+
+
+def test_handle_turn_completed_keeps_different_projects_queues_separate(client, monkeypatch):
+    """Turns from sessions under different projects must go to their own
+    project's queue, never cross-mixed."""
+    monkeypatch.setattr(session_runner, "classify_needs_input", _REAL_CLASSIFY_NEEDS_INPUT)
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, False)
+
+    def fake_post(url, body, *, timeout):
+        return {"response": json.dumps({"needs_input": True, "reason": None})}
+
+    async def _drive_both():
+        await session_runner.handle_turn_completed(
+            1, conn, {"project_id": 1}, "project one's turn", "grilling", http_post=fake_post
+        )
+        await session_runner.handle_turn_completed(
+            2, conn, {"project_id": 2}, "project two's turn", "implementing", http_post=fake_post
+        )
+
+    asyncio.run(_drive_both())
+
+    assert [item["text"] for item in parser_session.get_needs_input_queue(1)] == ["project one's turn"]
+    assert [item["text"] for item in parser_session.get_needs_input_queue(2)] == ["project two's turn"]
+
+
+# ---------------------------------------------------------------------------
+# Real per-phase wiring: confirming grilling, qa-grilling, implementing
+# (including two independent per-issue implement sessions under the same
+# project, the shape `/implement`'s parallel mode runs), and the
+# creating_prd/creating_issues chain all route through the shared
+# `handle_turn_completed` hook and genuinely enqueue a positive
+# classification end to end -- not just via a direct hook call above.
+# ---------------------------------------------------------------------------
+
+
+def test_grilling_last_resort_needs_input_classification_enqueues_onto_project_queue(
+    client, tmp_path, monkeypatch
+):
+    """Issue #191: grilling's own last-resort needs-input check
+    (`_maybe_extract_needs_input_grilling`, issue #178) now also enqueues a
+    positively-classified turn, tagged with this session's own card id and
+    phase `"grilling"`, onto its project's needs-input queue."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    # No "question " trigger at all -- `should_attempt_grilling_rescue`
+    # never fires, so only the last-resort classifier check flags this turn.
+    prose = "Still thinking this through -- should I use REST or GraphQL here?"
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(prose, session_id="g1")]))
+
+    async def fake_classify(card_id, conn_arg, text, phase, *, http_post=None):
+        return {"needs_input": True, "reason": "Asked REST vs GraphQL."}
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    # `start_session_job` runs only grilling's own first turn and stops --
+    # the chain never auto-advances into creating_prd without an explicit
+    # later `continue_session_job(confirm_advance=True)` call, so this
+    # project's queue reflects only this one grilling turn.
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    queue = parser_session.get_needs_input_queue(project_id)
+    assert queue == [{"project_id": project_id, "card_id": row_id, "phase": "grilling", "text": prose}]
+
+
+def test_qa_grilling_last_resort_needs_input_classification_enqueues_onto_project_queue(
+    client, tmp_path, monkeypatch
+):
+    """Issue #191: QA-grilling's own last-resort needs-input check
+    (`_maybe_extract_needs_input_qa`, issue #178) now also enqueues a
+    positively-classified turn, tagged with the ORIGINATING implementing
+    session's own card id (the QA handoff turn ran on that same card) and
+    phase `"qa_grilling"`."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _qa_tracker(cwd)
+
+    wrapup_text = _QA_BLOCK + "\n\nEverything checks out, no further QA questions."
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(wrapup_text, session_id="qa-session-id")]))
+
+    async def fake_classify(card_id, conn_arg, text, phase, *, http_post=None):
+        return {"needs_input": True, "reason": "Still worth a follow-up check."}
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+    monkeypatch.setattr(session_runner, "rescue_qa_response", lambda raw_text: None)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implementing",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    )
+
+    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    queue = parser_session.get_needs_input_queue(project_id)
+    assert queue == [{"project_id": project_id, "card_id": row_id, "phase": "qa_grilling", "text": wrapup_text}]
+
+
+def test_implementing_needs_input_classification_enqueues_onto_project_queue(client, tmp_path, monkeypatch):
+    """Issue #191: implementing's own needs-input classification
+    (`_finish_implement_turn`, issue #179) now also enqueues a
+    positively-classified turn, tagged with this session's own card id and
+    phase `"implementing"`."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    prose = "I went ahead with the OAuth approach, but I'd like you to confirm before I touch the schema."
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(prose, session_id="impl-stall1")]))
+
+    async def fake_classify(card_id, conn_arg, text, phase, *, http_post=None):
+        return {"needs_input": True, "reason": "Asked for confirmation before a schema change."}
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    queue = parser_session.get_needs_input_queue(project_id)
+    assert queue == [{"project_id": project_id, "card_id": row_id, "phase": "implementing", "text": prose}]
+
+
+def test_creating_prd_needs_input_classification_enqueues_onto_project_queue(client, tmp_path, monkeypatch):
+    """Issue #191: the /to-prd, /to-issues chain's own needs-input
+    classification (`_run_chain_step`, issue #177) now also enqueues a
+    positively-classified turn, tagged with this session's own card id and
+    phase `"creating_prd"`."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def handler(prompt, **kw):
+        if prompt == "/rhubarb:do a feature":
+            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
+        if prompt == "/rhubarb:to-prd":
+            return iter([_result_event("Wrote PRD draft, but scope is unclear.")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
+
+    def reply_handler():
+        # Stands in for the live process's response once a human has
+        # replied through the generic stall-reply panel -- see
+        # `_await_stalled_reply`. This test only cares that the ORIGINAL
+        # turn got enqueued; it doesn't drive the chain any further.
+        return [_result_event("Understood, using Postgres for scope.")]
+
+    _mock_engine(monkeypatch, handler, reply_handler=reply_handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    async def fake_classify(card_id, conn_arg, text, phase, *, http_post=None):
+        if phase == "creating_prd":
+            return {"needs_input": True, "reason": "Scope is ambiguous."}
+        return None
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+
+    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
+    queue = parser_session.get_needs_input_queue(project_id)
+    assert queue == [
+        {
+            "project_id": project_id,
+            "card_id": row_id,
+            "phase": "creating_prd",
+            "text": "Wrote PRD draft, but scope is unclear.",
+        }
+    ]
+
+
+def test_parallel_per_issue_implement_sessions_enqueue_in_fifo_order_under_the_same_project(
+    client, tmp_path, monkeypatch
+):
+    """`/implement`'s parallel mode runs one independent PtyEngine tab per
+    PRD, all under the same project -- both must flow through the exact same
+    `_finish_implement_turn` -> `handle_turn_completed` tail a single
+    implement session does, enqueueing onto the SAME project's queue, in the
+    order each turn actually finished, with no loss."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def handler(prompt, **kw):
+        if prompt == "/rhubarb:implement prd: 5":
+            return iter([_result_event("Confirm before touching schema for PRD 5.", session_id="impl-5")])
+        if prompt == "/rhubarb:implement prd: 6":
+            return iter([_result_event("Confirm before touching schema for PRD 6.", session_id="impl-6")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
+
+    _mock_engine(monkeypatch, handler)
+
+    async def fake_classify(card_id, conn_arg, text, phase, *, http_post=None):
+        return {"needs_input": True, "reason": "Needs schema confirmation."}
+
+    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
+
+    conn = db.get_connection()
+    row_5 = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "A"}},
+    )
+    row_6 = db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 6, "title": "B"}},
+    )
+
+    async def _both():
+        await session_runner.start_implement_job(row_5, 5, cwd=cwd)
+        await session_runner.start_implement_job(row_6, 6, cwd=cwd)
+
+    asyncio.run(_both())
+
+    queue = parser_session.get_needs_input_queue(project_id)
+    assert [item["card_id"] for item in queue] == [row_5, row_6]
+    assert [item["phase"] for item in queue] == ["implementing", "implementing"]
+    assert queue[0]["text"] == "Confirm before touching schema for PRD 5."
+    assert queue[1]["text"] == "Confirm before touching schema for PRD 6."

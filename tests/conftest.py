@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from rhubarb import afk_loop, db, live_stream, ollama_rescue, session_runner
+from rhubarb import afk_loop, db, live_stream, ollama_rescue, parser_session, session_runner, stream_json_engine
 from rhubarb.web import app as app_module
 
 
@@ -72,6 +72,33 @@ def _isolated_standby_stream_json_engines(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_parser_sessions(monkeypatch):
+    """Same story again, but for the persistent-per-project parser-session
+    registry (issue #189) -- project ids also restart at 1 in every test's
+    fresh tmp db, so a leftover (fake) parser session from one test must
+    never be handed to an unrelated test's identically-numbered project."""
+    monkeypatch.setattr(parser_session, "_parser_sessions", {})
+    monkeypatch.setattr(parser_session, "_locks", {})
+    # Also reset issue #190's per-project tracked context-usage fraction --
+    # same "process-lifetime, project-id-keyed" state as the registry above,
+    # so a leftover reading from one test can never be seen by an unrelated
+    # test's identically-numbered project.
+    monkeypatch.setattr(parser_session, "_context_pct", {})
+
+
+@pytest.fixture(autouse=True)
+def _isolated_needs_input_queues(monkeypatch):
+    """Same story again, but for the per-project needs-input FIFO queue
+    (issue #191) -- project ids also restart at 1 in every test's fresh tmp
+    db, so a leftover queued item from one test must never be handed to an
+    unrelated test's identically-numbered project."""
+    monkeypatch.setattr(parser_session, "_needs_input_queues", {})
+    # Also reset issue #192's per-project accumulated tagged-parse-result
+    # list -- same reasoning as the queue itself above.
+    monkeypatch.setattr(parser_session, "_parsed_results", {})
+
+
+@pytest.fixture(autouse=True)
 def _isolated_afk_loop(monkeypatch):
     """Same story again, but for the AFK loop's per-project idle clock and
     its per-project undismissed-notification queue."""
@@ -84,6 +111,104 @@ def _isolated_error_notifications(monkeypatch):
     """Same story again, but for session_runner's per-project undismissed
     background-session-error notification queue."""
     monkeypatch.setattr(session_runner, "_error_notifications", {})
+
+
+@pytest.fixture(autouse=True)
+def _parser_session_engine_is_a_fake_by_default(monkeypatch):
+    """`rhubarb.web.app.open_project` fire-and-forgets a per-project
+    parser-session warm on every project open
+    (`parser_session.ensure_parser_session`, issue #189). Unlike
+    `session_runner.py`'s own `PtyEngine`/`StreamJsonEngine` names (which
+    plenty of existing tests already monkeypatch via `_mock_engine`),
+    `parser_session.py` imports the real `StreamJsonEngine` directly under
+    its own name -- so left unpatched, EVERY existing test that opens a
+    project (the overwhelming majority of tests/test_sessions.py and
+    tests/test_app.py, via `_open_project`) would attempt to spawn a REAL
+    `claude` subprocess in the background on every single run: slow, flaky,
+    and a genuinely unwanted side effect on whatever machine runs the suite.
+
+    Defaults every test to a fake `StreamJsonEngine` that never spawns a
+    real process; `tests/test_parser_session.py` (the tests that actually
+    want to exercise this path) overrides this stub with its own fake/
+    injected-backend engine, using the same `monkeypatch` fixture instance
+    this autouse fixture already used, so it simply wins for the rest of
+    that one test -- same pattern as `_ollama_unreachable_by_default` below
+    and test_sessions.py's own `_classify_needs_input_is_a_no_op_by_default`."""
+
+    class _NoopParserEngine:
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+            self.cwd = cwd
+            self.model = model
+            self.effort = effort
+            self.session_id = resume_session_id
+            self._alive = False
+
+        def start(self):
+            self._alive = True
+            return self
+
+        def close(self):
+            self._alive = False
+
+        def isalive(self):
+            return self._alive
+
+        async def stream_turn(self, prompt):
+            raise AssertionError(
+                "stream_turn must not be called on the default no-op parser-session "
+                "fake -- this test needs its own fake/injected StreamJsonEngine if it "
+                "actually drives a parser-session turn"
+            )
+            yield  # pragma: no cover -- makes this an async generator function
+
+    monkeypatch.setattr(parser_session, "StreamJsonEngine", _NoopParserEngine)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_stream_json_subprocess_spawns_by_default(monkeypatch):
+    """`rhubarb.web.app.open_project` ALSO fire-and-forgets a pre-warmed
+    STANDBY `StreamJsonEngine` on every open (`ensure_standby_stream_json_
+    engine`, pre-existing since issue #184, unrelated to issue #189's own
+    parser-session addition above) -- and, unlike `PtyEngine`/
+    `StreamJsonEngine`-level mocking via `_mock_engine`, a handful of
+    existing tests never mock that class at all (e.g.
+    `test_pty_tab_count_lists_resident_and_standby_engines_with_model_
+    effort`, and the argv-capturing tests that intentionally leave the real
+    class in place -- `_capture_real_stream_json_spawns`). On a machine
+    where `claude` is genuinely installed on PATH (true for a real dev
+    machine, not just a minimal CI image), those tests were relying on an
+    unguarded real OS subprocess spawn LOSING a race against their own
+    synchronous assertions to pass -- not a guarantee, and adding any other
+    concurrent background task (such as issue #189's own parser-session
+    warm, scheduled from the very same `open_project` call) can easily tip
+    that race the other way.
+
+    Defaults every test's real spawn seam (`stream_json_engine.
+    _spawn_subprocess`, the one place every non-test `StreamJsonEngine`
+    resolves its `process_factory` through when none is injected) to an
+    inert fake that never touches the OS. `_capture_real_stream_json_
+    spawns` (`tests/test_sessions.py`) already explicitly overrides this
+    exact same seam via its own `monkeypatch.setattr` call, which simply
+    wins for the rest of that one test -- same override pattern as
+    `_ollama_unreachable_by_default` below."""
+
+    class _InertStreamJsonBackend:
+        def write_line(self, line):
+            pass
+
+        def read_line(self):
+            raise EOFError
+
+        def is_alive(self):
+            return False
+
+        def terminate(self, force=False):
+            pass
+
+    def _inert_spawn_subprocess(argv, *, cwd, env):
+        return _InertStreamJsonBackend()
+
+    monkeypatch.setattr(stream_json_engine, "_spawn_subprocess", _inert_spawn_subprocess)
 
 
 @pytest.fixture(autouse=True)

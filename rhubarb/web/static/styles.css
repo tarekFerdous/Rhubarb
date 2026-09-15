@@ -1010,3 +1010,125 @@ textarea.prompt-box:focus {
   width: auto;
   flex: 1;
 }
+
+/* Toast notification stack (issue #188, slice of PRD #187) -- fixed
+   bottom-right, layered above the .split layout and above every
+   .modal-overlay (z-index 10) so a toast stays visible even while a modal is
+   open. Only the first TOAST_VISIBLE_CAP toasts (see prompt.html) ever
+   render as full cards here; anything beyond that collapses into the
+   .toast-overflow "+N more" pill instead of being dropped. The stack itself
+   never captures clicks (pointer-events: none) so it doesn't block the page
+   underneath in the gaps between toasts -- only the toast/pill elements
+   re-enable pointer-events. */
+.toast-stack {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(320px, calc(100vw - 40px));
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  backdrop-filter: blur(16px) saturate(1.4);
+  -webkit-backdrop-filter: blur(16px) saturate(1.4);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  cursor: pointer;
+  animation: toast-in 0.15s ease;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Same two-variant distinction pattern used elsewhere in this file --
+   .toast-normal borrows the accent (--glass-bg/--glass-border) used by
+   .glass-btn/.implementing-banner, .toast-failure borrows the error red
+   already used by .session-error/.session-card-dot-error, so a failure
+   toast reads as "degraded" the same way an error already does everywhere
+   else in the UI. */
+.toast-normal {
+  border-color: var(--glass-border);
+}
+
+.toast-failure {
+  border-color: rgba(220, 38, 38, 0.5);
+}
+
+.toast-icon {
+  flex: 0 0 auto;
+  font-size: 0.9rem;
+  line-height: 1;
+}
+
+.toast-normal .toast-icon {
+  color: var(--glass-bg);
+}
+
+.toast-failure .toast-icon {
+  color: #dc2626;
+}
+
+.toast-message {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.85rem;
+  line-height: 1.35;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+
+.toast-close {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: var(--fg-muted);
+  font-size: 1rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.toast-close:hover {
+  background: rgba(127, 127, 127, 0.15);
+  color: var(--fg);
+}
+
+.toast-overflow {
+  cursor: default;
+  justify-content: center;
+  font-size: 0.78rem;
+  color: var(--fg-muted);
+  padding: 8px 14px;
+}
+
+/* Manual test hook button (issue #188 debug) -- third button in the same
+   top-right row as #settings-gear (right: 24px) and
+   #preview-question-file-btn (right: 68px). */
+#toast-debug-btn {
+  right: 112px;
+  font-size: 0.95rem;
+}

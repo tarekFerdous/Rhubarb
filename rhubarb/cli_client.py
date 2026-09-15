@@ -38,10 +38,33 @@ def _effort_args(effort: str | None) -> list[str]:
     return ["--effort", effort]
 
 
+# Set to True by app.py when a Headroom proxy is running and claude
+# subprocess traffic should be routed through it (issue #200).
+# `_clean_env` reads this flag to add ANTHROPIC_BASE_URL when needed.
+# Always False until app.py explicitly activates it -- no Headroom by default.
+_headroom_proxy_active: bool = False
+_HEADROOM_BASE_URL = "http://localhost:8080"
+
+
+def set_headroom_proxy_active(active: bool) -> None:
+    """Called by app.py when the Headroom proxy process starts or stops."""
+    global _headroom_proxy_active
+    _headroom_proxy_active = active
+
+
 def _clean_env() -> dict:
     env = os.environ.copy()
+    # Always strip these so the subprocess uses the subscription login, not
+    # an API key -- this must happen regardless of Headroom's state.
     env.pop("ANTHROPIC_API_KEY", None)
     env.pop("ANTHROPIC_AUTH_TOKEN", None)
+    # Route traffic through the local Headroom proxy when it's active.
+    # When not active, ensure any ambient ANTHROPIC_BASE_URL in the parent
+    # environment is not passed through either.
+    if _headroom_proxy_active:
+        env["ANTHROPIC_BASE_URL"] = _HEADROOM_BASE_URL
+    else:
+        env.pop("ANTHROPIC_BASE_URL", None)
     return env
 
 

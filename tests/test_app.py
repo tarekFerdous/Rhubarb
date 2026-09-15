@@ -1,7 +1,7 @@
 import json
 import subprocess
 
-from rhubarb import afk_loop, db, error_log, ollama_installer, session_runner
+from rhubarb import afk_loop, caveman_installer, db, error_log, ollama_installer, session_runner
 from rhubarb.web import app as app_module
 
 
@@ -234,6 +234,13 @@ def _open_project(client, tmp_path, name):
     client.post("/api/settings/root-dir", json={"root_dir": str(root)})
     project_id = client.get("/api/app-state").json()["projects"][0]["id"]
     client.post(f"/api/projects/{project_id}/open")
+    # See `tests/test_sessions.py`'s identical `_open_project` helper for why:
+    # `open_project` fire-and-forgets its own standby-`StreamJsonEngine`
+    # pre-warm (issue #136/#184), whose background completion timing is not
+    # guaranteed relative to this helper returning -- clear it here so every
+    # test in this file starts from a deterministic, known-empty registry
+    # rather than whatever that ambient pre-warm happened to leave behind.
+    session_runner._standby_stream_json_engines.clear()
     return project_id
 
 
@@ -1164,3 +1171,95 @@ def test_stall_reply_endpoint_resumes_an_implement_session_via_a_new_turn_instea
 def _cwd_for(project_id):
     conn = db.get_connection()
     return db.get_project(conn, project_id)["path"]
+
+
+# ---------------------------------------------------------------------------
+# Caveman consent/install gate (issue #201)
+# ---------------------------------------------------------------------------
+
+
+def test_caveman_status_reports_presence_and_declined_state(client, monkeypatch):
+    monkeypatch.setattr(caveman_installer, "check_caveman_presence", lambda: caveman_installer.PRESENCE_NOT_PRESENT)
+
+    data = client.get("/api/caveman-status").json()
+
+    assert data == {"presence": "not_present", "declined": False}
+
+
+def test_set_caveman_declined_persists_and_reflects_in_status(client, monkeypatch):
+    monkeypatch.setattr(caveman_installer, "check_caveman_presence", lambda: caveman_installer.PRESENCE_PRESENT)
+    # disable_caveman is called when declining; stub it out to avoid real subprocess
+    monkeypatch.setattr(caveman_installer, "disable_caveman", lambda: None)
+
+    resp = client.post("/api/settings/caveman-declined", json={"caveman_declined": True})
+    assert resp.json() == {"caveman_declined": True}
+    assert client.get("/api/caveman-status").json()["declined"] is True
+
+    resp = client.post("/api/settings/caveman-declined", json={"caveman_declined": False})
+    assert resp.json() == {"caveman_declined": False}
+    assert client.get("/api/caveman-status").json()["declined"] is False
+
+
+def test_caveman_install_is_a_noop_and_ok_when_already_present(client, monkeypatch):
+    monkeypatch.setattr(caveman_installer, "check_caveman_presence", lambda: caveman_installer.PRESENCE_PRESENT)
+    monkeypatch.setattr(
+        caveman_installer,
+        "install_caveman",
+        lambda: (_ for _ in ()).throw(AssertionError("should not install")),
+    )
+
+    resp = client.post("/api/caveman-install")
+
+    assert resp.json() == {"ok": True}
+
+
+def test_caveman_install_runs_install_when_not_present(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(caveman_installer, "check_caveman_presence", lambda: caveman_installer.PRESENCE_NOT_PRESENT)
+    monkeypatch.setattr(caveman_installer, "install_caveman", lambda: calls.append("install"))
+
+    resp = client.post("/api/caveman-install")
+
+    assert resp.json() == {"ok": True}
+    assert calls == ["install"]
+
+
+def test_caveman_install_reports_the_error_on_failure_instead_of_raising(client, monkeypatch):
+    monkeypatch.setattr(caveman_installer, "check_caveman_presence", lambda: caveman_installer.PRESENCE_NOT_PRESENT)
+
+    def failing_install():
+        raise RuntimeError("npx not found")
+
+    monkeypatch.setattr(caveman_installer, "install_caveman", failing_install)
+
+    resp = client.post("/api/caveman-install")
+
+    assert resp.json() == {"ok": False, "error": "npx not found"}
+
+
+def test_caveman_declined_calls_disable_caveman(client, monkeypatch):
+    """Turning off the toggle (caveman_declined=True) should attempt to remove the skill."""
+    calls = []
+    monkeypatch.setattr(caveman_installer, "check_caveman_presence", lambda: caveman_installer.PRESENCE_PRESENT)
+    monkeypatch.setattr(caveman_installer, "disable_caveman", lambda: calls.append("disable"))
+
+    client.post("/api/settings/caveman-declined", json={"caveman_declined": True})
+
+    assert calls == ["disable"]
+
+
+def test_caveman_declined_disable_failure_is_silent(client, monkeypatch):
+    """A failure in disable_caveman (e.g. not installed) must not cause the
+    endpoint to return an error -- the declined flag still persists."""
+    monkeypatch.setattr(caveman_installer, "check_caveman_presence", lambda: caveman_installer.PRESENCE_NOT_PRESENT)
+
+    def failing_disable():
+        raise RuntimeError("npx skills remove failed")
+
+    monkeypatch.setattr(caveman_installer, "disable_caveman", failing_disable)
+
+    resp = client.post("/api/settings/caveman-declined", json={"caveman_declined": True})
+
+    assert resp.json() == {"caveman_declined": True}
+    conn = db.get_connection()
+    assert db.get_caveman_declined(conn) is True

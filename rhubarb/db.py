@@ -97,6 +97,14 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
         conn.execute(
             "ALTER TABLE settings ADD COLUMN ollama_declined INTEGER NOT NULL DEFAULT 0"
         )
+    if "headroom_declined" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE settings ADD COLUMN headroom_declined INTEGER NOT NULL DEFAULT 0"
+        )
+    if "caveman_declined" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE settings ADD COLUMN caveman_declined INTEGER NOT NULL DEFAULT 0"
+        )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS projects (
@@ -235,6 +243,47 @@ def set_ollama_declined(conn: sqlite3.Connection, value: bool) -> None:
         """
         INSERT INTO settings (id, ollama_declined) VALUES (1, ?)
         ON CONFLICT(id) DO UPDATE SET ollama_declined = excluded.ollama_declined
+        """,
+        (1 if value else 0,),
+    )
+    conn.commit()
+
+
+def get_headroom_declined(conn: sqlite3.Connection) -> bool:
+    """True once the user has explicitly declined the Headroom proxy
+    install (the first-run gate, or later turning the Settings toggle off)
+    -- see issue #200. While true, the install gate is never shown again
+    and `ANTHROPIC_BASE_URL` is never injected into subprocess environments,
+    even if Headroom happens to already be installed."""
+    row = conn.execute("SELECT headroom_declined FROM settings WHERE id = 1").fetchone()
+    return bool(row["headroom_declined"]) if row else False
+
+
+def set_headroom_declined(conn: sqlite3.Connection, value: bool) -> None:
+    conn.execute(
+        """
+        INSERT INTO settings (id, headroom_declined) VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET headroom_declined = excluded.headroom_declined
+        """,
+        (1 if value else 0,),
+    )
+    conn.commit()
+
+
+def get_caveman_declined(conn: sqlite3.Connection) -> bool:
+    """True once the user has explicitly declined the Caveman skill
+    install (the first-run gate, or later turning the Settings toggle off)
+    -- see issue #201. While true, the install gate is never shown again
+    and the skill is disabled, even if Caveman happens to already be installed."""
+    row = conn.execute("SELECT caveman_declined FROM settings WHERE id = 1").fetchone()
+    return bool(row["caveman_declined"]) if row else False
+
+
+def set_caveman_declined(conn: sqlite3.Connection, value: bool) -> None:
+    conn.execute(
+        """
+        INSERT INTO settings (id, caveman_declined) VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET caveman_declined = excluded.caveman_declined
         """,
         (1 if value else 0,),
     )
