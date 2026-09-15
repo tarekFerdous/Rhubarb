@@ -106,6 +106,7 @@ from rhubarb.ollama_rescue import (
 from rhubarb.pty_engine import PtyEngine, PtyEngineError, PtyEngineUnrecoverableError
 from rhubarb.qa_parser import parse_grilling_response, parse_qa_response
 from rhubarb.question_files import delete_question_file, read_question_file
+from rhubarb.stream_json_engine import StreamJsonEngine, StreamJsonEngineUnrecoverableError
 from rhubarb.stream_translate import translate_event
 
 # Filenames under `.claude/` a skill writes its structured question/blocked
@@ -280,8 +281,17 @@ def close_session(conn, card_id: int) -> None:
     No literal `/clear` turn is sent into the PTY first -- the process is
     destroyed directly, same rationale as `_spawn_fresh_engine`'s docstring:
     the point is to end this conversation for good, not to round-trip a
-    slash command into a process that may itself be mid-turn."""
+    slash command into a process that may itself be mid-turn.
+
+    Issue #184: a grilling card's resident tab is a `StreamJsonEngine`, not
+    a `PtyEngine` -- `_close_stream_json_engine` is called alongside
+    `_close_engine` unconditionally so this one function still closes
+    whichever this card actually has resident, without needing to know
+    which phase/engine it was. Each is a no-op when this card has nothing
+    in that particular registry, so this is exactly as safe as the
+    single-registry version was for every other phase."""
     _close_engine(card_id)
+    _close_stream_json_engine(card_id)
     db.update_session(conn, card_id, phase="closed")
     publish(card_id, {"type": "closed", "card_id": card_id})
 
@@ -382,8 +392,14 @@ def open_pty_tab_count() -> int:
     UI's tab-count indicator next to the "Sessions" label (`GET
     /api/pty-tabs/count` in `rhubarb/web/app.py`); polled rather than
     pushed since it's a global count, not scoped to any one card's SSE
-    stream."""
-    return len(_pty_engines) + len(_standby_engines)
+    stream.
+
+    Issue #184: also counts a grilling card's resident `StreamJsonEngine`
+    tabs (`_stream_json_engines`) and its pre-warmed standby
+    (`_standby_stream_json_engines`) -- both are real, live `claude`
+    processes exactly like their `PtyEngine` counterparts, so the indicator
+    stays meaningful regardless of which engine backs a given card."""
+    return len(_pty_engines) + len(_standby_engines) + len(_stream_json_engines) + len(_standby_stream_json_engines)
 
 
 def list_live_engines() -> list[dict]:
@@ -400,7 +416,11 @@ def list_live_engines() -> list[dict]:
 
     Backs `GET /api/pty-tabs/count`'s additive `"engines"` field -- purely a
     read-only listing for the background-visibility UI; does not stream, or
-    otherwise touch, any engine."""
+    otherwise touch, any engine.
+
+    Issue #184: also includes a grilling card's resident `StreamJsonEngine`
+    tabs and standby, same shape, so this listing stays consistent with
+    `open_pty_tab_count()`'s own extended total."""
     engines = [
         {"card_id": card_id, "model": engine.model, "effort": engine.effort}
         for card_id, engine in _pty_engines.items()
@@ -408,6 +428,14 @@ def list_live_engines() -> list[dict]:
     engines.extend(
         {"card_id": "standby", "model": model, "effort": effort}
         for engine, model, effort in _standby_engines.values()
+    )
+    engines.extend(
+        {"card_id": card_id, "model": engine.model, "effort": engine.effort}
+        for card_id, engine in _stream_json_engines.items()
+    )
+    engines.extend(
+        {"card_id": "standby", "model": model, "effort": effort}
+        for engine, model, effort in _standby_stream_json_engines.values()
     )
     return engines
 
@@ -480,6 +508,291 @@ def _spawn_fresh_engine(*, cwd: str | None, model: str | None, effort: str | Non
     engine = PtyEngine(cwd=cwd, model=model, effort=effort)
     engine.start()
     return engine
+
+
+# ---------------------------------------------------------------------------
+# Stream-json engine wiring, grilling phase ONLY (issue #184, step 2 of PRD
+# #182 -- `gh issue view 182` for full context). Every other phase
+# (creating_prd, creating_issues, implementing, qa, ...) keeps using
+# `PtyEngine`/`_pty_engines`/`_get_or_create_engine`/`_run_turn` above,
+# completely unchanged -- dispatch happens only in `start_session_job` and
+# `continue_session_job` below (the only two entry points that ever run a
+# grilling-phase turn), which check `row["phase"] == "grilling"` and route
+# to this section instead. Everything here mirrors its `PtyEngine`
+# counterpart above by name/shape on purpose, for the same reason issue
+# #183's own docstring gives: tests stay familiar, and a future reader can
+# diff the two sections directly.
+#
+# KNOWN GAP -- deliberate, not an oversight (see issue #184's "explicitly
+# deferred" section): none of this survives a full Rhubarb server restart.
+# `_stream_json_engines`/`_standby_stream_json_engines` are in-memory only,
+# exactly like `_pty_engines`/`_standby_engines` -- but unlike a `PtyEngine`
+# row (which can always be reattached later via `--resume claude_session_id`
+# against a freshly-constructed `PtyEngine`), nothing here has been built to
+# pick a grilling session back up after a restart. If the server restarts
+# mid-grilling, that session is simply lost and the user starts over.
+# Restart-survival for this engine is out of scope for this experiment and
+# left for a future issue.
+# ---------------------------------------------------------------------------
+
+_stream_json_engines: dict[int, StreamJsonEngine] = {}
+
+# Pre-warmed, unclaimed StreamJsonEngine per project (mirrors
+# `_standby_engines`, issue #136, for the new engine) -- so a brand-new
+# session's first (grilling) turn doesn't pay inline spawn latency. Every
+# brand-new session begins in grilling (see `db.create_session`'s own
+# `phase="grilling"` default), so this is the ONLY standby a fresh
+# `/api/session/start` call needs any more -- see `rhubarb/web/app.py`'s
+# `open_project`/`close_project`/`start_session`, which now warm/claim this
+# standby instead of `_standby_engines`.
+_standby_stream_json_engines: dict[int, tuple[StreamJsonEngine, str | None, str | None]] = {}
+
+
+def _get_or_create_stream_json_engine(
+    card_id: int, *, cwd: str | None, model: str | None, effort: str | None, resume_session_id: str | None
+) -> StreamJsonEngine:
+    """Stream-json analogue of `_get_or_create_engine` -- see its docstring
+    for the shared contract (construct+start on first use, reuse thereafter,
+    never recreated per turn)."""
+    engine = _stream_json_engines.get(card_id)
+    if engine is not None:
+        return engine
+    engine = StreamJsonEngine(cwd=cwd, model=model, effort=effort, resume_session_id=resume_session_id)
+    engine.start()
+    _stream_json_engines[card_id] = engine
+    return engine
+
+
+def register_stream_json_engine(card_id: int, engine: StreamJsonEngine) -> None:
+    """Stream-json analogue of `register_engine` -- registers an
+    already-running engine (a claimed standby) as `card_id`'s resident tab."""
+    _stream_json_engines[card_id] = engine
+
+
+def _close_stream_json_engine(card_id: int) -> None:
+    """Stream-json analogue of `_close_engine` -- pop and close this card's
+    resident `StreamJsonEngine`, if any, and drop its turn lock (the same
+    `_turn_locks` registry `_close_engine` itself already pops -- this is
+    genuinely the SAME lock mechanism, just recreated at the same natural
+    "this card's engine incarnation just ended" boundary `_close_engine`
+    already recreates it at)."""
+    engine = _stream_json_engines.pop(card_id, None)
+    if engine is not None:
+        engine.close()
+    _turn_locks.pop(card_id, None)
+
+
+async def ensure_standby_stream_json_engine(
+    project_id: int, *, cwd: str | None, model: str | None, effort: str | None
+) -> None:
+    """Stream-json analogue of `ensure_standby_engine` -- see its docstring
+    for the shared contract."""
+    existing = _standby_stream_json_engines.get(project_id)
+    if existing is not None:
+        engine, standby_model, standby_effort = existing
+        if engine.isalive() and standby_model == model and standby_effort == effort:
+            return
+        engine.close()
+        del _standby_stream_json_engines[project_id]
+
+    engine = await asyncio.to_thread(_spawn_fresh_stream_json_engine, cwd=cwd, model=model, effort=effort)
+    _standby_stream_json_engines[project_id] = (engine, model, effort)
+
+
+def claim_standby_stream_json_engine(
+    project_id: int, *, model: str | None, effort: str | None
+) -> StreamJsonEngine | None:
+    """Stream-json analogue of `claim_standby_engine` -- see its docstring
+    for the shared contract."""
+    existing = _standby_stream_json_engines.pop(project_id, None)
+    if existing is None:
+        return None
+    engine, standby_model, standby_effort = existing
+    if not engine.isalive() or standby_model != model or standby_effort != effort:
+        engine.close()
+        return None
+    return engine
+
+
+def close_standby_stream_json_engine(project_id: int) -> None:
+    """Stream-json analogue of `close_standby_engine` -- see its docstring
+    for the shared contract."""
+    existing = _standby_stream_json_engines.pop(project_id, None)
+    if existing is not None:
+        existing[0].close()
+
+
+def _spawn_fresh_stream_json_engine(*, cwd: str | None, model: str | None, effort: str | None) -> StreamJsonEngine:
+    """Stream-json analogue of `_spawn_fresh_engine` -- a genuinely fresh
+    `StreamJsonEngine`, no `resume_session_id`. Blocking (real spawn is a
+    subprocess call) -- callers run this via `asyncio.to_thread`."""
+    engine = StreamJsonEngine(cwd=cwd, model=model, effort=effort)
+    engine.start()
+    return engine
+
+
+async def _run_grilling_stream_json_turn(
+    card_id: int,
+    prompt: str,
+    *,
+    session_id: str | None,
+    cwd: str | None,
+    model: str | None,
+    effort: str | None,
+) -> dict | None:
+    """Stream-json analogue of `_run_turn` (see its docstring for the full
+    shared contract), used ONLY for a grilling card's turns. Runs one turn
+    against this card's resident `StreamJsonEngine`
+    (`_get_or_create_stream_json_engine`), guarded by the EXACT SAME
+    per-card turn lock `_run_turn` itself uses (`_get_turn_lock`, unmodified
+    -- see issue #184's explicit "reuse the turn lock as-is" requirement) --
+    so a second write for the same `card_id` while a grilling turn is in
+    flight produces the identical "Another turn for this session is already
+    in progress" error a `PtyEngine`-backed card's `_run_turn` would
+    produce, via the same lock. Returns `None` (having already published
+    that error itself, same contract as `_run_turn`) when the lock was
+    already held.
+
+    Every raw event `StreamJsonEngine.stream_turn` yields is translated via
+    the same `stream_translate.translate_event()` `_run_turn` uses and
+    published on this card's stream via the same `publish()` call, except
+    the translated `turn` (`result`) event, which is returned to the caller
+    instead (same "boundary marker" contract as `_run_turn`).
+
+    Any turn failure -- including `StreamJsonEngineUnrecoverableError`
+    (this engine's own internal crash-retry-once, see `stream_json_engine
+    .py`, already gave up) -- is folded into a plain `ClaudeCLIError`,
+    UNLIKE `_run_turn`'s special-cased `PtyEngineUnrecoverableError`
+    routing to the generic "blocked, reply to retry" flow
+    (`_route_crash_to_blocked`): `StreamJsonEngine` exposes no raw
+    keystroke `write()`/`stream_reply()` passthrough for a human to nudge a
+    dead subprocess back to life the way `PtyEngine` does, so there is
+    nothing a "blocked" UI could usefully resume into here -- a plain error
+    turn (which the frontend already shows a retry affordance for) is the
+    honest outcome instead."""
+    lock = _get_turn_lock(card_id)
+    if lock.locked():
+        lookup_conn = db.get_connection()
+        lookup_row = db.get_session(lookup_conn, card_id)
+        publish(
+            card_id,
+            _turn_event(
+                phase="grilling",
+                error="Another turn for this session is already in progress -- please wait for it to finish.",
+                needs_github_login=False,
+                card_id=card_id,
+                project_id=lookup_row["project_id"] if lookup_row is not None else None,
+            ),
+        )
+        return None
+
+    async with lock:
+        holder: dict = {}
+
+        async def runner():
+            engine = _get_or_create_stream_json_engine(
+                card_id, cwd=cwd, model=model, effort=effort, resume_session_id=session_id
+            )
+            async for raw_event in engine.stream_turn(prompt):
+                translated = translate_event(raw_event)
+                if translated is None:
+                    continue
+                if translated["type"] == "turn":
+                    translated["context_pct"] = _context_window_pct(raw_event)
+                    holder["turn"] = translated
+                    continue
+                publish(card_id, translated)
+
+        try:
+            await runner()
+        except Exception as e:
+            holder["error"] = ClaudeCLIError(str(e))
+
+        if "error" in holder:
+            raise holder["error"]
+        return holder["turn"]
+
+
+async def _run_grilling_turn_stream_json(
+    card_id: int,
+    conn,
+    row,
+    prompt: str,
+    *,
+    cwd: str | None,
+    model: str | None,
+    effort: str | None,
+    publish_when_empty: bool = False,
+) -> dict | None:
+    """Stream-json analogue of `_run_grilling_turn`, for a grilling card
+    dispatched to the new engine (issue #184). Mirrors that function's
+    publish/persist contract exactly (`turn` event shape, DB fields,
+    `publish_when_empty` semantics, return value) but its question-parsing
+    is deliberately much simpler: `qa_parser.parse_grilling_response` is
+    called directly on the completed turn's own `result` text, with NO
+    `.claude/rhubarb_question.md` file-preference read/delete and NO Ollama
+    rescue-classifier fallback, and NO corrective-retry follow-up turn.
+
+    That whole file-preference/rescue/corrective-retry chain
+    (`_run_grilling_turn`/`_run_grilling_corrective_retry`
+    /`_maybe_extract_needs_input_grilling`) exists specifically to
+    compensate for `PtyEngine`'s PTY-rendering/capture-timing unreliability
+    -- word-wrap, ANSI cursor-movement redraws, a file write racing a
+    terminal read. None of that applies here: `StreamJsonEngine`'s `result`
+    event text comes straight from the CLI's own structured stream-json
+    output, not a scraped/rendered terminal buffer, so there is nothing for
+    that compensation mechanism to compensate for -- see the issue's
+    acceptance criteria: a grilling card under this engine must NOT touch
+    the question file or invoke the Ollama rescue path. That existing
+    chain is left completely untouched and still fully exercised by every
+    other phase that has its own equivalent (`_QA_QUESTION_FILE`,
+    `_IMPLEMENT_BLOCKED_FILE`)."""
+    publish(card_id, {"type": "phase", "phase": "grilling"})
+
+    try:
+        turn = await _run_grilling_stream_json_turn(
+            card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort
+        )
+    except ClaudeCLIError as e:
+        _close_stream_json_engine(card_id)
+        message = str(e)
+        db.update_session(conn, card_id, model=model, effort=effort, error_text=message, needs_github_login=0)
+        publish(
+            card_id,
+            _turn_event(
+                phase="grilling",
+                error=message,
+                needs_github_login=False,
+                card_id=card_id,
+                project_id=row["project_id"],
+            ),
+        )
+        return None
+
+    if turn is None:
+        # Issue #144/#149: a genuine turn for this card_id is already in
+        # flight -- `_run_grilling_stream_json_turn` already published the
+        # duplicate-call error itself; nothing more to do here.
+        return None
+
+    parsed = parse_grilling_response(turn["result"])
+    console_text = row["console_text"] + "\n\n" + turn["result"] if row["console_text"] else turn["result"]
+
+    db.update_session(
+        conn,
+        card_id,
+        model=model,
+        effort=effort,
+        claude_session_id=turn["session_id"],
+        console_text=console_text,
+        interview_json=json.dumps(parsed),
+        context_pct=turn.get("context_pct"),
+    )
+
+    if parsed["questions"] or publish_when_empty:
+        publish(card_id, _turn_event(phase="grilling", interview=parsed))
+
+    return parsed if parsed["questions"] else None
 
 
 async def _maybe_clear_for_next_phase(card_id: int, conn, row, *, cwd: str | None, cutoff: float) -> str:
@@ -1578,7 +1891,18 @@ async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
     auto-/clear and pool the session. Uses the model already recorded on the
     row (set back when the session started grilling) -- this is a
     continuation of that same session, not a fresh one, so the configured
-    model is not re-read here even if it's changed since."""
+    model is not re-read here even if it's changed since.
+
+    Issue #184: grilling itself just ended for good -- this card's resident
+    `StreamJsonEngine` (if any; a card that finished grilling with zero
+    questions on its very first turn never had one) is closed here, before
+    `_run_chain_step` below runs `/rhubarb:to-prd` through the ordinary,
+    unmodified `PtyEngine` path (`_get_or_create_engine`), which reattaches
+    via `--resume` at this row's `claude_session_id` -- the real session id
+    the stream-json engine's own `result` event handed back, same as any
+    other reattach. Every phase from here on is `PtyEngine`-driven again,
+    completely unchanged."""
+    _close_stream_json_engine(card_id)
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
     model = row["model"]
@@ -1616,10 +1940,27 @@ async def start_session_job(card_id: int, prompt: str, *, cwd: str | None) -> No
     value captured before this task was scheduled) picks up a same-session
     override made via `POST /api/session/{card_id}/effort` in the brief
     window between the row's creation and this task actually running --
-    exactly the "still no turns sent yet" case that should apply immediately."""
+    exactly the "still no turns sent yet" case that should apply immediately.
+
+    Issue #184: dispatches by phase. `db.create_session` defaults every
+    brand-new row's `phase` to `"grilling"`, and this function only ever
+    runs on a session's very first turn -- so in practice `row["phase"]` is
+    always `"grilling"` here. The check is kept explicit anyway (rather than
+    assuming it) per the issue's "dispatch by phase, not globally"
+    requirement: a grilling-phase row goes through the new
+    `StreamJsonEngine` path (`_run_grilling_turn_stream_json`); anything
+    else -- which should not normally happen here, but is handled safely
+    rather than assumed impossible -- falls back to the original,
+    completely unmodified `PtyEngine` path (`_run_grilling_turn`)."""
     conn = db.get_connection()
     model = db.get_model(conn)
     row = db.get_session(conn, card_id)
+    if row is not None and row["phase"] == "grilling":
+        await _run_grilling_turn_stream_json(
+            card_id, conn, row, f"/rhubarb:do {prompt}", cwd=cwd, model=model, effort=row["effort"],
+            publish_when_empty=True,
+        )
+        return
     await _run_grilling_turn(
         card_id, conn, row, f"/rhubarb:do {prompt}", cwd=cwd, model=model, effort=row["effort"], publish_when_empty=True
     )
@@ -1645,15 +1986,35 @@ async def continue_session_job(card_id: int, reply: str, *, cwd: str | None, con
     Either way, this is the round being answered -- delete its
     `.claude/rhubarb_question.md` (PRD #123) if one is still there, now that
     it's served its purpose, before the next turn (which writes a fresh one
-    of its own if it has another round to ask)."""
-    delete_question_file(cwd, _GRILLING_QUESTION_FILE)
+    of its own if it has another round to ask).
+
+    Issue #184: a grilling card dispatched to the new `StreamJsonEngine`
+    never writes that file in the first place (see
+    `_run_grilling_turn_stream_json`'s docstring) -- so for that card, the
+    `delete_question_file` call above is skipped entirely, not just
+    harmlessly redundant, per the issue's explicit "must NOT touch
+    `.claude/rhubarb_question.md`" acceptance criterion. `row` is fetched
+    up front (rather than only in the non-`confirm_advance` branch, as
+    before) so that phase check can happen before deciding whether to make
+    that call at all; this is a pure read with no side effects, so it
+    changes nothing about the `PtyEngine` path's own behavior below."""
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    is_new_engine_grilling = row is not None and row["phase"] == "grilling"
+
+    if not is_new_engine_grilling:
+        delete_question_file(cwd, _GRILLING_QUESTION_FILE)
 
     if confirm_advance:
         await advance_past_grilling(card_id, cwd)
         return
 
-    conn = db.get_connection()
-    row = db.get_session(conn, card_id)
+    if is_new_engine_grilling:
+        await _run_grilling_turn_stream_json(
+            card_id, conn, row, reply, cwd=cwd, model=row["model"], effort=row["effort"], publish_when_empty=True
+        )
+        return
+
     await _run_grilling_turn(
         card_id, conn, row, reply, cwd=cwd, model=row["model"], effort=row["effort"], publish_when_empty=True
     )

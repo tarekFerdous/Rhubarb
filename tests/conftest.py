@@ -55,6 +55,23 @@ def _isolated_standby_engines(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolated_stream_json_engines(monkeypatch):
+    """Same story again, but for the resident StreamJsonEngine-per-card_id
+    registry a grilling card now uses (issue #184) -- mirrors
+    `_isolated_pty_engines` above exactly, for the same reason."""
+    monkeypatch.setattr(session_runner, "_stream_json_engines", {})
+
+
+@pytest.fixture(autouse=True)
+def _isolated_standby_stream_json_engines(monkeypatch):
+    """Same story again, but for the pre-warmed standby-StreamJsonEngine-
+    per-project registry a brand-new (grilling-phase) session now claims
+    from (issue #184) -- mirrors `_isolated_standby_engines` above exactly,
+    for the same reason."""
+    monkeypatch.setattr(session_runner, "_standby_stream_json_engines", {})
+
+
+@pytest.fixture(autouse=True)
 def _isolated_afk_loop(monkeypatch):
     """Same story again, but for the AFK loop's per-project idle clock and
     its per-project undismissed-notification queue."""

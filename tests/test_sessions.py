@@ -5,10 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from rhubarb import db, error_log, live_stream, pty_engine, session_runner
+from rhubarb import db, error_log, live_stream, pty_engine, session_runner, stream_json_engine
 from rhubarb.cli_client import ClaudeCLIError
 from rhubarb.github_publisher import GithubPublishError
 from rhubarb.pty_engine import PtyEngineUnrecoverableError
+from rhubarb.qa_parser import parse_grilling_response
+from rhubarb.stream_json_engine import StreamJsonEngineUnrecoverableError
 from rhubarb.web import app as app_module
 
 # Captured at collection time, before any test's `monkeypatch` fixture ever
@@ -105,6 +107,17 @@ def _make_fake_engine_class(handler, *, fresh_ids=None, reply_handler=None):
     for the equivalent fake-backend style one level down (the real PTY
     backend, rather than the engine built on top of it).
 
+    Issue #184: this same fake class is ALSO used (via `_mock_engine`, see
+    below) as the stand-in for `session_runner.StreamJsonEngine` -- a
+    grilling card's turns now dispatch to that engine instead, and its
+    public shape (`__init__` kwargs, `start`/`close`/`isalive`/`stream_turn`)
+    is identical for the purposes every existing test here already cares
+    about. `session_id` is exposed as an alias for `claude_session_id` (the
+    real `StreamJsonEngine`'s own attribute name) so a test exercising the
+    stream-json standby-claim path (`register_stream_json_engine`, which
+    reads `.session_id`) works against this same fake without needing a
+    second, parallel fake class.
+
     `reply_handler()` (issue #177), if given, stands in for
     `PtyEngine.stream_reply` -- returns an iterable of raw event dicts (same
     shape `handler` returns), simulating the live process's response to a
@@ -188,16 +201,36 @@ def _make_fake_engine_class(handler, *, fresh_ids=None, reply_handler=None):
             for raw in reply_handler():
                 yield raw
 
+        @property
+        def session_id(self):
+            # `StreamJsonEngine`'s own attribute name for the same concept
+            # `claude_session_id` already tracks here -- see this class's
+            # docstring above.
+            return self.claude_session_id
+
     return FakeEngine
 
 
 def _mock_engine(monkeypatch, handler, *, fresh_ids=None, reply_handler=None):
-    """Monkeypatch `session_runner.PtyEngine` with a fake driven by
+    """Monkeypatch BOTH `session_runner.PtyEngine` and
+    `session_runner.StreamJsonEngine` with the SAME fake class driven by
     `handler` -- see `_make_fake_engine_class`. Returns the fake class so a
     test can inspect `.instances` (e.g. to assert an engine was/wasn't
-    reconstructed, or to check constructor args)."""
+    reconstructed, or to check constructor args).
+
+    Issue #184: a grilling card's turns now dispatch to `StreamJsonEngine`
+    instead of `PtyEngine`, while every later phase (creating_prd,
+    creating_issues, implementing, qa, ...) still dispatches to `PtyEngine`
+    exactly as before -- patching both class names in `session_runner`'s own
+    namespace with the same fake means `handler` (and every existing test
+    written against it) doesn't need to know or care which phase's turn
+    it's actually being called for; the fake responds identically either
+    way, exactly like `translate_event()` doesn't care which engine
+    produced a given raw event shape (see `stream_json_engine.py`'s own
+    `test_stream_turn_events_are_compatible_with_translate_event`)."""
     fake_class = _make_fake_engine_class(handler, fresh_ids=fresh_ids, reply_handler=reply_handler)
     monkeypatch.setattr(session_runner, "PtyEngine", fake_class)
+    monkeypatch.setattr(session_runner, "StreamJsonEngine", fake_class)
     return fake_class
 
 
@@ -308,8 +341,14 @@ def test_start_session_job_publishes_terminal_output_events_from_the_pty(client,
 def test_open_pty_tab_count_tracks_tabs_as_sessions_open_and_close(client, tmp_path, monkeypatch):
     """Backs the web UI's tab-count indicator (issue #88):
     `session_runner.open_pty_tab_count()` must accurately reflect how many
-    `PtyEngine` tabs are currently resident as sessions start (opening a
-    tab, one per card_id) and close (dropping it)."""
+    engine tabs are currently resident as sessions start (opening a tab, one
+    per card_id) and close (dropping it).
+
+    Issue #184: both sessions here are grilling-phase, so their resident
+    tabs are `StreamJsonEngine`s, closed via `_close_stream_json_engine`
+    (not the `PtyEngine`-only `_close_engine`) -- `open_pty_tab_count()`
+    itself counts both registries, so the indicator stays accurate either
+    way."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -329,10 +368,10 @@ def test_open_pty_tab_count_tracks_tabs_as_sessions_open_and_close(client, tmp_p
     asyncio.run(session_runner.start_session_job(row_b, "feature B", cwd=cwd))
     assert session_runner.open_pty_tab_count() == 2
 
-    session_runner._close_engine(row_a)
+    session_runner._close_stream_json_engine(row_a)
     assert session_runner.open_pty_tab_count() == 1
 
-    session_runner._close_engine(row_b)
+    session_runner._close_stream_json_engine(row_b)
     assert session_runner.open_pty_tab_count() == 0
 
 
@@ -488,101 +527,23 @@ def _write_question_file(cwd, filename, content):
     (claude_dir / filename).write_text(content, encoding="utf-8")
 
 
-def test_start_session_job_prefers_rhubarb_question_file_over_terminal_text(client, tmp_path, monkeypatch):
-    """PRD #123: a turn whose rendered terminal text would parse to nothing
-    still produces a full interview when `.claude/rhubarb_question.md` is
-    present with valid content -- the file-based path this PRD adds."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-    _write_question_file(
-        cwd, "rhubarb_question.md",
-        'Question 1: "Python or Node?"\nOptions:\nOption 1: "Python"\nOption 2: "Node"\nRecommended: [1]\n',
-    )
-
-    # Terminal text alone has no recognizable Question block -- would parse empty.
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("Working on it, one moment.")]))
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a new feature", cwd=cwd))
-
-    row = db.get_session(conn, row_id)
-    interview = json.loads(row["interview_json"])
-    assert interview["source"] == "regex"
-    assert len(interview["questions"]) == 1
-    assert interview["questions"][0]["options"] == ["Python", "Node"]
-    assert interview["questions"][0]["recommended"] == [1]
-
-
-def test_rhubarb_question_file_is_not_deleted_merely_by_being_read(client, tmp_path, monkeypatch):
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-    _write_question_file(cwd, "rhubarb_question.md", 'Question 1: "Python or Node?"')
-
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("irrelevant terminal text")]))
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a new feature", cwd=cwd))
-
-    assert (Path(cwd) / ".claude" / "rhubarb_question.md").exists()
-
-
-def test_continue_session_job_deletes_rhubarb_question_file_on_reply(client, tmp_path, monkeypatch):
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    def handler(prompt, **kw):
-        return iter([_result_event('Question 1: "A follow-up?"')])
-
-    _mock_engine(monkeypatch, handler)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    _write_question_file(cwd, "rhubarb_question.md", 'Question 1: "First question?"')
-    asyncio.run(session_runner.continue_session_job(row_id, "my answer", cwd=cwd))
-
-    assert not (Path(cwd) / ".claude" / "rhubarb_question.md").exists()
-
-
-def test_confirm_advance_also_deletes_rhubarb_question_file(client, tmp_path, monkeypatch):
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    def handler(prompt, **kw):
-        if prompt in ("/rhubarb:to-prd", "/rhubarb:to-issues"):
-            return iter([_result_event("done")])
-        return iter([_result_event("Thanks, that's everything I need.")])
-
-    _mock_engine(monkeypatch, handler)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    _write_question_file(cwd, "rhubarb_question.md", 'Question 1: "First question?"')
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
-
-    assert not (Path(cwd) / ".claude" / "rhubarb_question.md").exists()
-
-
-def test_malformed_rhubarb_question_file_is_deleted_and_falls_back_to_terminal_text(client, tmp_path, monkeypatch):
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-    _write_question_file(cwd, "rhubarb_question.md", "not a recognizable question format at all")
-
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event('Question 1: "From terminal text"')]))
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a new feature", cwd=cwd))
-
-    row = db.get_session(conn, row_id)
-    interview = json.loads(row["interview_json"])
-    assert interview["questions"][0]["text"] == "From terminal text"
-    assert not (Path(cwd) / ".claude" / "rhubarb_question.md").exists()
+# Issue #184: the five tests that used to live here
+# (`test_start_session_job_prefers_rhubarb_question_file_over_terminal_text`,
+# `test_rhubarb_question_file_is_not_deleted_merely_by_being_read`,
+# `test_continue_session_job_deletes_rhubarb_question_file_on_reply`,
+# `test_confirm_advance_also_deletes_rhubarb_question_file`,
+# `test_malformed_rhubarb_question_file_is_deleted_and_falls_back_to_terminal_text`)
+# covered PRD #123's `.claude/rhubarb_question.md` file-preference mechanism
+# for GRILLING specifically. That mechanism is now dispatched-around for
+# grilling entirely (`_run_grilling_turn_stream_json` never reads or deletes
+# this file -- see its docstring) since grilling no longer runs on
+# `PtyEngine`, whose PTY-rendering/capture-timing unreliability this file
+# existed to compensate for. Removed rather than kept red: the behavior they
+# asserted no longer exists for this phase by design, not by regression. The
+# mechanism itself is untouched and still covered by its `_QA_QUESTION_FILE`/
+# `_IMPLEMENT_BLOCKED_FILE` equivalents elsewhere in this file; a new test
+# below (`test_grilling_turn_under_new_engine_never_touches_the_question_file`)
+# covers the new engine's "must not touch this file" requirement directly.
 
 
 def test_start_session_job_publishes_interview_even_with_no_structured_questions(client, tmp_path, monkeypatch):
@@ -675,545 +636,36 @@ def test_continue_session_job_with_no_more_questions_does_not_auto_advance(clien
 
 
 # ---------------------------------------------------------------------------
-# Ollama rescue-path wiring (issue #114)
+# Issue #184: this whole block (Ollama rescue-path wiring for issue #114,
+# the PRD #158 corrective-retry mechanism, and the issue #178 needs-input
+# classification wired into grilling) used to test roughly 20 scenarios of
+# PtyEngine-specific grilling behavior: the regex parser finding nothing,
+# handing malformed/suspicious terminal text to `rescue_grilling_response`,
+# a one-shot corrective follow-up turn when that also came back empty, and
+# a last-resort Ollama needs-input classification before giving up. All of
+# it existed to compensate for PtyEngine's PTY-rendering/capture-timing
+# unreliability (word-wrap, ANSI cursor-movement redraws) -- see
+# `_run_grilling_turn`'s docstring in session_runner.py.
+#
+# A grilling card now dispatches to `StreamJsonEngine`
+# (`_run_grilling_turn_stream_json`), whose `result` event text comes
+# straight from the CLI's own structured stream-json output, not a
+# scraped/rendered terminal buffer -- there is nothing left for that whole
+# chain to compensate for, and the issue's acceptance criteria explicitly
+# requires grilling under this engine to skip it entirely (no file read, no
+# Ollama rescue call). These tests are removed rather than kept red: the
+# behavior they asserted no longer exists for this phase by design. The
+# mechanism itself (`rescue_grilling_response`, `should_attempt_grilling_rescue`,
+# `classify_needs_input`) is untouched and still fully exercised by its
+# QA/implement equivalents elsewhere in this file
+# (`test_start_implement_job_uses_ollama_rescue_when_qa_regex_parser_finds_nothing`,
+# `test_qa_corrective_retry_fires_once_and_uses_reformatted_result`,
+# `test_qa_needs_input_classification_renders_rich_ui_on_genuine_wrapup`,
+# etc.). New tests below
+# (`test_grilling_turn_under_new_engine_never_touches_the_question_file`,
+# `test_grilling_turn_under_new_engine_skips_ollama_rescue_entirely`) cover
+# the new engine's "must not touch that mechanism" requirement directly.
 # ---------------------------------------------------------------------------
-
-
-def test_grilling_turn_uses_ollama_rescue_when_regex_parser_finds_nothing(client, tmp_path, monkeypatch):
-    """A turn whose text looks like it was trying to contain a question
-    (contains "Question ") but doesn't match the strict regex format must
-    be handed to the Ollama rescue path, and a valid rescue result must be
-    used as the published/persisted interview."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    malformed_text = 'Question 1: The quote never closes, so the regex parser finds nothing here.\n'
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_text)]))
-
-    rescued = {
-        "header": "",
-        "footer": "",
-        "questions": [
-            {
-                "id": "q1",
-                "text": "Rescued question text",
-                "kind": "open",
-                "options": None,
-                "recommended": None,
-                "recommended_text": None,
-            }
-        ],
-    }
-    seen = {}
-
-    def fake_rescue(raw_text):
-        seen["raw_text"] = raw_text
-        return rescued
-
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", fake_rescue)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    assert seen["raw_text"] == malformed_text
-
-    row = db.get_session(conn, row_id)
-    interview = json.loads(row["interview_json"])
-    assert interview == rescued
-
-    events = live_stream._buffers.get(row_id, [])
-    turn_events = [e for e in events if e["type"] == "turn"]
-    assert turn_events[-1]["interview"] == rescued
-
-
-def test_grilling_turn_does_not_use_ollama_rescue_when_regex_parser_already_finds_questions(client, tmp_path, monkeypatch):
-    """The rescue path must never fire when the regex parser already found
-    questions -- it's the fast, free, primary path for the common case."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event('Question 1: "A clean, well-formed question?"')]))
-
-    def fake_rescue(raw_text):
-        raise AssertionError("rescue must not be called when the regex parser already found questions")
-
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", fake_rescue)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    row = db.get_session(conn, row_id)
-    interview = json.loads(row["interview_json"])
-    assert interview["questions"][0]["text"] == "A clean, well-formed question?"
-
-
-def test_grilling_turn_does_not_use_ollama_rescue_on_a_genuine_wrap_up(client, tmp_path, monkeypatch):
-    """A genuine "grilling is done" wrap-up message (no "Question " substring
-    at all) must never trigger a rescue attempt."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("Thanks, that's everything I need.")]))
-
-    def fake_rescue(raw_text):
-        raise AssertionError("rescue must not be called on a genuine wrap-up message")
-
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", fake_rescue)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    row = db.get_session(conn, row_id)
-    interview = json.loads(row["interview_json"])
-    assert interview["questions"] == []
-
-
-def test_grilling_turn_falls_back_to_empty_result_when_ollama_rescue_returns_none(client, tmp_path, monkeypatch):
-    """When Ollama is unavailable/times out/returns something invalid
-    (modeled here as rescue_grilling_response returning None), the turn must
-    not crash. Issue #158: since the raw text still looks like it was
-    trying to contain questions, this no longer just silently falls back to
-    an empty parsed result -- a corrective retry runs, and since (in this
-    test) it comes back equally unparseable, an explicit error is
-    published/persisted instead of a bare empty interview."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    malformed_text = 'Question 1: unterminated, no closing quote\n'
-    calls = []
-
-    def handler(prompt, **kw):
-        calls.append(prompt)
-        return iter([_result_event(malformed_text, session_id=f"s{len(calls)}")])
-
-    _mock_engine(monkeypatch, handler)
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", lambda raw_text: None)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    assert len(calls) == 2
-
-    row = db.get_session(conn, row_id)
-    assert row["error_text"] is not None
-
-
-def test_grilling_turn_skips_ollama_rescue_when_declined(client, tmp_path, monkeypatch):
-    """Issue #119: with `ollama_declined` true, a turn whose regex parse is
-    empty and whose raw text contains the trigger substring must NOT invoke
-    the rescue function -- the toggle must actually gate the rescue call,
-    not just the install-gate modal's own display logic. Issue #158: the
-    decline toggle only gates the Ollama rescue call, not the separate
-    corrective-retry mechanism -- that still fires, and since (in this test)
-    its result is equally unparseable, ends in an explicit error rather
-    than a silently empty interview."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    malformed_text = 'Question 1: The quote never closes, so the regex parser finds nothing here.\n'
-    calls = []
-
-    def handler(prompt, **kw):
-        calls.append(prompt)
-        return iter([_result_event(malformed_text, session_id=f"s{len(calls)}")])
-
-    _mock_engine(monkeypatch, handler)
-
-    def fake_rescue(raw_text):
-        raise AssertionError("rescue must not be called when ollama_declined is true")
-
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", fake_rescue)
-
-    conn = db.get_connection()
-    db.set_ollama_declined(conn, True)
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    assert len(calls) == 2
-
-    row = db.get_session(conn, row_id)
-    assert row["error_text"] is not None
-
-
-def test_grilling_turn_uses_ollama_rescue_when_not_declined(client, tmp_path, monkeypatch):
-    """Issue #119: with `ollama_declined` explicitly false, the rescue call
-    still fires, unchanged from current behavior."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    malformed_text = 'Question 1: The quote never closes, so the regex parser finds nothing here.\n'
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_text)]))
-
-    rescued = {
-        "header": "",
-        "footer": "",
-        "questions": [
-            {
-                "id": "q1",
-                "text": "Rescued question text",
-                "kind": "open",
-                "options": None,
-                "recommended": None,
-                "recommended_text": None,
-            }
-        ],
-    }
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", lambda raw_text: rescued)
-
-    conn = db.get_connection()
-    db.set_ollama_declined(conn, False)
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    row = db.get_session(conn, row_id)
-    interview = json.loads(row["interview_json"])
-    assert interview == rescued
-
-
-# ---------------------------------------------------------------------------
-# Corrective retry for a grilling round that failed to parse (issue #158)
-# ---------------------------------------------------------------------------
-
-
-def test_grilling_turn_corrective_retry_fires_on_suspicious_unparseable_result(client, tmp_path, monkeypatch):
-    """A round whose terminal text looks like it was trying to contain
-    questions (contains "Question "), but which the whole existing fallback
-    chain (file -> terminal text -> Ollama rescue) still fails to parse,
-    must trigger exactly one corrective follow-up turn: the model is handed
-    its own broken output back and asked to reformat it. When that
-    corrective turn comes back parseable, its questions -- not the generic
-    "ready to proceed?" wrap-up -- are what gets published/persisted."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    malformed_text = 'Question 1: the quote never closes, so the regex parser finds nothing here.\n'
-    calls = []
-
-    def handler(prompt, **kw):
-        calls.append(prompt)
-        if "did not parse" in prompt:
-            assert malformed_text in prompt
-            return iter([_result_event('Question 1: "Reformatted question?"', session_id="s2")])
-        return iter([_result_event(malformed_text, session_id="s1")])
-
-    _mock_engine(monkeypatch, handler)
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", lambda raw_text: None)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    assert len(calls) == 2, "expected exactly one corrective retry turn, in addition to the original"
-
-    row = db.get_session(conn, row_id)
-    assert row["error_text"] is None
-    assert row["claude_session_id"] == "s2"
-    interview = json.loads(row["interview_json"])
-    assert interview["questions"][0]["text"] == "Reformatted question?"
-
-    events = live_stream._buffers.get(row_id, [])
-    turn_events = [e for e in events if e["type"] == "turn"]
-    assert len(turn_events) == 1
-    assert turn_events[0]["interview"]["questions"][0]["text"] == "Reformatted question?"
-    assert turn_events[0]["error"] is None
-
-
-def test_grilling_turn_no_corrective_retry_on_a_genuine_wrap_up(client, tmp_path, monkeypatch):
-    """A genuine "grilling is done" wrap-up (no "Question " substring at all,
-    in either the file or the terminal text) must NOT trigger any corrective
-    retry -- it's treated as done, same as before issue #158."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    calls = []
-
-    def handler(prompt, **kw):
-        calls.append(prompt)
-        return iter([_result_event("Thanks, that's everything I need.")])
-
-    _mock_engine(monkeypatch, handler)
-
-    def fail_retry(*args, **kwargs):
-        raise AssertionError("corrective retry must not run on a genuine wrap-up")
-
-    monkeypatch.setattr(session_runner, "_run_grilling_corrective_retry", fail_retry)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    assert len(calls) == 1
-
-    row = db.get_session(conn, row_id)
-    assert row["error_text"] is None
-    interview = json.loads(row["interview_json"])
-    assert interview["questions"] == []
-
-
-def test_grilling_turn_corrective_retry_failure_publishes_explicit_error(client, tmp_path, monkeypatch):
-    """When the corrective retry's own result also fails to parse, the
-    session must stop automatically with an explicit, persisted/published
-    error -- never the generic "ready to proceed?" gate a genuine empty
-    wrap-up would show."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    malformed_text = 'Question 1: still no closing quote here either\n'
-    calls = []
-
-    def handler(prompt, **kw):
-        calls.append(prompt)
-        # Every turn -- original and corrective retry alike -- comes back
-        # equally unparseable.
-        return iter([_result_event(malformed_text, session_id=f"s{len(calls)}")])
-
-    _mock_engine(monkeypatch, handler)
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", lambda raw_text: None)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    assert len(calls) == 2, "must not retry more than once"
-
-    row = db.get_session(conn, row_id)
-    assert row["error_text"] is not None
-    assert "did not" in row["error_text"] or "failed" in row["error_text"]
-    assert row["claude_session_id"] == "s2"
-
-    events = live_stream._buffers.get(row_id, [])
-    turn_events = [e for e in events if e["type"] == "turn"]
-    assert turn_events, "an explicit error turn event must be published"
-    assert turn_events[-1]["error"] == row["error_text"]
-    assert turn_events[-1]["phase"] == "grilling"
-
-
-# ---------------------------------------------------------------------------
-# Ollama needs-input classification wired into grilling (issue #178, child of
-# PRD #174) -- the last-resort check run right before treating a round as a
-# genuine "no more questions" wrap-up, after the existing file/terminal-text/
-# Ollama-rescue chain (and, where attempted, the PRD #157 corrective retry)
-# has already concluded there are no questions.
-# ---------------------------------------------------------------------------
-
-
-def test_grilling_turn_needs_input_classification_renders_rich_ui_on_genuine_wrapup(client, tmp_path, monkeypatch):
-    """A round that looks like a genuine "no more questions" wrap-up (no
-    "Question " trigger at all, so the existing chain never even attempts a
-    corrective retry) must still be handed to the Ollama needs-input
-    classifier before being treated as done. When it says a human's input is
-    still needed, and a second Ollama extraction attempt on the same text
-    actually produces question content, that rich content -- not the plain
-    wrap-up gate -- is what gets published/persisted."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    wrapup_text = "Thanks, that's everything I need."
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(wrapup_text)]))
-
-    rescued = {
-        "header": "",
-        "footer": "",
-        "questions": [
-            {
-                "id": "q1",
-                "text": "Actually, one more thing -- which database?",
-                "kind": "open",
-                "options": None,
-                "recommended": None,
-                "recommended_text": None,
-            }
-        ],
-    }
-    seen = {}
-
-    async def fake_classify(card_id, conn, text, phase, **kw):
-        seen["text"] = text
-        seen["phase"] = phase
-        return {"needs_input": True, "reason": "Still waiting on a database choice."}
-
-    def fake_rescue(raw_text):
-        seen["rescue_raw_text"] = raw_text
-        return rescued
-
-    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", fake_rescue)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    assert seen["text"] == wrapup_text
-    assert seen["phase"] == "grilling"
-    assert seen["rescue_raw_text"] == wrapup_text
-
-    row = db.get_session(conn, row_id)
-    assert row["error_text"] is None
-    interview = json.loads(row["interview_json"])
-    assert interview == rescued
-
-    events = live_stream._buffers.get(row_id, [])
-    turn_events = [e for e in events if e["type"] == "turn"]
-    assert turn_events[-1]["interview"] == rescued
-
-
-def test_grilling_turn_needs_input_classification_false_falls_through_to_wrapup(client, tmp_path, monkeypatch):
-    """A negative classification (no human input actually needed) must fall
-    through to today's unchanged "ready to proceed?" wrap-up -- and must
-    never even attempt the extraction rescue call."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("Thanks, that's everything I need.")]))
-
-    async def fake_classify(card_id, conn, text, phase, **kw):
-        return {"needs_input": False, "reason": "This is a genuine wrap-up."}
-
-    def fake_rescue(raw_text):
-        raise AssertionError("extraction must not be attempted when needs_input is false")
-
-    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", fake_rescue)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    row = db.get_session(conn, row_id)
-    assert row["error_text"] is None
-    interview = json.loads(row["interview_json"])
-    assert interview["questions"] == []
-
-
-def test_grilling_turn_needs_input_declined_or_unavailable_falls_through_to_wrapup(client, tmp_path, monkeypatch):
-    """A declined/unavailable classification (`classify_needs_input` itself
-    already returns `None` for both cases) must fall through to today's
-    unchanged wrap-up, exactly like an explicit negative classification."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("Thanks, that's everything I need.")]))
-
-    async def fake_classify(card_id, conn, text, phase, **kw):
-        return None
-
-    def fake_rescue(raw_text):
-        raise AssertionError("extraction must not be attempted when classification is unavailable")
-
-    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", fake_rescue)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    row = db.get_session(conn, row_id)
-    assert row["error_text"] is None
-    interview = json.loads(row["interview_json"])
-    assert interview["questions"] == []
-
-
-def test_grilling_turn_needs_input_true_but_extraction_fails_falls_through_to_wrapup(client, tmp_path, monkeypatch):
-    """A positive classification whose extraction attempt still comes up
-    empty must fall through to today's unchanged wrap-up -- extraction
-    failing is treated exactly like a negative classification."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("Thanks, that's everything I need.")]))
-
-    async def fake_classify(card_id, conn, text, phase, **kw):
-        return {"needs_input": True, "reason": "Looks unfinished."}
-
-    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", lambda raw_text: None)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    row = db.get_session(conn, row_id)
-    assert row["error_text"] is None
-    interview = json.loads(row["interview_json"])
-    assert interview["questions"] == []
-
-
-def test_grilling_turn_needs_input_classification_rescues_after_corrective_retry_also_failed(
-    client, tmp_path, monkeypatch
-):
-    """Issue #178 explicitly covers this case too: once the PRD #157
-    corrective retry has already run and its own result *also* failed to
-    parse, the needs-input classifier gets one last look at that retry's
-    own text before the session gives up with an explicit error. A positive
-    classification with successfully extracted question content must render
-    the rich question UI instead of that explicit error."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    malformed_text = 'Question 1: the quote never closes, so the regex parser finds nothing here.\n'
-    still_malformed_retry_text = 'Question 1: still no closing quote after the retry either\n'
-    calls = []
-
-    def handler(prompt, **kw):
-        calls.append(prompt)
-        if "did not parse" in prompt:
-            return iter([_result_event(still_malformed_retry_text, session_id="s2")])
-        return iter([_result_event(malformed_text, session_id="s1")])
-
-    _mock_engine(monkeypatch, handler)
-
-    rescued = {
-        "header": "",
-        "footer": "",
-        "questions": [
-            {
-                "id": "q1",
-                "text": "Extracted after the retry failed to parse too",
-                "kind": "open",
-                "options": None,
-                "recommended": None,
-                "recommended_text": None,
-            }
-        ],
-    }
-
-    def fake_rescue(raw_text):
-        # The existing chain's own rescue attempt (on the original malformed
-        # text) must still come back empty -- otherwise the corrective retry
-        # would never fire in the first place. Only the new issue #178
-        # extraction attempt, on the retry's own text, succeeds.
-        if raw_text == still_malformed_retry_text:
-            return rescued
-        return None
-
-    async def fake_classify(card_id, conn, text, phase, **kw):
-        assert text == still_malformed_retry_text
-        assert phase == "grilling"
-        return {"needs_input": True, "reason": "The retry still looks like it wants an answer."}
-
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", fake_rescue)
-    monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    assert len(calls) == 2, "expected exactly one corrective retry turn, in addition to the original"
-
-    row = db.get_session(conn, row_id)
-    assert row["error_text"] is None
-    assert row["claude_session_id"] == "s2"
-    interview = json.loads(row["interview_json"])
-    assert interview == rescued
-
-    events = live_stream._buffers.get(row_id, [])
-    turn_events = [e for e in events if e["type"] == "turn"]
-    assert turn_events[-1]["interview"] == rescued
-    assert turn_events[-1]["error"] is None
 
 
 def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, tmp_path, monkeypatch):
@@ -1369,19 +821,28 @@ def test_model_selector_change_respawns_only_the_open_cards_engine(client, tmp_p
 
     _mock_engine(monkeypatch, handler)
 
-    # The card under test -- already has a live resident engine (its first
-    # turn already ran).
+    # The card under test -- already has a live resident engine. Issue #184:
+    # model/effort respawn-on-settings-change is only built for `PtyEngine`
+    # (a grilling card's resident tab is a `StreamJsonEngine`, which this
+    # mechanism deliberately isn't extended to -- out of this issue's
+    # scope), so the engine is seeded directly via `_get_or_create_engine`
+    # rather than through `start_session_job` (which would now dispatch a
+    # fresh session to the new engine instead, since every fresh session
+    # starts in grilling) -- this test is about the respawn mechanism
+    # itself, not about grilling.
     row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-    original_engine = session_runner._pty_engines[row_id]
+    original_engine = session_runner._get_or_create_engine(
+        row_id, cwd=cwd, model="claude-opus-4-8", effort="auto", resume_session_id=None
+    )
     assert original_engine.model == "claude-opus-4-8"
     assert original_engine.effort == "auto"
 
     # A different card, also with a live resident engine -- must be left
     # completely untouched below.
     other_row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(other_row_id, "another feature", cwd=cwd))
-    other_engine = session_runner._pty_engines[other_row_id]
+    other_engine = session_runner._get_or_create_engine(
+        other_row_id, cwd=cwd, model="claude-opus-4-8", effort="auto", resume_session_id=None
+    )
 
     # The project's pre-warmed standby engine -- also must be left
     # completely untouched below.
@@ -1439,14 +900,19 @@ def test_effort_selector_change_respawns_only_the_open_cards_engine(client, tmp_
 
     _mock_engine(monkeypatch, handler)
 
+    # See `test_model_selector_change_respawns_only_the_open_cards_engine`'s
+    # docstring above for why this seeds the engine directly rather than
+    # through `start_session_job` (issue #184).
     row_id = db.create_session(conn, project_id, effort="low")
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-    original_engine = session_runner._pty_engines[row_id]
+    original_engine = session_runner._get_or_create_engine(
+        row_id, cwd=cwd, model="claude-opus-4-8", effort="low", resume_session_id=None
+    )
     assert original_engine.effort == "low"
 
     other_row_id = db.create_session(conn, project_id, effort="low")
-    asyncio.run(session_runner.start_session_job(other_row_id, "another feature", cwd=cwd))
-    other_engine = session_runner._pty_engines[other_row_id]
+    other_engine = session_runner._get_or_create_engine(
+        other_row_id, cwd=cwd, model="claude-opus-4-8", effort="low", resume_session_id=None
+    )
 
     resp = client.post("/api/settings/effort", json={"effort": "high", "card_id": row_id})
     assert resp.json() == {"effort": "high", "respawned": True}
@@ -3697,12 +3163,16 @@ def test_engine_is_constructed_once_and_reused_across_turns_in_the_same_phase(cl
     asyncio.run(session_runner.continue_session_job(row_id, "tell me more", cwd=cwd))
     asyncio.run(session_runner.continue_session_job(row_id, "and more", cwd=cwd))
 
-    # Exactly one PtyEngine was ever constructed for this card_id, reused
-    # across all three turns.
+    # Exactly one engine was ever constructed for this card_id, reused
+    # across all three turns. Issue #184: this card stayed in grilling the
+    # whole time, so its resident tab is a `StreamJsonEngine`
+    # (`_stream_json_engines`), not a `PtyEngine` -- the resident-tab
+    # persistence guarantee itself is unchanged, just backed by a different
+    # registry for this phase.
     assert len(fake_class.instances) == 1
     assert fake_class.instances[0].started is True
-    assert row_id in session_runner._pty_engines
-    assert session_runner._pty_engines[row_id] is fake_class.instances[0]
+    assert row_id in session_runner._stream_json_engines
+    assert session_runner._stream_json_engines[row_id] is fake_class.instances[0]
 
 
 def test_engine_reattaches_via_resume_when_continuing_an_existing_session_id(client, tmp_path, monkeypatch):
@@ -3958,26 +3428,84 @@ def _capture_real_pty_spawns(monkeypatch):
     return spawns
 
 
+class _ArgvCapturingStreamJsonBackend:
+    """Stream-json analogue of `_ArgvCapturingBackend` above: a minimal
+    real-shaped `StreamJsonBackend` (see `stream_json_engine.py`) whose
+    `read_line()` hands back one canned `result` NDJSON line on its first
+    call (ending `stream_turn` in one round trip), then raises `EOFError`."""
+
+    def __init__(self, result_text="- Only question?", session_id="s1"):
+        self._line = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": result_text,
+                "session_id": session_id,
+            }
+        )
+        self._served = False
+
+    def write_line(self, line):
+        pass
+
+    def read_line(self):
+        if not self._served:
+            self._served = True
+            return self._line
+        raise EOFError
+
+    def is_alive(self):
+        return not self._served
+
+    def terminate(self, force=False):
+        pass
+
+
+def _capture_real_stream_json_spawns(monkeypatch):
+    """Stream-json analogue of `_capture_real_pty_spawns` above: replace
+    `stream_json_engine._spawn_subprocess` (the seam every real, non-test
+    `StreamJsonEngine()` construction resolves its `process_factory`
+    through, when none is injected) with one that records every spawn's
+    argv and hands back an `_ArgvCapturingStreamJsonBackend` instead of a
+    real OS process. Returns the list of captured argvs, appended to in
+    spawn order."""
+    spawns = []
+
+    def fake_factory(argv, *, cwd, env):
+        spawns.append(argv)
+        return _ArgvCapturingStreamJsonBackend()
+
+    monkeypatch.setattr(stream_json_engine, "_spawn_subprocess", fake_factory)
+    return spawns
+
+
 def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_standby_claim(
     client, tmp_path, monkeypatch
 ):
-    """Issue #138's reported repro: pick a model in the UI, then start what
-    looks like a brand-new session -- the Live Terminal must actually spawn
-    `claude` with THAT model, not a stale one left over from a pre-warmed
-    standby engine warmed under the model that was configured before the
-    switch. Goes through the real `/api/session/start` endpoint logic
-    (`app_module.start_session`) and `start_session_job`, with only the
-    OS-level pty spawn faked -- so this exercises the real
-    `claim_standby_engine`/`register_engine` reuse path and the real
-    `PtyEngine._build_args()`, not a Python-kwarg-level mock."""
+    """Issue #138's reported repro (adapted for issue #184: a brand-new
+    session's engine is now `StreamJsonEngine`, not `PtyEngine`): pick a
+    model in the UI, then start what looks like a brand-new session -- it
+    must actually spawn `claude` with THAT model, not a stale one left over
+    from a pre-warmed standby engine warmed under the model that was
+    configured before the switch. Goes through the real `/api/session/start`
+    endpoint logic (`app_module.start_session`) and `start_session_job`,
+    with only the OS-level subprocess spawn faked -- so this exercises the
+    real `claim_standby_stream_json_engine`/`register_stream_json_engine`
+    reuse path and the real `StreamJsonEngine._build_args()`, not a
+    Python-kwarg-level mock."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     conn = db.get_connection()
-    spawns = _capture_real_pty_spawns(monkeypatch)
+    spawns = _capture_real_stream_json_spawns(monkeypatch)
 
     # A standby was pre-warmed (e.g. by `open_project`) under the model that
     # was configured at the time.
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-4-6", effort="auto"))
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(
+            project_id, cwd=cwd, model="claude-sonnet-4-6", effort="auto"
+        )
+    )
     assert len(spawns) == 1
     idx = spawns[0].index("--model")
     assert spawns[0][idx + 1] == "claude-sonnet-4-6"
@@ -3998,7 +3526,7 @@ def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_st
     assert "--model" in new_argv
     idx = new_argv.index("--model")
     assert new_argv[idx + 1] == "claude-opus-4-8"
-    assert session_runner._pty_engines[card_id].model == "claude-opus-4-8"
+    assert session_runner._stream_json_engines[card_id].model == "claude-opus-4-8"
 
 
 def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_standby_match(
@@ -4006,16 +3534,18 @@ def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_st
 ):
     """The mirror-image case: the standby's model still matches what's
     currently configured (no change happened, or the user picked the SAME
-    model again) -- it must be adopted (`register_engine`) rather than
-    discarded, and the argv it was ALREADY spawned with (captured back when
-    the standby was warmed) must carry that same model. Confirms
-    `claim_standby_engine`'s reuse path itself is argv-correct, not just its
-    discard path."""
+    model again) -- it must be adopted (`register_stream_json_engine`)
+    rather than discarded, and the argv it was ALREADY spawned with
+    (captured back when the standby was warmed) must carry that same model.
+    Confirms `claim_standby_stream_json_engine`'s reuse path itself is
+    argv-correct, not just its discard path."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
-    spawns = _capture_real_pty_spawns(monkeypatch)
+    spawns = _capture_real_stream_json_spawns(monkeypatch)
 
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-opus-4-8", effort="auto"))
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-opus-4-8", effort="auto")
+    )
     assert len(spawns) == 1
     standby_argv = spawns[0]
     idx = standby_argv.index("--model")
@@ -4031,7 +3561,7 @@ def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_st
     # No second real spawn -- the standby (already carrying the right
     # --model) was adopted directly.
     assert len(spawns) == 1
-    assert session_runner._pty_engines[card_id].model == "claude-opus-4-8"
+    assert session_runner._stream_json_engines[card_id].model == "claude-opus-4-8"
 
 
 def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_pooled_resume(
@@ -4046,7 +3576,7 @@ def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_po
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     conn = db.get_connection()
-    spawns = _capture_real_pty_spawns(monkeypatch)
+    spawns = _capture_real_stream_json_spawns(monkeypatch)
 
     pooled_row_id = db.create_session(
         conn, project_id, claude_session_id="pooled-conversation-1", model="claude-sonnet-4-6", effort="auto"
@@ -4068,7 +3598,7 @@ def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_po
     assert "--model" in new_argv
     idx = new_argv.index("--model")
     assert new_argv[idx + 1] == "claude-opus-4-8"
-    assert session_runner._pty_engines[card_id].model == "claude-opus-4-8"
+    assert session_runner._stream_json_engines[card_id].model == "claude-opus-4-8"
 
 
 def test_standby_is_still_claimed_when_the_request_omits_effort_entirely(client, tmp_path, monkeypatch):
@@ -4083,9 +3613,13 @@ def test_standby_is_still_claimed_when_the_request_omits_effort_entirely(client,
     way around: adopt one it shouldn't)."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
-    spawns = _capture_real_pty_spawns(monkeypatch)
+    spawns = _capture_real_stream_json_spawns(monkeypatch)
 
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-4-6", effort="auto"))
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(
+            project_id, cwd=cwd, model="claude-sonnet-4-6", effort="auto"
+        )
+    )
     assert len(spawns) == 1
 
     # Body omits "effort" entirely, exactly like a request built without the
@@ -4095,8 +3629,8 @@ def test_standby_is_still_claimed_when_the_request_omits_effort_entirely(client,
 
     # The standby matched (no mismatch-triggered discard-and-respawn).
     assert len(spawns) == 1
-    assert session_runner._pty_engines[card_id] is not None
-    assert session_runner._pty_engines[card_id].effort == "auto"
+    assert session_runner._stream_json_engines[card_id] is not None
+    assert session_runner._stream_json_engines[card_id].effort == "auto"
 
 
 # ---------------------------------------------------------------------------
@@ -4171,14 +3705,26 @@ def test_implement_crash_recovers_via_the_same_reply_endpoint_as_a_real_block(cl
     assert fake_class.instances[0].resume_session_id == "crashed-1"
 
 
-def test_grilling_turn_crash_routes_into_the_blocked_flow(client, tmp_path, monkeypatch):
-    """The crash-routing mechanism is generic, not implement-specific --
-    any phase's stream_turn call can raise PtyEngineUnrecoverableError."""
+def test_grilling_turn_under_new_engine_crash_surfaces_as_a_plain_error(client, tmp_path, monkeypatch):
+    """Issue #184: the crash-routing mechanism exercised just above
+    (`test_implement_turn_crash_routes_into_the_blocked_flow`,
+    `_route_crash_to_blocked`, `phase: blocked`) is `PtyEngine`-specific and
+    untouched -- still fully exercised for implement and every other phase
+    still on that engine. A grilling card's `StreamJsonEngineUnrecoverableError`
+    (this engine's own internal crash-retry-once already gave up -- see
+    `stream_json_engine.py`) does NOT route into that generic `blocked`
+    suspend-and-reply flow -- `StreamJsonEngine` exposes no raw keystroke
+    passthrough for a human to nudge a dead subprocess back to life, so
+    there's nothing a 'blocked' UI could usefully resume into. Instead it
+    surfaces as a plain persisted/published error, exactly like an ordinary
+    `ClaudeCLIError` would (`test_grilling_claude_cli_error_never_sets_needs_github_login`'s
+    same shape) -- the card's dead tab is still dropped either way, so a
+    retry attempt starts a fresh engine rather than reusing a dead one."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     def crashing(prompt, **kw):
-        raise PtyEngineUnrecoverableError("died twice", claude_session_id="crashed-grilling")
+        raise StreamJsonEngineUnrecoverableError("died twice", session_id="crashed-grilling")
 
     _mock_engine(monkeypatch, crashing)
 
@@ -4187,9 +3733,17 @@ def test_grilling_turn_crash_routes_into_the_blocked_flow(client, tmp_path, monk
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     row = db.get_session(conn, row_id)
-    assert row["phase"] == "blocked"
-    assert row["claude_session_id"] == "crashed-grilling"
-    assert row_id not in session_runner._pty_engines
+    assert row["phase"] == "grilling"
+    assert row["error_text"] is not None
+    assert "died twice" in row["error_text"]
+    assert bool(row["needs_github_login"]) is False
+    assert row_id not in session_runner._stream_json_engines
+
+    events = live_stream._buffers.get(row_id, [])
+    error_turns = [e for e in events if e.get("type") == "turn" and e.get("phase") == "grilling"]
+    assert error_turns
+    assert error_turns[-1]["error"] is not None
+    assert error_turns[-1]["needs_github_login"] is False
 
 
 def test_implement_error_in_background_raises_a_notification(client, tmp_path, monkeypatch):
@@ -5249,3 +4803,386 @@ def test_start_implement_job_blocked_marker_takes_priority_over_classification(c
     assert row["phase"] == "blocked"
     blocked = json.loads(row["blocked_json"])
     assert blocked["question"] == "Which auth provider should the login button use?"
+
+
+# ---------------------------------------------------------------------------
+# Issue #184 (step 2 of PRD #182): dispatch, standby pre-warming, the shared
+# turn lock, and question-parsing coverage for a grilling card driven by the
+# new `StreamJsonEngine` (issue #183) instead of `PtyEngine`.
+# ---------------------------------------------------------------------------
+
+
+def test_grilling_turn_dispatches_to_stream_json_engine_not_pty_engine(client, tmp_path, monkeypatch):
+    """A grilling card's turn must be driven by `StreamJsonEngine`, never
+    `PtyEngine`: `PtyEngine` is patched with a stand-in that fails loudly if
+    ever constructed, `StreamJsonEngine` with a working fake, and the turn's
+    translated events (`action`/`text`/`turn`) must reach this card's live
+    SSE-visible buffer (`live_stream._buffers`) via the exact same
+    `publish()`/`stream_translate.translate_event()` pipeline a
+    `PtyEngine`-backed phase's turn already uses (acceptance criterion:
+    "Turn/text/tool-use events ... appear on the existing ... SSE endpoint,
+    translated via stream_translate.translate_event()")."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    class _ExplodingPtyEngine:
+        def __init__(self, *a, **kw):
+            raise AssertionError("PtyEngine must never be constructed for a grilling-phase turn")
+
+    monkeypatch.setattr(session_runner, "PtyEngine", _ExplodingPtyEngine)
+
+    def handler(prompt, **kw):
+        return iter(
+            [
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "echo hi"}}
+                        ]
+                    },
+                },
+                {
+                    "type": "stream_event",
+                    "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hello"}},
+                },
+                _result_event('Question 1: "What should it do?"'),
+            ]
+        )
+
+    fake_class = _make_fake_engine_class(handler)
+    monkeypatch.setattr(session_runner, "StreamJsonEngine", fake_class)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a new feature", cwd=cwd))
+
+    # StreamJsonEngine (the fake) was actually used to drive this turn.
+    assert len(fake_class.instances) == 1
+
+    events = live_stream._buffers.get(row_id, [])
+    assert {"type": "action", "summary": "$ echo hi"} in events
+    assert {"type": "text", "text": "Hello"} in events
+    turn_events = [e for e in events if e["type"] == "turn"]
+    assert turn_events
+    assert turn_events[-1]["interview"]["questions"][0]["text"] == "What should it do?"
+
+
+def test_grilling_questions_parsed_directly_via_qa_parser_match_existing_parser_output(client, tmp_path, monkeypatch):
+    """Issue #184 acceptance criterion: "Grilling questions parsed from a
+    turn under this engine match what qa_parser.parse_grilling_response
+    would produce from the same text today." Persisted/published interview
+    must be byte-for-byte what calling the parser directly on the turn's own
+    text produces -- no file-preference/Ollama-rescue detour changing it."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    text = 'Question 1: "Python or Node?"\nOptions:\nOption 1: "Python"\nOption 2: "Node"\nRecommended: [1]\n'
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(text)]))
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    interview = json.loads(row["interview_json"])
+    assert interview == parse_grilling_response(text)
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e["type"] == "turn"]
+    assert turn_events[-1]["interview"] == parse_grilling_response(text)
+
+
+def test_grilling_turn_lock_rejects_a_concurrent_write_with_the_same_error_as_pty_engine(client, tmp_path, monkeypatch):
+    """Issue #184: reuses the EXACT SAME `_get_turn_lock` mechanism
+    `_run_turn` itself uses -- a second write for the same `card_id` while a
+    grilling turn under the new engine is still in flight must produce the
+    identical "Another turn for this session is already in progress" error
+    a `PtyEngine`-backed card's `_run_turn` produces for the identical
+    scenario (see `test_run_turn_lock_rejects_a_concurrent_call_for_the_same_card_id`
+    above -- this is its stream-json-engine mirror)."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    enter_count = {"n": 0}
+    fake_class = _make_blocking_fake_engine_class(
+        entered, release, enter_count, result_text="❓ **Q1** - **Scope**: Only question?"
+    )
+    monkeypatch.setattr(session_runner, "StreamJsonEngine", fake_class)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+
+    async def scenario():
+        first_task = asyncio.create_task(
+            session_runner._run_grilling_stream_json_turn(
+                row_id, "first prompt", session_id=None, cwd=cwd, model=None, effort=None
+            )
+        )
+        await entered.wait()  # first call is now mid-turn, blocked inside stream_turn
+
+        second_result = await session_runner._run_grilling_stream_json_turn(
+            row_id, "second prompt", session_id=None, cwd=cwd, model=None, effort=None
+        )
+        assert second_result is None
+
+        release.set()
+        return await first_task
+
+    first_result = asyncio.run(scenario())
+
+    # Only the first call's turn ever actually reached the engine.
+    assert enter_count["n"] == 1
+    assert len(fake_class.instances) == 1
+    assert first_result["session_id"] == fake_class.instances[0].claude_session_id
+
+    events = live_stream._buffers.get(row_id, [])
+    error_turn_events = [e for e in events if e["type"] == "turn" and e.get("error")]
+    assert len(error_turn_events) == 1
+    assert error_turn_events[0]["phase"] == "grilling"
+    assert error_turn_events[0]["needs_github_login"] is False
+    assert (
+        error_turn_events[0]["error"]
+        == "Another turn for this session is already in progress -- please wait for it to finish."
+    )
+
+
+def test_ensure_standby_stream_json_engine_spawns_when_none_exists(client, tmp_path, monkeypatch):
+    """Stream-json mirror of `test_ensure_standby_engine_spawns_when_none_exists`."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
+
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto")
+    )
+
+    assert len(fake_class.instances) == 1
+    engine, model, effort = session_runner._standby_stream_json_engines[project_id]
+    assert engine is fake_class.instances[0]
+    assert (model, effort) == ("claude-sonnet-5", "auto")
+
+
+def test_claim_standby_stream_json_engine_returns_it_on_a_match_and_removes_it(client, tmp_path, monkeypatch):
+    """Stream-json mirror of `test_claim_standby_engine_returns_it_on_a_match_and_removes_it`."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto")
+    )
+
+    claimed = session_runner.claim_standby_stream_json_engine(project_id, model="claude-sonnet-5", effort="auto")
+
+    assert claimed is fake_class.instances[0]
+    assert claimed.closed is False
+    assert project_id not in session_runner._standby_stream_json_engines
+
+
+def test_claim_standby_stream_json_engine_returns_none_and_discards_on_model_mismatch(client, tmp_path, monkeypatch):
+    """Stream-json mirror of `test_claim_standby_engine_returns_none_and_discards_on_model_mismatch`."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto")
+    )
+
+    claimed = session_runner.claim_standby_stream_json_engine(project_id, model="claude-opus-5", effort="auto")
+
+    assert claimed is None
+    assert fake_class.instances[0].closed is True  # discarded, not left dangling
+    assert project_id not in session_runner._standby_stream_json_engines
+
+
+def test_close_standby_stream_json_engine_closes_and_discards_it(client, tmp_path, monkeypatch):
+    """Stream-json mirror of `test_close_standby_engine_closes_and_discards_it`."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto")
+    )
+
+    session_runner.close_standby_stream_json_engine(project_id)
+
+    assert fake_class.instances[0].closed is True
+    assert project_id not in session_runner._standby_stream_json_engines
+
+
+def test_register_stream_json_engine_makes_get_or_create_reuse_it_without_spawning(client, tmp_path, monkeypatch):
+    """Stream-json mirror of `test_register_engine_makes_get_or_create_engine_reuse_it_without_spawning`."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("hi")]))
+
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto")
+    )
+    claimed = session_runner.claim_standby_stream_json_engine(project_id, model="claude-sonnet-5", effort="auto")
+    session_runner.register_stream_json_engine(999, claimed)
+
+    engine = session_runner._get_or_create_stream_json_engine(
+        999, cwd=cwd, model="claude-sonnet-5", effort="auto", resume_session_id=None
+    )
+
+    assert engine is claimed
+    assert len(fake_class.instances) == 1  # no second spawn triggered by _get_or_create_stream_json_engine
+
+
+def test_a_grilling_sessions_first_turn_claims_the_pre_warmed_standby_via_the_start_endpoint(
+    client, tmp_path, monkeypatch
+):
+    """Issue #184 acceptance criterion: "A grilling card's first turn
+    benefits from standby pre-warming, matching PtyEngine's existing latency
+    characteristics for a first turn." Mirrors the real production path:
+    `open_project` warms a matching standby, then `/api/session/start`
+    (`start_session`) claims it directly -- no second engine spawn pays the
+    inline "wait for claude to open" cost on this session's actual first
+    turn."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    conn = db.get_connection()
+
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("- Only question?")]))
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(
+            project_id, cwd=cwd, model=db.get_model(conn), effort=db.DEFAULT_EFFORT
+        )
+    )
+    assert len(fake_class.instances) == 1
+    standby_instance = fake_class.instances[0]
+
+    result = asyncio.run(_run_and_drain(app_module.start_session({"prompt": "a feature", "effort": "auto"})))
+    card_id = result["card_id"]
+
+    # No second engine spawned -- the pre-warmed standby was claimed and
+    # drove the first turn directly.
+    assert len(fake_class.instances) == 1
+    assert session_runner._stream_json_engines[card_id] is standby_instance
+
+
+def test_grilling_turn_under_new_engine_never_touches_the_question_file(client, tmp_path, monkeypatch):
+    """Issue #184 acceptance criterion: "A grilling card under this engine
+    does NOT read or write .claude/rhubarb_question.md." Terminal text alone
+    carries a DIFFERENT, unambiguous question than the file -- if the new
+    engine's path ever preferred the file the way the old PtyEngine path
+    does, the persisted interview would come from the file instead."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    original_file_content = (
+        'Question 1: "Python or Node?"\nOptions:\nOption 1: "Python"\nOption 2: "Node"\nRecommended: [1]\n'
+    )
+    _write_question_file(cwd, "rhubarb_question.md", original_file_content)
+
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event('Question 1: "From the turn text"')]))
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a new feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    interview = json.loads(row["interview_json"])
+    assert interview["questions"][0]["text"] == "From the turn text"
+
+    # The file was never read (so it's also never deleted the way a
+    # malformed/consumed file would be) -- completely untouched.
+    question_file = Path(cwd) / ".claude" / "rhubarb_question.md"
+    assert question_file.exists()
+    assert question_file.read_text(encoding="utf-8") == original_file_content
+
+
+def test_continue_session_job_under_new_engine_does_not_delete_the_question_file(client, tmp_path, monkeypatch):
+    """Companion to the test above, for the reply path: unlike the
+    `PtyEngine` path (`test_continue_session_job_deletes_rhubarb_question_file_on_reply`,
+    removed above since it no longer applies to grilling), `continue_session_job`
+    must skip its `delete_question_file` call entirely for a grilling card
+    dispatched to the new engine."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def handler(prompt, **kw):
+        return iter([_result_event('Question 1: "A follow-up?"')])
+
+    _mock_engine(monkeypatch, handler)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    _write_question_file(cwd, "rhubarb_question.md", 'Question 1: "Leftover from somewhere else?"')
+    asyncio.run(session_runner.continue_session_job(row_id, "my answer", cwd=cwd))
+
+    assert (Path(cwd) / ".claude" / "rhubarb_question.md").exists()
+
+
+def test_grilling_turn_under_new_engine_skips_ollama_rescue_entirely(client, tmp_path, monkeypatch):
+    """Issue #184 acceptance criterion: "... does not invoke the Ollama
+    rescue classifier." Text here is deliberately shaped to trigger the OLD
+    PtyEngine path's rescue call (`should_attempt_grilling_rescue` -- looks
+    like it was trying to contain a question, but doesn't match the strict
+    regex format) -- `rescue_grilling_response` must never be called for a
+    grilling card under the new engine, even with Ollama assistance NOT
+    declined."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    malformed_text = 'Question 1: The quote never closes, so the regex parser finds nothing here.\n'
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_text)]))
+
+    def must_not_be_called(raw_text):
+        raise AssertionError("rescue_grilling_response must not be called for a grilling card under the new engine")
+
+    monkeypatch.setattr(session_runner, "rescue_grilling_response", must_not_be_called)
+
+    conn = db.get_connection()
+    db.set_ollama_declined(conn, False)
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    interview = json.loads(row["interview_json"])
+    # No rescue was attempted -- the plain regex parse (which finds nothing
+    # for this malformed text) is exactly what gets persisted, unmodified.
+    assert interview == parse_grilling_response(malformed_text)
+    assert interview["questions"] == []
+
+
+def test_grilling_multiline_composed_reply_under_new_engine_completes_as_a_single_turn(client, tmp_path, monkeypatch):
+    """Direct regression test for the PRD #180/#181 bug class this whole
+    engine exists to fix (see `stream_json_engine.py`'s own module docstring
+    and its `test_multiline_prompt_transmits_and_completes_as_a_single_turn`):
+    a multi-line composed reply answering 2+ grilling questions, joined with
+    embedded newlines, must reach the CLI and complete as ONE turn on the
+    first attempt -- no splitting, no retry, no special handling anywhere in
+    `continue_session_job`'s dispatch to the new engine."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    composed_reply = "1. Python\n2. For internal tooling"
+    seen_prompts = []
+
+    def handler(prompt, **kw):
+        seen_prompts.append(prompt)
+        if prompt == "/rhubarb:do a feature":
+            return iter([_result_event('Question 1: "Language?"\n\nQuestion 2: "Who is it for?"')])
+        return iter([_result_event("Thanks, that's everything I need.")])
+
+    _mock_engine(monkeypatch, handler)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+    asyncio.run(session_runner.continue_session_job(row_id, composed_reply, cwd=cwd))
+
+    # Exactly one write per turn -- the composed multi-line reply was sent
+    # whole, as a single prompt, on the first (and only) attempt.
+    assert seen_prompts == ["/rhubarb:do a feature", composed_reply]
+
+    row = db.get_session(conn, row_id)
+    assert row["error_text"] is None
+    assert row["phase"] == "grilling"
+    interview = json.loads(row["interview_json"])
+    assert interview["questions"] == []

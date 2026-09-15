@@ -302,11 +302,21 @@ async def open_project(project_id: int):
     afk_loop.record_activity(project_id)
     row = db.get_project(conn, project_id)
 
-    # Pre-warm a standby PtyEngine for this project (issue #136) so the
-    # first /do a user starts doesn't pay the "wait for claude to open"
-    # spawn cost inline -- fire-and-forget, never blocks this response.
+    # Pre-warm a standby engine for this project (issue #136) so the first
+    # /do a user starts doesn't pay the "wait for claude to open" spawn cost
+    # inline -- fire-and-forget, never blocks this response.
+    #
+    # Issue #184: a brand-new session always begins in the grilling phase
+    # (`db.create_session`'s own `phase="grilling"` default), and grilling
+    # now runs on `StreamJsonEngine`, not `PtyEngine` -- so the standby this
+    # warms is the `StreamJsonEngine` one (`ensure_standby_stream_json_engine`),
+    # matching what `start_session` below actually claims for a fresh
+    # session's first turn. The old `ensure_standby_engine` (PtyEngine)
+    # standby machinery is left completely intact for any other caller --
+    # it's simply not used for this purpose any more, since nothing else
+    # ever starts a brand-new session.
     asyncio.create_task(
-        session_runner.ensure_standby_engine(
+        session_runner.ensure_standby_stream_json_engine(
             project_id, cwd=row["path"], model=db.get_model(conn), effort=db.DEFAULT_EFFORT
         )
     )
@@ -324,7 +334,12 @@ def close_project(project_id: int, body: dict):
     db.save_session_state(conn, project_id, body.get("session_state", {}))
     if _active_project_id == project_id:
         _active_project_id = None
+    # Issue #184: close whichever standby this project actually has warm --
+    # in practice this is always the `StreamJsonEngine` one now (see
+    # `open_project`), but `close_standby_engine` (PtyEngine) is also called
+    # unconditionally, harmlessly, in case anything else ever warms one.
     session_runner.close_standby_engine(project_id)
+    session_runner.close_standby_stream_json_engine(project_id)
     return {"closed": True}
 
 
@@ -663,15 +678,26 @@ async def start_session(body: dict):
     # (`effort or DEFAULT_EFFORT`) and start_session_job's own model
     # resolution (`db.get_model(conn)`) precisely, not this row's stored
     # columns (which can differ -- see the comments in session_runner.py).
+    #
+    # Issue #184: every brand-new session begins in the grilling phase
+    # (`db.create_session`'s own `phase="grilling"` default), and grilling
+    # now runs on `StreamJsonEngine` -- so the standby claimed/registered
+    # here is the `StreamJsonEngine` one, matching what `open_project` warms
+    # and what `start_session_job` will actually dispatch this session's
+    # first turn to. Unlike `PtyEngine` (which self-assigns a session id up
+    # front), a freshly-spawned, never-yet-turned `StreamJsonEngine`'s
+    # `session_id` is `None` until its first completed turn -- passing that
+    # straight through to `claude_session_id=` here is correct: it's exactly
+    # what "no resumable session yet" already means to `create_session`.
     model = db.get_model(conn)
     resolved_effort = effort or db.DEFAULT_EFFORT
-    standby = session_runner.claim_standby_engine(project_id, model=model, effort=resolved_effort)
+    standby = session_runner.claim_standby_stream_json_engine(project_id, model=model, effort=resolved_effort)
 
     if standby is not None:
         row_id = db.create_session(
-            conn, project_id, claude_session_id=standby.claude_session_id, effort=effort
+            conn, project_id, claude_session_id=standby.session_id, effort=effort
         )
-        session_runner.register_engine(row_id, standby)
+        session_runner.register_stream_json_engine(row_id, standby)
     else:
         reused = db.claim_available_session(conn, project_id)
         resume_id = reused["claude_session_id"] if reused is not None else None

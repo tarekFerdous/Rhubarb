@@ -17,6 +17,42 @@
        version pinned to match xterm@5.3.0 (the last major xterm-addon-fit
        line published under the unscoped package name). -->
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+  <!-- Grilling structured block feed (issue #186, step 3 of PRD #182): for a
+       grilling card running under the new stream-json engine
+       (rhubarb/stream_json_engine.py, issue #184), the Live Terminal panel
+       shows this plain block feed -- full assistant text, one-line tool-call
+       summaries -- instead of the raw xterm.js terminal above. Deliberately
+       NOT styled to look like a terminal (no monospace, no dark console
+       chrome): the issue is explicit that this is a distinct feed, not a
+       fake terminal. Every other card type (any `PtyEngine`-backed session)
+       keeps the untouched `.terminal-view` xterm rendering -- see
+       setLiveTerminalFeedMode()/applyTerminalViewVisibility() in the script
+       below for how the two sibling panels are toggled. -->
+  <style>
+    .grilling-feed-view {
+      flex: 1;
+      min-height: 160px;
+      border-radius: 20px;
+      overflow-y: auto;
+      padding: 16px;
+      background: var(--card-bg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 0.9rem;
+      line-height: 1.5;
+      color: var(--fg);
+    }
+    .grilling-feed-text {
+      white-space: pre-wrap;
+      margin: 0 0 10px;
+    }
+    .grilling-feed-action {
+      color: var(--fg-muted);
+      font-size: 0.82rem;
+      margin: 0 0 10px;
+      padding-left: 8px;
+      border-left: 2px solid var(--fg-muted);
+    }
+  </style>
 </head>
 <body>
   <div class="split">
@@ -107,6 +143,10 @@
         <span id="passthrough-indicator" class="passthrough-indicator" hidden>typing during automated turn</span>
       </p>
       <div id="terminal-view" class="terminal-view"></div>
+      <!-- Structured block feed sibling for a grilling card under the new
+           stream-json engine (issue #186) -- toggled opposite `terminal-view`
+           via `setLiveTerminalFeedMode()`, never shown at the same time. -->
+      <div id="grilling-feed-view" class="grilling-feed-view" hidden></div>
     </div>
     <div class="card right">
       <p class="console-title">
@@ -343,6 +383,16 @@
     // already-closed card can never resurrect it in the queue.
     const closedCardIds = new Set();
     let closeSessionTargetCardId = null;
+    // Structured block feed for a grilling card under the new stream-json
+    // engine (issue #186) -- replaces the Live Terminal panel's raw xterm
+    // rendering for such a card only. `liveTerminalFeedMode` toggles which
+    // of the two sibling panels (#terminal-view / #grilling-feed-view) is
+    // shown; `grillingFeedCurrentTextEl` is the paragraph currently
+    // accumulating this turn's streamed `text` deltas (issue #184), reset to
+    // null at each new block (an `action` event, or a resolved `turn`) so
+    // the next text delta starts a fresh paragraph instead of running on.
+    let liveTerminalFeedMode = false;
+    let grillingFeedCurrentTextEl = null;
 
     const startForm = document.getElementById("start-form");
     const interviewEl = document.getElementById("interview");
@@ -363,6 +413,7 @@
     const parallelImplementationWarningEl = document.getElementById("parallel-implementation-warning");
     const terminalViewHiddenToggleEl = document.getElementById("terminal-view-hidden-toggle");
     const terminalViewEl = document.getElementById("terminal-view");
+    const grillingFeedViewEl = document.getElementById("grilling-feed-view");
     const passthroughIndicatorEl = document.getElementById("passthrough-indicator");
     const ollamaEnabledToggleEl = document.getElementById("ollama-enabled-toggle");
     const ollamaToggleErrorEl = document.getElementById("ollama-toggle-error");
@@ -625,6 +676,8 @@
 
       leftCardId = null;
       currentLeftSession = null;
+      resetGrillingFeed();
+      setLiveTerminalFeedMode(false);
       preQaLeftSession = null;
       refreshModelEffortCard();
       turnInFlight = false;
@@ -886,6 +939,8 @@
       turnInFlight = false;
       syncPtySocket();
       currentLeftSession = null;
+      resetGrillingFeed();
+      setLiveTerminalFeedMode(false);
       rightCards.clear();
       resetPromptBox();
       startForm.style.display = "";
@@ -1175,7 +1230,60 @@
     // terminal view immediately -- called on load and right after the
     // setting changes, so no page reload or Rhubarb restart is needed.
     function applyTerminalViewVisibility() {
-      terminalViewEl.hidden = !!knownTerminalViewHidden;
+      const userHidden = !!knownTerminalViewHidden;
+      // The two sibling panels are never shown together -- `liveTerminalFeedMode`
+      // (issue #186) picks which one, and the user's own "hide live terminal
+      // view" setting still wins over both when it's on.
+      terminalViewEl.hidden = userHidden || liveTerminalFeedMode;
+      grillingFeedViewEl.hidden = userHidden || !liveTerminalFeedMode;
+    }
+
+    // Clears the block feed's rendered content and running-paragraph state --
+    // called whenever the Live Terminal panel starts representing a
+    // different card (connectStream) or no card at all.
+    function resetGrillingFeed() {
+      grillingFeedViewEl.innerHTML = "";
+      grillingFeedCurrentTextEl = null;
+    }
+
+    // Single choke point for switching the Live Terminal panel between the
+    // raw xterm terminal and the structured block feed (issue #186). A
+    // `PtyEngine`-backed card never emits the `text`/`action` events the
+    // feed is fed by in the first place (see stream_translate.translate_event --
+    // those only ever come from `stream_event`/`assistant` raw events, which
+    // only the new StreamJsonEngine's NDJSON stream produces), so leaving
+    // this at its default `false` for such a card is always correct even if
+    // some call site below fails to explicitly turn it off.
+    function setLiveTerminalFeedMode(active) {
+      liveTerminalFeedMode = active;
+      applyTerminalViewVisibility();
+    }
+
+    // Appends to (or starts) the current turn's running assistant-text
+    // paragraph -- mirrors how a chat UI streams text: each `text` delta
+    // (issue #184's translated `stream_event`/`content_block_delta`) is
+    // appended in place, never replacing what's already rendered.
+    function appendGrillingText(text) {
+      if (!grillingFeedCurrentTextEl) {
+        grillingFeedCurrentTextEl = document.createElement("p");
+        grillingFeedCurrentTextEl.className = "grilling-feed-text";
+        grillingFeedViewEl.appendChild(grillingFeedCurrentTextEl);
+      }
+      grillingFeedCurrentTextEl.textContent += text;
+      grillingFeedViewEl.scrollTop = grillingFeedViewEl.scrollHeight;
+    }
+
+    // Appends a one-line, already-formatted tool-call/thinking summary
+    // (`stream_translate._action_summary`/the "thinking…" case -- displayed
+    // verbatim, never reformatted here) as its own collapsed block, and
+    // starts a fresh paragraph for whatever assistant text follows it.
+    function appendGrillingAction(summary) {
+      grillingFeedCurrentTextEl = null;
+      const el = document.createElement("p");
+      el.className = "grilling-feed-action";
+      el.textContent = summary;
+      grillingFeedViewEl.appendChild(el);
+      grillingFeedViewEl.scrollTop = grillingFeedViewEl.scrollHeight;
     }
 
     async function updateTerminalViewHidden() {
@@ -1448,7 +1556,23 @@
     // (xterm's public API for focusing that helper textarea) is what
     // actually routes typed input into `term.onData` the moment reply mode
     // is entered, matching the on-screen "> " prompt this already writes.
+    // Issue #185: a grilling card runs under the new stream-json engine,
+    // whose Live Terminal panel shows the structured block feed instead of
+    // this xterm terminal (`#terminal-view` sits `hidden` for the whole
+    // time `liveTerminalFeedMode` is on -- see applyTerminalViewVisibility
+    // above). Writing the "> " prompt into it and calling `term.focus()`
+    // would target an element the user can't see; worse, a `hidden`
+    // (display:none) element can't actually receive focus in a browser, so
+    // `term.focus()` would silently no-op and no keystroke would ever reach
+    // `term.onData`'s curated branch below -- this convenience is already
+    // dead for such a card, just without any visible error. Every caller of
+    // this function already renders its own free-form textarea + Send/
+    // Submit button (renderManualReply, or renderInterview's own trailing-
+    // notes box) that submits through this exact same `sendFn` with zero
+    // terminal dependency, so skipping the curated-terminal-typing
+    // convenience here for a grilling card loses no capability.
     function enableTerminalReplyInput(sendFn) {
+      if (liveTerminalFeedMode) return;
       terminalReplySendFn = sendFn;
       terminalReplyBuffer = "";
       term.write("\r\n> ");
@@ -1663,6 +1787,25 @@
     // a no-op whenever the same card is already connected/connecting.
     function syncPtySocket({ force = false } = {}) {
       if (leftCardId === null) {
+        closePtySocket();
+        return;
+      }
+
+      // Issue #185: a grilling card runs under the new stream-json engine,
+      // which has no resident `PtyEngine` at all for this socket to forward
+      // keystrokes into -- the backend already closes such a connection
+      // immediately with code 1008 (see `pty_passthrough` in
+      // rhubarb/web/app.py, whose lookup only ever checks `_pty_engines`).
+      // But `onclose` below treats every 1008 close as "no engine YET" and
+      // reconnects again after 1.5s -- correct for e.g. implement's very
+      // first turn (before its PtyEngine spins up), wrong for grilling,
+      // which never gets a PtyEngine at all. Left unguarded this would
+      // connect-and-immediately-close in a loop for as long as a grilling
+      // card stays focused. `currentLeftSession` is reliable ground truth
+      // for this the same way connectStream's own `setLiveTerminalFeedMode`
+      // call above already relies on it (no feature flag -- session_runner
+      // routes `phase == "grilling"` unconditionally).
+      if (currentLeftSession && currentLeftSession.card_id === leftCardId && currentLeftSession.phase === "grilling") {
         closePtySocket();
         return;
       }
@@ -1884,6 +2027,8 @@
       turnInFlight = false;
       syncPtySocket();
       currentLeftSession = null;
+      resetGrillingFeed();
+      setLiveTerminalFeedMode(false);
       refreshModelEffortCard();
       resetPromptBox();
       startForm.style.display = "";
@@ -1905,6 +2050,17 @@
     function connectStream(cardId) {
       if (eventSource) eventSource.close();
       term.reset();
+      resetGrillingFeed();
+      // Every caller of connectStream has already set `currentLeftSession`
+      // for `cardId` before calling it (renderLeftSession/applyTurn/the
+      // start-form handler all do this) -- so its `.phase` is reliable
+      // ground truth here for whether this card is a grilling card under the
+      // new engine (see session_runner's unconditional `phase == "grilling"`
+      // dispatch -- no feature flag, so this check needs nothing from the
+      // backend beyond the `phase` field every session snapshot already has).
+      setLiveTerminalFeedMode(
+        !!currentLeftSession && currentLeftSession.card_id === cardId && currentLeftSession.phase === "grilling"
+      );
       // Every caller here already set `leftCardId = cardId` first -- `force`
       // makes this reconnect unconditionally (covers e.g. retryCard, where
       // the previous engine may have just died and been replaced).
@@ -2007,9 +2163,25 @@
         return;
       }
 
-      // "text"/"action" events used to feed the removed plain-text Output
-      // panel -- the Live Terminal (raw PTY stream) already shows the same
-      // content, so these are pure no-ops now.
+      // "text"/"action" events (issue #186): a grilling card under the new
+      // stream-json engine (issue #184) never emits `terminal_output` --
+      // these are the only content it streams, and they used to feed the
+      // removed plain-text Output panel (pure no-ops once that was removed).
+      // They now drive the Live Terminal panel's structured block feed
+      // instead, gated on `liveTerminalFeedMode` -- set by connectStream/
+      // applyTurn from `currentLeftSession.phase === "grilling"` -- so a
+      // stray event from a connection that's since moved off grilling (or
+      // any `PtyEngine`-backed card, which never emits these types at all)
+      // is simply dropped rather than appended.
+      if (event.type === "text") {
+        if (liveTerminalFeedMode) appendGrillingText(event.text);
+        return;
+      }
+
+      if (event.type === "action") {
+        if (liveTerminalFeedMode) appendGrillingAction(event.summary);
+        return;
+      }
     }
 
     function applyTurn(cardId, event) {
@@ -2114,6 +2286,13 @@
           leftCardId = cardId;
           turnInFlight = false;
           syncPtySocket();
+          // This QA card is silently taking over the left slot without going
+          // through connectStream (its EventSource is being reused, not
+          // reopened) -- so unlike connectStream's own callers, mode isn't
+          // resynced for free here. A QA session is never grilling-phase, so
+          // explicitly turn the block feed off in case the session it's
+          // displacing had left it on (issue #186).
+          setLiveTerminalFeedMode(false);
           currentLeftSession = snapshot;
           refreshModelEffortCard();
           startForm.style.display = "none";
@@ -2148,6 +2327,9 @@
         leftCardId = cardId;
         turnInFlight = false;
         syncPtySocket();
+        // See the identical comment in the QA takeover branch above -- this
+        // card is never grilling-phase either (issue #186).
+        setLiveTerminalFeedMode(false);
         currentLeftSession = snapshot;
         refreshModelEffortCard();
         startForm.style.display = "none";
@@ -2188,6 +2370,9 @@
         leftCardId = cardId;
         turnInFlight = false;
         syncPtySocket();
+        // See the identical comment in the QA takeover branch above -- this
+        // card is never grilling-phase either (issue #186).
+        setLiveTerminalFeedMode(false);
         currentLeftSession = snapshot;
         refreshModelEffortCard();
         startForm.style.display = "none";
@@ -2201,6 +2386,16 @@
       if (leftCardId !== cardId) return;
 
       if (event.phase === "grilling") {
+        // Issue #186: a grilling card runs under the new stream-json engine
+        // from its very first turn (no feature flag -- session_runner routes
+        // `phase == "grilling"` unconditionally), so the Live Terminal
+        // panel's block-feed mode is (re)confirmed on every resolved
+        // grilling turn, not just at initial connect -- cheap and idempotent.
+        // This turn is done streaming -- clear the running paragraph so the
+        // next turn's first `text` delta starts a fresh block instead of
+        // appending onto this turn's.
+        setLiveTerminalFeedMode(true);
+        grillingFeedCurrentTextEl = null;
         if (event.error) {
           showGrillingError(event.error);
           return;
@@ -2215,6 +2410,9 @@
         return;
       }
 
+      // This card just moved off the grilling phase (e.g. into creating_prd)
+      // -- back to the normal raw-terminal Live Terminal panel (issue #186).
+      setLiveTerminalFeedMode(false);
       currentLeftSession = snapshot;
       setHeading(headingForPhase(event.phase));
       showOnly(sessionStatusEl);
@@ -2250,6 +2448,8 @@
       turnInFlight = false;
       syncPtySocket();
       currentLeftSession = null;
+      resetGrillingFeed();
+      setLiveTerminalFeedMode(false);
       refreshModelEffortCard();
       resetPromptBox();
       startForm.style.display = "";
@@ -2274,6 +2474,8 @@
         turnInFlight = false;
         syncPtySocket();
         currentLeftSession = null;
+        resetGrillingFeed();
+        setLiveTerminalFeedMode(false);
         refreshModelEffortCard();
         resetPromptBox();
         startForm.style.display = "";

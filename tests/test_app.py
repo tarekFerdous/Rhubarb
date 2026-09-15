@@ -515,6 +515,10 @@ def test_open_project_records_afk_activity(client, tmp_path, monkeypatch):
 
 
 def test_open_project_schedules_a_standby_prewarm(client, tmp_path, monkeypatch):
+    """Issue #184: a brand-new session always begins in the grilling phase,
+    which now runs on `StreamJsonEngine` -- so `open_project` pre-warms the
+    `StreamJsonEngine` standby (`ensure_standby_stream_json_engine`), not
+    the `PtyEngine` one."""
     root = tmp_path / "root"
     root.mkdir()
     _init_repo(root / "repo1", "https://github.com/x/repo1.git")
@@ -526,7 +530,7 @@ def test_open_project_schedules_a_standby_prewarm(client, tmp_path, monkeypatch)
     async def _fake_ensure(pid, *, cwd, model, effort):
         calls.append({"project_id": pid, "cwd": cwd, "model": model, "effort": effort})
 
-    monkeypatch.setattr(app_module.session_runner, "ensure_standby_engine", _fake_ensure)
+    monkeypatch.setattr(app_module.session_runner, "ensure_standby_stream_json_engine", _fake_ensure)
 
     client.post(f"/api/projects/{project_id}/open")
 
@@ -536,6 +540,11 @@ def test_open_project_schedules_a_standby_prewarm(client, tmp_path, monkeypatch)
 
 
 def test_close_project_closes_its_standby(client, tmp_path, monkeypatch):
+    """Issue #184: `close_project` closes BOTH standby registries
+    unconditionally (harmless no-op on whichever one is actually empty) --
+    in practice only the `StreamJsonEngine` one is ever warm for a project
+    now (see `open_project`), but the `PtyEngine` one is still called too,
+    in case anything else ever warms it."""
     root = tmp_path / "root"
     root.mkdir()
     _init_repo(root / "repo1", "https://github.com/x/repo1.git")
@@ -543,14 +552,27 @@ def test_close_project_closes_its_standby(client, tmp_path, monkeypatch):
     project_id = client.get("/api/app-state").json()["projects"][0]["id"]
 
     calls = []
+    stream_json_calls = []
     monkeypatch.setattr(app_module.session_runner, "close_standby_engine", lambda pid: calls.append(pid))
+    monkeypatch.setattr(
+        app_module.session_runner, "close_standby_stream_json_engine", lambda pid: stream_json_calls.append(pid)
+    )
 
     client.post(f"/api/projects/{project_id}/close", json={})
 
     assert calls == [project_id]
+    assert stream_json_calls == [project_id]
 
 
 def test_session_start_claims_a_matching_standby_engine(client, tmp_path, monkeypatch):
+    """Issue #184: `/api/session/start` always begins a grilling-phase
+    session, which now claims the `StreamJsonEngine` standby
+    (`claim_standby_stream_json_engine`/`register_stream_json_engine`), not
+    the `PtyEngine` one. The claimed engine's session id is exposed as
+    `.session_id` (StreamJsonEngine's own attribute name), not
+    `.claude_session_id` (PtyEngine's) -- see `session_runner.py`'s
+    `start_session` docstring for why that's the correct "no resumable
+    session yet" value for a never-yet-turned standby."""
     root = tmp_path / "root"
     root.mkdir()
     _init_repo(root / "repo1", "https://github.com/x/repo1.git")
@@ -559,7 +581,7 @@ def test_session_start_claims_a_matching_standby_engine(client, tmp_path, monkey
     client.post(f"/api/projects/{project_id}/open")
 
     class FakeStandby:
-        claude_session_id = "standby-session-id"
+        session_id = "standby-session-id"
 
     fake_standby = FakeStandby()
     claim_calls = []
@@ -569,8 +591,10 @@ def test_session_start_claims_a_matching_standby_engine(client, tmp_path, monkey
         claim_calls.append({"project_id": pid, "model": model, "effort": effort})
         return fake_standby
 
-    monkeypatch.setattr(app_module.session_runner, "claim_standby_engine", fake_claim)
-    monkeypatch.setattr(app_module.session_runner, "register_engine", lambda cid, eng: register_calls.append((cid, eng)))
+    monkeypatch.setattr(app_module.session_runner, "claim_standby_stream_json_engine", fake_claim)
+    monkeypatch.setattr(
+        app_module.session_runner, "register_stream_json_engine", lambda cid, eng: register_calls.append((cid, eng))
+    )
 
     async def _noop_job(card_id, prompt, *, cwd):
         return None
@@ -592,6 +616,10 @@ def test_session_start_claims_a_matching_standby_engine(client, tmp_path, monkey
 
 
 def test_session_start_falls_back_to_db_pool_when_no_standby_matches(client, tmp_path, monkeypatch):
+    """Issue #184: same rewiring as
+    `test_session_start_claims_a_matching_standby_engine` above -- the
+    standby a fresh (grilling-phase) session checks first is now the
+    `StreamJsonEngine` one."""
     root = tmp_path / "root"
     root.mkdir()
     _init_repo(root / "repo1", "https://github.com/x/repo1.git")
@@ -599,10 +627,12 @@ def test_session_start_falls_back_to_db_pool_when_no_standby_matches(client, tmp
     project_id = client.get("/api/app-state").json()["projects"][0]["id"]
     client.post(f"/api/projects/{project_id}/open")
 
-    monkeypatch.setattr(app_module.session_runner, "claim_standby_engine", lambda pid, *, model, effort: None)
+    monkeypatch.setattr(app_module.session_runner, "claim_standby_stream_json_engine", lambda pid, *, model, effort: None)
 
     register_calls = []
-    monkeypatch.setattr(app_module.session_runner, "register_engine", lambda cid, eng: register_calls.append((cid, eng)))
+    monkeypatch.setattr(
+        app_module.session_runner, "register_stream_json_engine", lambda cid, eng: register_calls.append((cid, eng))
+    )
 
     called_claim_available = []
 
