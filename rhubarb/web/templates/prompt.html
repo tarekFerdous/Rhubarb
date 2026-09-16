@@ -217,6 +217,29 @@
       </label>
       <p id="headroom-toggle-error" class="modal-warning-text" hidden></p>
 
+      <!-- Headroom token-savings widget (issue #205, part of PRD #202).
+           Fetched once per Settings-panel open from GET /api/headroom-savings
+           (issue #204) -- never polled. Visibility is driven entirely by
+           that response's `available`/`empty` fields, NOT by
+           `headroom-enabled-toggle`'s checked state above: a user who
+           turned Headroom off should still see historical savings. Hidden
+           by default and only unhidden by `renderHeadroomSavingsWidget()`
+           once a response with `available: true` comes back -- an
+           `available: false` response (not installed / command failed)
+           leaves it hidden for the whole Settings-panel session.
+           `<button>` (not a styled `<div>`) so it's natively clickable/
+           focusable/keyboard-activatable without extra ARIA wiring; the
+           click handler is a stub for issue #206's not-yet-built modal. -->
+      <button
+        type="button"
+        id="headroom-savings-widget"
+        class="headroom-savings-widget"
+        hidden
+      >
+        <span id="headroom-savings-today-line" class="headroom-savings-line"></span>
+        <span id="headroom-savings-30day-line" class="headroom-savings-line"></span>
+      </button>
+
       <label class="modal-checkbox-label">
         <input id="caveman-enabled-toggle" type="checkbox" class="modal-checkbox-input" />
         Enable Caveman skill
@@ -247,6 +270,51 @@
       </select>
 
       <button id="modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
+    </div>
+  </div>
+
+  <!-- Headroom savings modal (issue #206, part of PRD #202): opened by
+       clicking the Settings widget from #205 (see the widget's click
+       listener near the bottom of this file, wired to
+       `openHeadroomSavingsModal()` below). Fetches GET /api/headroom-savings
+       FRESH on every open -- never reuses `refreshHeadroomSavingsWidget()`'s
+       earlier response, since the modal can be opened well after the widget
+       loaded (e.g. Headroom could have been uninstalled in between,
+       flipping `available` to false). No polling: exactly one fetch per
+       open. Follows the same manually-toggled `.modal-overlay`/`hidden`
+       convention as every other modal in this file (see `error-logs-modal`
+       above) -- no <dialog>, no separate "open" CSS class. The three chart
+       sections are hand-rolled inline SVG built in JS via
+       `buildHeadroomBarChartSvg()` -- no charting library, per PRD #202. -->
+  <div id="headroom-savings-modal" class="modal-overlay" hidden>
+    <div class="modal headroom-savings-modal-content">
+      <h2 class="modal-heading">Headroom Savings</h2>
+
+      <p id="headroom-savings-modal-unavailable" class="headroom-savings-modal-unavailable-text" hidden>
+        Headroom savings are no longer available.
+      </p>
+
+      <div id="headroom-savings-modal-body">
+        <section class="headroom-savings-modal-section">
+          <h3 class="headroom-savings-modal-section-heading">Today / 7-day / 30-day</h3>
+          <p id="headroom-savings-modal-windows-empty" class="headroom-savings-modal-empty-text" hidden>No savings recorded yet</p>
+          <div id="headroom-savings-modal-windows-chart" class="headroom-savings-modal-chart"></div>
+        </section>
+
+        <section class="headroom-savings-modal-section">
+          <h3 class="headroom-savings-modal-section-heading">Cost avoided per model</h3>
+          <p id="headroom-savings-modal-model-empty" class="headroom-savings-modal-empty-text" hidden>No savings recorded yet</p>
+          <div id="headroom-savings-modal-model-chart" class="headroom-savings-modal-chart"></div>
+        </section>
+
+        <section class="headroom-savings-modal-section">
+          <h3 class="headroom-savings-modal-section-heading">Tokens saved per client</h3>
+          <p id="headroom-savings-modal-client-empty" class="headroom-savings-modal-empty-text" hidden>No savings recorded yet</p>
+          <div id="headroom-savings-modal-client-chart" class="headroom-savings-modal-chart"></div>
+        </section>
+      </div>
+
+      <button id="headroom-savings-modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
     </div>
   </div>
 
@@ -400,6 +468,7 @@
         <button id="headroom-gate-decline-btn" class="glass-btn" type="button">No thanks</button>
       </div>
       <p id="headroom-gate-progress-text" class="modal-text" hidden>Installing… this can take a few minutes.</p>
+      <pre id="headroom-gate-output-log" class="install-output-log" hidden></pre>
       <div id="headroom-gate-retry-actions" class="ready-to-proceed-actions" hidden>
         <button id="headroom-gate-retry-btn" class="glass-btn" type="button">Retry</button>
         <button id="headroom-gate-skip-btn" class="glass-btn" type="button">Skip for now</button>
@@ -426,6 +495,7 @@
         <button id="caveman-gate-decline-btn" class="glass-btn" type="button">No thanks</button>
       </div>
       <p id="caveman-gate-progress-text" class="modal-text" hidden>Installing…</p>
+      <pre id="caveman-gate-output-log" class="install-output-log" hidden></pre>
       <div id="caveman-gate-retry-actions" class="ready-to-proceed-actions" hidden>
         <button id="caveman-gate-retry-btn" class="glass-btn" type="button">Retry</button>
         <button id="caveman-gate-skip-btn" class="glass-btn" type="button">Skip for now</button>
@@ -517,12 +587,26 @@
     const ollamaGateSkipBtnEl = document.getElementById("ollama-gate-skip-btn");
     const headroomEnabledToggleEl = document.getElementById("headroom-enabled-toggle");
     const headroomToggleErrorEl = document.getElementById("headroom-toggle-error");
+    const headroomSavingsWidgetEl = document.getElementById("headroom-savings-widget");
+    const headroomSavingsTodayLineEl = document.getElementById("headroom-savings-today-line");
+    const headroomSavings30DayLineEl = document.getElementById("headroom-savings-30day-line");
+    const headroomSavingsModalEl = document.getElementById("headroom-savings-modal");
+    const headroomSavingsModalUnavailableEl = document.getElementById("headroom-savings-modal-unavailable");
+    const headroomSavingsModalBodyEl = document.getElementById("headroom-savings-modal-body");
+    const headroomSavingsModalWindowsEmptyEl = document.getElementById("headroom-savings-modal-windows-empty");
+    const headroomSavingsModalWindowsChartEl = document.getElementById("headroom-savings-modal-windows-chart");
+    const headroomSavingsModalModelEmptyEl = document.getElementById("headroom-savings-modal-model-empty");
+    const headroomSavingsModalModelChartEl = document.getElementById("headroom-savings-modal-model-chart");
+    const headroomSavingsModalClientEmptyEl = document.getElementById("headroom-savings-modal-client-empty");
+    const headroomSavingsModalClientChartEl = document.getElementById("headroom-savings-modal-client-chart");
+    const headroomSavingsModalCloseBtnEl = document.getElementById("headroom-savings-modal-close-btn");
     const headroomGateModalEl = document.getElementById("headroom-gate-modal");
     const headroomGateErrorEl = document.getElementById("headroom-gate-error");
     const headroomGateActionsEl = document.getElementById("headroom-gate-actions");
     const headroomGateInstallBtnEl = document.getElementById("headroom-gate-install-btn");
     const headroomGateDeclineBtnEl = document.getElementById("headroom-gate-decline-btn");
     const headroomGateProgressTextEl = document.getElementById("headroom-gate-progress-text");
+    const headroomGateOutputLogEl = document.getElementById("headroom-gate-output-log");
     const headroomGateRetryActionsEl = document.getElementById("headroom-gate-retry-actions");
     const headroomGateRetryBtnEl = document.getElementById("headroom-gate-retry-btn");
     const headroomGateSkipBtnEl = document.getElementById("headroom-gate-skip-btn");
@@ -534,6 +618,7 @@
     const cavemanGateInstallBtnEl = document.getElementById("caveman-gate-install-btn");
     const cavemanGateDeclineBtnEl = document.getElementById("caveman-gate-decline-btn");
     const cavemanGateProgressTextEl = document.getElementById("caveman-gate-progress-text");
+    const cavemanGateOutputLogEl = document.getElementById("caveman-gate-output-log");
     const cavemanGateRetryActionsEl = document.getElementById("caveman-gate-retry-actions");
     const cavemanGateRetryBtnEl = document.getElementById("caveman-gate-retry-btn");
     const cavemanGateSkipBtnEl = document.getElementById("caveman-gate-skip-btn");
@@ -1132,11 +1217,442 @@
       modelSelectSettingsEl.value = knownModel ?? "claude-sonnet-4-6";
       effortSelectSettingsEl.value = knownEffort ?? "auto";
       settingsModalEl.hidden = false;
+      // Issue #205: one fetch per panel open, never polled. Deliberately
+      // NOT gated on `headroomEnabledToggleEl.checked` above -- widget
+      // visibility is driven entirely by what `/api/headroom-savings`
+      // reports, so historical savings stay visible even with Headroom
+      // currently toggled off.
+      refreshHeadroomSavingsWidget();
     }
 
     function closeSettingsModal() {
       settingsModalEl.hidden = true;
     }
+
+    // --- Headroom token-savings widget (issue #205, part of PRD #202) ------
+    // Reads whatever real payload GET /api/headroom-savings (issue #204)
+    // returns. That endpoint is a thin pass-through of `headroom savings
+    // --json`'s own (undocumented) schema; the shape below --
+    // `windows: {today: {...}, last_30_days: {...}}`, each with
+    // `tokens_saved`/`percent` -- is #204's own confirmed test fixture and
+    // the PRD's described shape, but every field is read defensively
+    // (optional chaining, typeof checks, a few alternate key spellings for
+    // the 30-day window) rather than assumed, since Headroom itself
+    // publishes no `--json` schema. Falls back to the empty-ledger text
+    // whenever the expected numbers aren't there instead of throwing or
+    // rendering "undefined".
+
+    function pickHeadroomSavingsWindow(windows, keys) {
+      if (!windows || typeof windows !== "object") return {};
+      for (const key of keys) {
+        const candidate = windows[key];
+        if (candidate && typeof candidate === "object") return candidate;
+      }
+      return {};
+    }
+
+    function formatHeadroomTokenCount(value) {
+      return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : null;
+    }
+
+    // The real `headroom savings --json` payload names this field
+    // `savings_percent`, not `percent` (confirmed live against an actual
+    // Headroom install, issue #202 QA) -- `percent` is kept as a fallback
+    // only in case a future/older Headroom version spells it differently,
+    // not because it's the primary field.
+    function pickHeadroomSavingsPercent(windowData) {
+      if (!windowData || typeof windowData !== "object") return null;
+      for (const key of ["savings_percent", "percent"]) {
+        if (typeof windowData[key] === "number" && Number.isFinite(windowData[key])) return windowData[key];
+      }
+      return null;
+    }
+
+    function renderHeadroomSavingsWidget(data) {
+      if (!data || data.available !== true) {
+        headroomSavingsWidgetEl.hidden = true;
+        return;
+      }
+      if (data.empty) {
+        headroomSavingsTodayLineEl.textContent = "No savings recorded yet";
+        headroomSavings30DayLineEl.hidden = true;
+        headroomSavingsWidgetEl.hidden = false;
+        return;
+      }
+
+      const today = pickHeadroomSavingsWindow(data.windows, ["today"]);
+      const last30 = pickHeadroomSavingsWindow(data.windows, [
+        "last_30_days",
+        "last_30d",
+        "last30Days",
+        "thirty_days",
+        "30_day",
+      ]);
+
+      const todayPercent = pickHeadroomSavingsPercent(today);
+      const todayTokens = formatHeadroomTokenCount(today.tokens_saved);
+      if (todayPercent !== null && todayTokens !== null) {
+        headroomSavingsTodayLineEl.textContent = `${todayPercent}% saved (${todayTokens} tokens)`;
+      } else {
+        headroomSavingsTodayLineEl.textContent = "No savings recorded yet";
+      }
+
+      const last30Tokens = formatHeadroomTokenCount(last30.tokens_saved);
+      if (last30Tokens !== null) {
+        headroomSavings30DayLineEl.hidden = false;
+        headroomSavings30DayLineEl.textContent = `${last30Tokens} tokens saved in the last 30 days`;
+      } else {
+        headroomSavings30DayLineEl.hidden = true;
+      }
+
+      headroomSavingsWidgetEl.hidden = false;
+    }
+
+    async function refreshHeadroomSavingsWidget() {
+      try {
+        const res = await fetch("/api/headroom-savings");
+        const data = await res.json();
+        renderHeadroomSavingsWidget(data);
+      } catch (err) {
+        // Network hiccup, bad JSON, etc. -- treat exactly like an
+        // "unavailable" response and stay hidden rather than show a
+        // broken widget.
+        headroomSavingsWidgetEl.hidden = true;
+      }
+    }
+
+    // --- Headroom savings modal (issue #206, part of PRD #202) -------------
+    // Fetches GET /api/headroom-savings fresh every time the modal opens --
+    // deliberately never reuses refreshHeadroomSavingsWidget()'s earlier
+    // response above, since the modal can be opened well after Settings was
+    // opened (e.g. Headroom could have been uninstalled in between). Reuses
+    // pickHeadroomSavingsWindow()/formatHeadroomTokenCount() from the widget
+    // above for the windows breakdown, and applies the same "don't assume
+    // Headroom's undocumented --json schema" philosophy (typeof/
+    // Number.isFinite guards, a short list of alternate key spellings) to
+    // the two new per-model/per-client breakdowns via
+    // extractHeadroomBreakdown() below, rather than writing a second,
+    // possibly-inconsistent parser.
+
+    const HEADROOM_SAVINGS_CHART_WIDTH = 320;
+    const HEADROOM_SAVINGS_CHART_LABEL_WIDTH = 96;
+    const HEADROOM_SAVINGS_CHART_ROW_HEIGHT = 32;
+    const HEADROOM_SAVINGS_SVG_NS = "http://www.w3.org/2000/svg";
+
+    function createHeadroomSvgEl(tag, attrs) {
+      const el = document.createElementNS(HEADROOM_SAVINGS_SVG_NS, tag);
+      if (attrs) {
+        Object.keys(attrs).forEach((key) => el.setAttribute(key, attrs[key]));
+      }
+      return el;
+    }
+
+    function truncateHeadroomLabel(text, maxChars) {
+      const str = String(text);
+      return str.length > maxChars ? `${str.slice(0, maxChars - 1)}…` : str;
+    }
+
+    // Renders entries = [{label, value, valueText}] (value >= 0) as a
+    // horizontal bar chart. One renderer shared by all three sections so
+    // the today/7d/30d comparison and the two breakdown charts can't drift
+    // into inconsistent visual conventions.
+    //
+    // `maxValue` is the denominator each bar's width is a fraction of --
+    // it is NOT computed from the entries themselves (issue #202 QA: that
+    // used to be `Math.max(...entries.map(e => e.value))`, which makes
+    // every bar render at full width whenever the entries happen to share
+    // the same value, or whenever there's only one entry -- both routine
+    // cases here (a fresh install with one model/one client; today/7d/30d
+    // legitimately reading the same percentage before much history has
+    // accumulated), and a chart where every bar is full width conveys no
+    // information at all). Callers pass a denominator that means
+    // something for their specific data: a fixed 100 for percentages, or
+    // the sum across all entries for a share-of-total breakdown -- see
+    // each call site below.
+    function buildHeadroomBarChartSvg(entries, maxValue) {
+      const barAreaWidth = HEADROOM_SAVINGS_CHART_WIDTH - HEADROOM_SAVINGS_CHART_LABEL_WIDTH - 56;
+      const rowHeight = HEADROOM_SAVINGS_CHART_ROW_HEIGHT;
+      const height = entries.length * rowHeight + 8;
+      const svg = createHeadroomSvgEl("svg", {
+        viewBox: `0 0 ${HEADROOM_SAVINGS_CHART_WIDTH} ${height}`,
+        width: "100%",
+        height: String(height),
+        role: "img",
+      });
+      const resolvedMaxValue = Math.max(1e-9, maxValue ?? Math.max(...entries.map((e) => e.value)));
+      entries.forEach((entry, i) => {
+        const y = i * rowHeight + 4;
+        const barWidth = Math.max(2, (entry.value / resolvedMaxValue) * barAreaWidth);
+
+        const label = createHeadroomSvgEl("text", { x: "0", y: String(y + 13), class: "headroom-savings-chart-label" });
+        label.textContent = truncateHeadroomLabel(entry.label, 14);
+        svg.appendChild(label);
+
+        const track = createHeadroomSvgEl("rect", {
+          x: String(HEADROOM_SAVINGS_CHART_LABEL_WIDTH),
+          y: String(y),
+          width: String(barAreaWidth),
+          height: "18",
+          rx: "4",
+          class: "headroom-savings-chart-track",
+        });
+        svg.appendChild(track);
+
+        const bar = createHeadroomSvgEl("rect", {
+          x: String(HEADROOM_SAVINGS_CHART_LABEL_WIDTH),
+          y: String(y),
+          width: String(barWidth),
+          height: "18",
+          rx: "4",
+          class: "headroom-savings-chart-bar",
+        });
+        svg.appendChild(bar);
+
+        const valueLabel = createHeadroomSvgEl("text", {
+          x: String(HEADROOM_SAVINGS_CHART_LABEL_WIDTH + barAreaWidth + 6),
+          y: String(y + 13),
+          class: "headroom-savings-chart-value",
+        });
+        valueLabel.textContent = entry.valueText;
+        svg.appendChild(valueLabel);
+      });
+      return svg;
+    }
+
+    // Two-line-per-entry variant (issue #202 QA): name on its own line,
+    // then the bar + value on the line below, with a gap before the next
+    // entry -- used for the per-model/per-client breakdowns, where names
+    // (model ids, client names) can be long enough that squeezing them
+    // into a fixed left-hand label column (buildHeadroomBarChartSvg's
+    // single-row layout) truncates them. The today/7d/30d chart keeps the
+    // single-row layout -- its labels ("Today"/"7-day"/"30-day") always
+    // fit, and a comparison chart reads better with everything on one
+    // visual baseline.
+    function buildHeadroomStackedBarChartSvg(entries, maxValue) {
+      const width = HEADROOM_SAVINGS_CHART_WIDTH;
+      const labelLineHeight = 16;
+      const barLineHeight = 18;
+      const entryGap = 14;
+      const entryHeight = labelLineHeight + 4 + barLineHeight + entryGap;
+      const height = entries.length * entryHeight - entryGap + 8;
+      const svg = createHeadroomSvgEl("svg", {
+        viewBox: `0 0 ${width} ${height}`,
+        width: "100%",
+        height: String(height),
+        role: "img",
+      });
+      const resolvedMaxValue = Math.max(1e-9, maxValue ?? Math.max(...entries.map((e) => e.value)));
+      const valueColumnWidth = 64;
+      const barAreaWidth = width - valueColumnWidth - 8;
+      entries.forEach((entry, i) => {
+        const entryTop = i * entryHeight;
+        const labelY = entryTop + 12;
+        const barY = entryTop + labelLineHeight + 4;
+        const barWidth = Math.max(2, (entry.value / resolvedMaxValue) * barAreaWidth);
+
+        const label = createHeadroomSvgEl("text", { x: "0", y: String(labelY), class: "headroom-savings-chart-label" });
+        label.textContent = truncateHeadroomLabel(entry.label, 42);
+        svg.appendChild(label);
+
+        const track = createHeadroomSvgEl("rect", {
+          x: "0",
+          y: String(barY),
+          width: String(barAreaWidth),
+          height: String(barLineHeight),
+          rx: "4",
+          class: "headroom-savings-chart-track",
+        });
+        svg.appendChild(track);
+
+        const bar = createHeadroomSvgEl("rect", {
+          x: "0",
+          y: String(barY),
+          width: String(barWidth),
+          height: String(barLineHeight),
+          rx: "4",
+          class: "headroom-savings-chart-bar",
+        });
+        svg.appendChild(bar);
+
+        const valueLabel = createHeadroomSvgEl("text", {
+          x: String(barAreaWidth + 6),
+          y: String(barY + 13),
+          class: "headroom-savings-chart-value",
+        });
+        valueLabel.textContent = entry.valueText;
+        svg.appendChild(valueLabel);
+      });
+      return svg;
+    }
+
+    // Shows either the chart (entries.length > 0) or the section's own
+    // "No savings recorded yet" text -- never both, never a blank/broken
+    // chart. Called with an empty array for every section on `data.empty`,
+    // and per-section whenever that section's own defensive extraction
+    // comes up empty (e.g. the payload is missing that field entirely).
+    // `chartBuilder` defaults to the single-row layout (buildHeadroomBarChartSvg);
+    // pass buildHeadroomStackedBarChartSvg for the per-model/per-client sections.
+    function renderHeadroomChartSection(containerEl, emptyEl, entries, maxValue, chartBuilder) {
+      containerEl.innerHTML = "";
+      if (!entries || entries.length === 0) {
+        emptyEl.hidden = false;
+        containerEl.hidden = true;
+        return;
+      }
+      emptyEl.hidden = true;
+      containerEl.hidden = false;
+      containerEl.appendChild((chartBuilder || buildHeadroomBarChartSvg)(entries, maxValue));
+    }
+
+    // Defensively pulls {label, value} rows out of an uncertain payload
+    // shape: either a list of objects (each with a name-ish field and a
+    // value-ish field) or a dict keyed by name -> number | {value-ish
+    // field}. Same "don't assume the exact undocumented schema" approach
+    // pickHeadroomSavingsWindow() uses for the windows object above,
+    // generalized to the by_model/by_client breakdowns.
+    function extractHeadroomBreakdown(source, nameKeys, valueKeys) {
+      const entries = [];
+      if (Array.isArray(source)) {
+        source.forEach((item) => {
+          if (!item || typeof item !== "object") return;
+          let name = null;
+          for (const key of nameKeys) {
+            if (typeof item[key] === "string" && item[key]) { name = item[key]; break; }
+          }
+          let value = null;
+          for (const key of valueKeys) {
+            if (typeof item[key] === "number" && Number.isFinite(item[key])) { value = item[key]; break; }
+          }
+          if (name !== null && value !== null && value >= 0) entries.push({ label: name, value });
+        });
+      } else if (source && typeof source === "object") {
+        Object.keys(source).forEach((key) => {
+          const item = source[key];
+          let value = null;
+          if (typeof item === "number" && Number.isFinite(item)) {
+            value = item;
+          } else if (item && typeof item === "object") {
+            for (const vk of valueKeys) {
+              if (typeof item[vk] === "number" && Number.isFinite(item[vk])) { value = item[vk]; break; }
+            }
+          }
+          if (value !== null && value >= 0) entries.push({ label: key, value });
+        });
+      }
+      return entries;
+    }
+
+    function renderHeadroomSavingsModalWindows(data) {
+      const windowDefs = [
+        { label: "Today", keys: ["today"] },
+        { label: "7-day", keys: ["last_7_days", "last_7d", "last7Days", "seven_days", "7_day"] },
+        { label: "30-day", keys: ["last_30_days", "last_30d", "last30Days", "thirty_days", "30_day"] },
+      ];
+      const entries = [];
+      windowDefs.forEach((def) => {
+        const windowData = pickHeadroomSavingsWindow(data.windows, def.keys);
+        const percent = pickHeadroomSavingsPercent(windowData);
+        if (percent !== null && percent >= 0) entries.push({ label: def.label, value: percent, valueText: `${percent}%` });
+      });
+      // Fixed denominator of 100, not the entries' own max: these values
+      // are already percentages (0-100), and today/7d/30d routinely share
+      // the same value before much history has accumulated -- scaling
+      // against each other would make all three bars full width and
+      // erase the one thing this chart exists to show (see
+      // buildHeadroomBarChartSvg's docstring).
+      renderHeadroomChartSection(headroomSavingsModalWindowsChartEl, headroomSavingsModalWindowsEmptyEl, entries, 100);
+    }
+
+    // Sum of every entry's own value -- the denominator for a
+    // share-of-total breakdown chart (per-model, per-client), so each
+    // bar's width represents "this model/client's share of the combined
+    // total" rather than "this model/client relative to whichever one
+    // happens to be biggest." With only one entry (a fresh install has
+    // exactly one model/client so far) this still renders a full bar,
+    // but that's now correct: 100% of savings genuinely did come from
+    // the one model/client recorded.
+    function sumHeadroomEntryValues(entries) {
+      return entries.reduce((total, e) => total + e.value, 0);
+    }
+
+    function renderHeadroomSavingsModalByModel(data) {
+      const raw = extractHeadroomBreakdown(
+        data.by_model ?? data.per_model ?? data.models,
+        ["model", "name"],
+        ["cost_avoided_usd", "cost_avoided", "cost_usd", "cost"]
+      );
+      const entries = raw.map((e) => ({ ...e, valueText: `$${e.value.toFixed(2)}` }));
+      renderHeadroomChartSection(
+        headroomSavingsModalModelChartEl,
+        headroomSavingsModalModelEmptyEl,
+        entries,
+        sumHeadroomEntryValues(entries),
+        buildHeadroomStackedBarChartSvg
+      );
+    }
+
+    function renderHeadroomSavingsModalByClient(data) {
+      const raw = extractHeadroomBreakdown(
+        data.by_client ?? data.per_client ?? data.clients,
+        ["client", "name"],
+        ["tokens_saved", "tokens"]
+      );
+      const entries = raw.map((e) => ({ ...e, valueText: formatHeadroomTokenCount(e.value) ?? String(e.value) }));
+      renderHeadroomChartSection(
+        headroomSavingsModalClientChartEl,
+        headroomSavingsModalClientEmptyEl,
+        entries,
+        sumHeadroomEntryValues(entries),
+        buildHeadroomStackedBarChartSvg
+      );
+    }
+
+    // Top-level render dispatch, mirroring renderHeadroomSavingsWidget()'s
+    // three-way available/empty/data handling above -- unavailable shows a
+    // plain message with the chart sections hidden entirely (never a
+    // broken/empty chart), empty shows every section's own empty state,
+    // and real data renders all three charts.
+    function renderHeadroomSavingsModal(data) {
+      if (!data || data.available !== true) {
+        headroomSavingsModalUnavailableEl.hidden = false;
+        headroomSavingsModalBodyEl.hidden = true;
+        return;
+      }
+      headroomSavingsModalUnavailableEl.hidden = true;
+      headroomSavingsModalBodyEl.hidden = false;
+      if (data.empty) {
+        renderHeadroomChartSection(headroomSavingsModalWindowsChartEl, headroomSavingsModalWindowsEmptyEl, []);
+        renderHeadroomChartSection(headroomSavingsModalModelChartEl, headroomSavingsModalModelEmptyEl, []);
+        renderHeadroomChartSection(headroomSavingsModalClientChartEl, headroomSavingsModalClientEmptyEl, []);
+        return;
+      }
+      renderHeadroomSavingsModalWindows(data);
+      renderHeadroomSavingsModalByModel(data);
+      renderHeadroomSavingsModalByClient(data);
+    }
+
+    // Wired to the Settings widget's click listener below. Deliberately
+    // `async` and re-fetches every call -- no caching, no polling, one
+    // fetch per open, per issue #206's acceptance criteria.
+    async function openHeadroomSavingsModal() {
+      headroomSavingsModalEl.hidden = false;
+      try {
+        const res = await fetch("/api/headroom-savings");
+        const data = await res.json();
+        renderHeadroomSavingsModal(data);
+      } catch (err) {
+        // Network hiccup / bad JSON -- same "unavailable" treatment as
+        // refreshHeadroomSavingsWidget()'s own fetch failure handling above.
+        renderHeadroomSavingsModal({ available: false });
+      }
+    }
+
+    function closeHeadroomSavingsModal() {
+      headroomSavingsModalEl.hidden = true;
+    }
+
+    headroomSavingsWidgetEl.addEventListener("click", openHeadroomSavingsModal);
+    headroomSavingsModalCloseBtnEl.addEventListener("click", closeHeadroomSavingsModal);
 
     // --- Error Logs modal (issue #156) ------------------------------------
     // Opened/closed the same way as the Settings modal above (plain
@@ -1347,9 +1863,54 @@
       }
     }
 
-    async function runHeadroomInstall() {
-      const res = await fetch("/api/headroom-install", { method: "POST" });
-      return res.json();
+    // Generic "run a POST to completion while polling a status endpoint
+    // for live progress" helper, shared by the Headroom and Caveman
+    // install flows -- shows the actual current stage (Headroom only --
+    // Caveman's status has no `stage`, just `lines`) AND the real
+    // subprocess output as it arrives (both), instead of a single static
+    // "please wait" message the whole time. Lets the user see exactly
+    // what's running and where it's stuck if something goes wrong.
+    async function runInstallWithLiveProgress({ installUrl, statusUrl, progressTextEl, outputLogEl, defaultProgressText }) {
+      progressTextEl.textContent = defaultProgressText;
+      outputLogEl.textContent = "";
+      outputLogEl.hidden = false;
+      const pollStatus = async () => {
+        try {
+          const res = await fetch(statusUrl);
+          const status = await res.json();
+          if (Object.prototype.hasOwnProperty.call(status, "stage")) {
+            progressTextEl.textContent = status.stage || defaultProgressText;
+          }
+          if (Array.isArray(status.lines) && status.lines.length > 0) {
+            outputLogEl.textContent = status.lines.join("\n");
+            outputLogEl.scrollTop = outputLogEl.scrollHeight;
+          }
+        } catch {
+          // Transient fetch failure while polling -- keep whatever's
+          // already shown rather than clobbering it with the default.
+        }
+      };
+      const intervalId = setInterval(pollStatus, 500);
+      pollStatus(); // first update without waiting a full interval
+      try {
+        const res = await fetch(installUrl, { method: "POST" });
+        return await res.json();
+      } finally {
+        clearInterval(intervalId);
+        outputLogEl.hidden = true;
+      }
+    }
+
+    const HEADROOM_INSTALL_DEFAULT_PROGRESS_TEXT = "Installing… this can take a few minutes.";
+
+    async function runHeadroomInstallWithLiveProgress(progressTextEl) {
+      return runInstallWithLiveProgress({
+        installUrl: "/api/headroom-install",
+        statusUrl: "/api/headroom-install-status",
+        progressTextEl,
+        outputLogEl: headroomGateOutputLogEl,
+        defaultProgressText: HEADROOM_INSTALL_DEFAULT_PROGRESS_TEXT,
+      });
     }
 
     headroomGateInstallBtnEl.addEventListener("click", async () => {
@@ -1357,7 +1918,7 @@
       headroomGateErrorEl.hidden = true;
       headroomGateProgressTextEl.hidden = false;
 
-      const data = await runHeadroomInstall();
+      const data = await runHeadroomInstallWithLiveProgress(headroomGateProgressTextEl);
 
       headroomGateProgressTextEl.hidden = true;
       if (data.ok) {
@@ -1386,7 +1947,7 @@
       headroomGateErrorEl.hidden = true;
       headroomGateProgressTextEl.hidden = false;
 
-      const data = await runHeadroomInstall();
+      const data = await runHeadroomInstallWithLiveProgress(headroomGateProgressTextEl);
 
       headroomGateProgressTextEl.hidden = true;
       if (data.ok) {
@@ -1424,7 +1985,8 @@
       if (status.presence === "present") return;
 
       headroomEnabledToggleEl.disabled = true;
-      const data = await runHeadroomInstall();
+      const installRes = await fetch("/api/headroom-install", { method: "POST" });
+      const data = await installRes.json();
       headroomEnabledToggleEl.disabled = false;
 
       if (!data.ok) {
@@ -1458,12 +2020,24 @@
       return res.json();
     }
 
+    const CAVEMAN_INSTALL_DEFAULT_PROGRESS_TEXT = "Installing…";
+
+    async function runCavemanInstallWithLiveProgress(progressTextEl) {
+      return runInstallWithLiveProgress({
+        installUrl: "/api/caveman-install",
+        statusUrl: "/api/caveman-install-status",
+        progressTextEl,
+        outputLogEl: cavemanGateOutputLogEl,
+        defaultProgressText: CAVEMAN_INSTALL_DEFAULT_PROGRESS_TEXT,
+      });
+    }
+
     cavemanGateInstallBtnEl.addEventListener("click", async () => {
       cavemanGateActionsEl.hidden = true;
       cavemanGateErrorEl.hidden = true;
       cavemanGateProgressTextEl.hidden = false;
 
-      const data = await runCavemanInstall();
+      const data = await runCavemanInstallWithLiveProgress(cavemanGateProgressTextEl);
 
       cavemanGateProgressTextEl.hidden = true;
       if (data.ok) {
@@ -1490,7 +2064,7 @@
       cavemanGateErrorEl.hidden = true;
       cavemanGateProgressTextEl.hidden = false;
 
-      const data = await runCavemanInstall();
+      const data = await runCavemanInstallWithLiveProgress(cavemanGateProgressTextEl);
 
       cavemanGateProgressTextEl.hidden = true;
       if (data.ok) {

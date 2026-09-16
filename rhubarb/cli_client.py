@@ -11,6 +11,8 @@ import platform
 import subprocess
 from pathlib import Path
 
+from rhubarb.headroom_installer import HEADROOM_BASE_URL as _HEADROOM_BASE_URL
+
 
 class ClaudeCLIError(RuntimeError):
     pass
@@ -43,7 +45,9 @@ def _effort_args(effort: str | None) -> list[str]:
 # `_clean_env` reads this flag to add ANTHROPIC_BASE_URL when needed.
 # Always False until app.py explicitly activates it -- no Headroom by default.
 _headroom_proxy_active: bool = False
-_HEADROOM_BASE_URL = "http://localhost:8080"
+# `_HEADROOM_BASE_URL` itself is imported from `headroom_installer` above
+# (issue #203) rather than hardcoded here -- see that module's
+# `HEADROOM_PROXY_PORT`/`HEADROOM_BASE_URL` docstring for why.
 
 
 def set_headroom_proxy_active(active: bool) -> None:

@@ -3,6 +3,7 @@ import json
 import pytest
 
 from rhubarb import cli_client
+from rhubarb.headroom_installer import HEADROOM_BASE_URL, HEADROOM_PROXY_PORT
 
 
 def test_run_prompt_skips_permission_checks(monkeypatch):
@@ -111,3 +112,39 @@ def test_get_auth_status_raises_on_nonzero_exit(monkeypatch):
 
     with pytest.raises(cli_client.ClaudeCLIError):
         cli_client.get_auth_status()
+
+
+# ---------------------------------------------------------------------------
+# Headroom proxy port (issue #203)
+# ---------------------------------------------------------------------------
+
+
+def test_headroom_base_url_derives_from_the_shared_port_constant():
+    """`cli_client._HEADROOM_BASE_URL` must not be an independent hardcoded
+    copy -- it derives from `headroom_installer.HEADROOM_BASE_URL`/
+    `HEADROOM_PROXY_PORT`, the single shared source of truth."""
+    assert cli_client._HEADROOM_BASE_URL == HEADROOM_BASE_URL
+    assert cli_client._HEADROOM_BASE_URL == f"http://localhost:{HEADROOM_PROXY_PORT}"
+    assert cli_client._HEADROOM_BASE_URL == "http://localhost:8787"
+
+
+def test_run_prompt_sets_anthropic_base_url_to_the_shared_port_when_headroom_active(monkeypatch):
+    captured = {}
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"session_id": "abc"})
+        stderr = ""
+
+    def fake_run(args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeResult()
+
+    monkeypatch.setattr(cli_client.subprocess, "run", fake_run)
+    cli_client.set_headroom_proxy_active(True)
+    try:
+        cli_client.run_prompt("hello")
+    finally:
+        cli_client.set_headroom_proxy_active(False)
+
+    assert captured["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:8787"

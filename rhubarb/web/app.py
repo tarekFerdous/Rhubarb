@@ -38,8 +38,17 @@ def _start_headroom_proxy() -> None:
     global _headroom_proxy
     if _headroom_proxy is not None and _headroom_proxy.poll() is None:
         return  # already running
+    # `resolve_headroom_command()`, not a bare `"headroom"`: this backend
+    # process's `PATH` doesn't reliably include the pip scripts directory
+    # `headroom` was just installed into -- see its own docstring (issue
+    # #200 QA) for the same `WinError 2` class of bug this sidesteps.
+    # `--port` passed explicitly (issue #203) rather than relying on
+    # Headroom's own implicit default: the value here and the value
+    # `cli_client.py`'s `ANTHROPIC_BASE_URL` assumes both derive from the
+    # same `headroom_installer.HEADROOM_PROXY_PORT` constant, so they can
+    # never silently drift apart again.
     _headroom_proxy = subprocess.Popen(
-        ["headroom", "proxy"],
+        [headroom_installer.resolve_headroom_command(), "proxy", "--port", str(headroom_installer.HEADROOM_PROXY_PORT)],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -347,6 +356,124 @@ def headroom_status():
     }
 
 
+def _run_headroom_savings_command() -> str:
+    """Runs `headroom savings --json` and returns its raw stdout. Split out
+    from `headroom_savings()` below as a single injectable call point --
+    tests monkeypatch this function directly (the same "monkeypatch the
+    one function that actually shells out" pattern already used for
+    `_start_headroom_proxy` elsewhere in this file), so no real subprocess
+    is spawned in tests.
+
+    `resolve_headroom_command()`, not a bare `"headroom"` -- same PATH
+    caveat as `_start_headroom_proxy`/`check_headroom_presence`: the pip
+    scripts directory `headroom` was installed into isn't reliably on this
+    backend process's `PATH`."""
+    result = subprocess.run(
+        [headroom_installer.resolve_headroom_command(), "savings", "--json"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+def _headroom_savings_has_data(data) -> bool:
+    """Headroom's own docs (checked directly -- `savings.mdx` shows only
+    the human-readable summary, no published `--json` schema) don't
+    document an explicit empty-ledger flag in the JSON output, so this
+    recursively scans the parsed payload for any numeric field whose key
+    looks like a "tokens saved" count (matched loosely on "saved" in the
+    key name, e.g. `tokens_saved`) that's greater than zero. Deliberately
+    not keyed to one exact field name/path -- issue #204 asks for
+    defensive parsing that tolerates the real output's field names
+    differing slightly from any guess made here, rather than hardcoding a
+    schema no one has confirmed byte-for-byte. A payload with no such
+    field anywhere (including a missing/empty `windows` breakdown
+    entirely) is treated as an empty ledger, matching #204's guidance to
+    treat "ran fine, parsed fine, every window shows zero" as the empty
+    signal."""
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and "saved" in key.lower() and value > 0:
+                return True
+            if _headroom_savings_has_data(value):
+                return True
+    elif isinstance(data, list):
+        for item in data:
+            if _headroom_savings_has_data(item):
+                return True
+    return False
+
+
+@app.get("/api/headroom-savings")
+def headroom_savings():
+    """Backend for the Settings token-savings widget/modal (issue #204,
+    part of PRD #202). Plain `def` route (matching `headroom_status`/
+    `caveman_status`'s convention) so FastAPI runs it in a worker thread --
+    the blocking `headroom savings --json` subprocess call never blocks
+    the event loop.
+
+    Three distinct response shapes the frontend needs to tell apart (see
+    issue #204's acceptance criteria):
+    - `{"available": False}` -- the command failed to run at all (not
+      installed, non-zero exit, or output that isn't valid JSON). The
+      frontend hides the widget entirely on this shape.
+    - `{"available": True, "empty": True}` -- the command ran fine and
+      produced valid JSON, but no compressions have been recorded yet
+      (every "tokens saved"-shaped field is zero, or the payload has no
+      such field at all). The frontend shows a "No savings recorded yet"
+      state, not an error.
+    - `{"available": True, "empty": False, **data}` -- ran fine with real
+      data. `data` is `headroom savings --json`'s own parsed payload,
+      merged through as-is rather than reshaped into hand-picked fields:
+      Headroom's docs don't publish a `--json` schema, so this is a thin
+      pass-through of whatever real keys the command emits (expected,
+      per the human-readable `headroom savings` example and PRD #202: a
+      today/7-day/30-day window breakdown, a per-model cost-avoided
+      breakdown, and a per-client tokens-saved breakdown) rather than a
+      guess at exact field names issues #205/#206 would otherwise be
+      briefed against incorrectly."""
+    try:
+        raw_output = _run_headroom_savings_command()
+        data = json.loads(raw_output)
+        if not isinstance(data, dict):
+            return {"available": False}
+    except Exception:
+        return {"available": False}
+    if not _headroom_savings_has_data(data):
+        return {"available": True, "empty": True}
+    return {"available": True, "empty": False, **data}
+
+
+# One human-readable "what's happening right now" string for the in-flight
+# `/api/headroom-install` call, so the frontend can show real progress
+# instead of a static "please wait" message -- polled by
+# `/api/headroom-install-status` while the install request is outstanding.
+# `None` when no install is running. A plain module-level string (like
+# `_headroom_proxy`/`_active_project_id` elsewhere in this file): the
+# install itself runs in a worker thread while this is read from the event
+# loop thread, and the GIL makes a single reference assignment/read safe
+# without a lock for this "eventually consistent progress text" use case.
+_headroom_install_stage: str | None = None
+
+# The actual `pip install "headroom-ai[all]"` output, one line per list
+# entry, appended live as `headroom_installer.run_streaming` reads each
+# line off the subprocess -- so a stuck/slow install shows real terminal
+# output (what it's downloading/building right now) instead of just a
+# static stage label. Reset to `[]` at the start of each install; polled
+# alongside `_headroom_install_stage`.
+_headroom_install_lines: list[str] = []
+
+
+def _headroom_install_run(argv: list[str]) -> None:
+    headroom_installer.run_streaming(argv, on_line=_headroom_install_lines.append)
+
+
+@app.get("/api/headroom-install-status")
+def headroom_install_status():
+    return {"stage": _headroom_install_stage, "lines": _headroom_install_lines}
+
+
 @app.post("/api/headroom-install")
 def start_headroom_install():
     """Runs the install to completion and returns the result. Plain `def`
@@ -354,14 +481,21 @@ def start_headroom_install():
     blocks the event loop or concurrent sessions. On success, starts the
     Headroom proxy immediately so new sessions pick up ANTHROPIC_BASE_URL
     without a restart."""
+    global _headroom_install_stage
+    _headroom_install_lines.clear()
     try:
+        _headroom_install_stage = "Checking whether Headroom is already installed…"
         presence = headroom_installer.check_headroom_presence()
         if presence == headroom_installer.PRESENCE_NOT_PRESENT:
-            headroom_installer.install_for_platform()
+            _headroom_install_stage = "Installing Headroom (pip install \"headroom-ai[all]\") — this can take a few minutes…"
+            headroom_installer.install_for_platform(run=_headroom_install_run)
+        _headroom_install_stage = "Starting the Headroom proxy…"
         _start_headroom_proxy()
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+    finally:
+        _headroom_install_stage = None
 
 
 @app.post("/api/settings/headroom-declined")
@@ -389,16 +523,33 @@ def caveman_status():
     }
 
 
+# Same live-output pattern as `_headroom_install_lines` above, for the
+# `npx skills add ...` install -- reset at the start of each install,
+# appended live via `caveman_installer.run_streaming`, polled by
+# `/api/caveman-install-status`.
+_caveman_install_lines: list[str] = []
+
+
+def _caveman_install_run(argv: list[str]) -> None:
+    caveman_installer.run_streaming(argv, on_line=_caveman_install_lines.append)
+
+
+@app.get("/api/caveman-install-status")
+def caveman_install_status():
+    return {"lines": _caveman_install_lines}
+
+
 @app.post("/api/caveman-install")
 def start_caveman_install():
     """Runs the skill install to completion and returns the result. Plain
     `def` route (worker thread) -- never blocks the event loop or concurrent
     sessions. No proxy to manage: once installed globally, the skill is
     available to any `claude` invocation Rhubarb spawns automatically."""
+    _caveman_install_lines.clear()
     try:
         presence = caveman_installer.check_caveman_presence()
         if presence == caveman_installer.PRESENCE_NOT_PRESENT:
-            caveman_installer.install_caveman()
+            caveman_installer.install_caveman(run=_caveman_install_run)
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}

@@ -486,6 +486,27 @@ textarea.prompt-box:focus {
   margin: -12px 0 20px;
 }
 
+/* Live subprocess output during a Headroom/Caveman install (issue: "show
+   me actual things that are happening, like lines of terminal" instead of
+   a static "please wait" message) -- a small scrolling terminal-style log,
+   populated by polling `/api/*-install-status`'s `lines` array. */
+.install-output-log {
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  color: var(--fg-muted);
+  font-family: "Recursive Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.7rem;
+  line-height: 1.5;
+  text-align: left;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 160px;
+  overflow-y: auto;
+  margin: -8px 0 20px;
+  padding: 10px 12px;
+}
+
 .modal-select-input {
   width: 100%;
   box-sizing: border-box;
@@ -674,6 +695,101 @@ textarea.prompt-box:focus {
   font-size: 0.72rem;
   font-variation-settings: "MONO" 0, "CASL" 0, "wght" 700, "slnt" 0, "CRSV" 0;
   margin: 0 0 16px;
+}
+
+/* Headroom token-savings widget (issue #205, part of PRD #202) -- a
+   two-line variant of the compact-badge pattern above (.rescue-source-badge
+   /.session-card-badge: pill-ish shape, small muted text, no new visual
+   language) rather than a full card. A real `<button>` so it's natively
+   clickable/keyboard-focusable; stays `hidden` (see prompt.html) until
+   GET /api/headroom-savings reports `available: true`. */
+.headroom-savings-widget {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 14px;
+  background: rgba(127, 127, 127, 0.12);
+  cursor: pointer;
+  margin: -12px 0 20px;
+  font-family: inherit;
+}
+
+.headroom-savings-widget:hover,
+.headroom-savings-widget:focus-visible {
+  background: rgba(127, 127, 127, 0.2);
+}
+
+.headroom-savings-line {
+  display: block;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--fg-muted);
+  font-variation-settings: "MONO" 0, "CASL" 0, "wght" 500, "slnt" 0, "CRSV" 0;
+}
+
+/* Headroom savings modal (issue #206, part of PRD #202) -- wider than the
+   default 400px modal so the hand-rolled inline-SVG bar charts have room,
+   same convention as .error-logs-modal-content above. */
+.headroom-savings-modal-content {
+  width: min(420px, calc(100% - 32px));
+  text-align: left;
+}
+
+.headroom-savings-modal-content .modal-heading {
+  text-align: center;
+}
+
+.headroom-savings-modal-unavailable-text {
+  color: var(--fg-muted);
+  font-size: 0.85rem;
+  text-align: center;
+  margin: 0 0 20px;
+}
+
+.headroom-savings-modal-section {
+  margin: 0 0 20px;
+}
+
+.headroom-savings-modal-section-heading {
+  font-size: 0.85rem;
+  margin: 0 0 8px;
+  color: var(--fg);
+}
+
+.headroom-savings-modal-empty-text {
+  color: var(--fg-muted);
+  font-size: 0.8rem;
+  margin: 0;
+}
+
+.headroom-savings-modal-chart {
+  width: 100%;
+}
+
+.headroom-savings-modal-chart[hidden] {
+  display: none;
+}
+
+/* Bar-chart primitives shared by all three sections (built in JS via
+   buildHeadroomBarChartSvg() in prompt.html) -- inline SVG so these CSS
+   custom properties cascade straight into it, no separate light/dark
+   handling needed. */
+.headroom-savings-chart-label,
+.headroom-savings-chart-value {
+  font-size: 10px;
+  font-family: "Recursive", sans-serif;
+  fill: var(--fg-muted);
+  dominant-baseline: middle;
+}
+
+.headroom-savings-chart-track {
+  fill: rgba(127, 127, 127, 0.15);
+}
+
+.headroom-savings-chart-bar {
+  fill: var(--glass-bg);
 }
 
 .ready-to-proceed-actions {

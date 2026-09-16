@@ -1,7 +1,7 @@
 import json
 import subprocess
 
-from rhubarb import afk_loop, caveman_installer, db, error_log, ollama_installer, session_runner
+from rhubarb import afk_loop, caveman_installer, cli_client, db, error_log, headroom_installer, ollama_installer, session_runner
 from rhubarb.web import app as app_module
 
 
@@ -1174,6 +1174,227 @@ def _cwd_for(project_id):
 
 
 # ---------------------------------------------------------------------------
+# Headroom consent/install gate (issue #200) -- live install output
+# ---------------------------------------------------------------------------
+
+
+def test_headroom_install_status_reflects_live_output_lines(client, monkeypatch):
+    """The install endpoint routes `headroom_installer.install_for_platform`
+    through a `run` that streams live subprocess output into
+    `_headroom_install_lines` -- `/api/headroom-install-status` must
+    expose exactly what got streamed, so the UI can show real pip output
+    instead of a static "please wait" message."""
+    monkeypatch.setattr(headroom_installer, "check_headroom_presence", lambda: headroom_installer.PRESENCE_NOT_PRESENT)
+    monkeypatch.setattr(app_module, "_start_headroom_proxy", lambda: None)
+
+    def fake_run_streaming(argv, *, on_line=None, popen_factory=None):
+        on_line("Collecting headroom-ai")
+        on_line("Successfully installed headroom-ai-1.0.0")
+
+    monkeypatch.setattr(headroom_installer, "run_streaming", fake_run_streaming)
+
+    resp = client.post("/api/headroom-install")
+    assert resp.json() == {"ok": True}
+
+    status = client.get("/api/headroom-install-status").json()
+    assert status["lines"] == ["Collecting headroom-ai", "Successfully installed headroom-ai-1.0.0"]
+    assert status["stage"] is None  # cleared once the install finishes
+
+
+def test_headroom_install_status_lines_reset_on_a_new_install(client, monkeypatch):
+    """A fresh install call must start from an empty log, not append onto
+    whatever a previous (possibly failed) install left behind."""
+    monkeypatch.setattr(headroom_installer, "check_headroom_presence", lambda: headroom_installer.PRESENCE_NOT_PRESENT)
+    monkeypatch.setattr(app_module, "_start_headroom_proxy", lambda: None)
+
+    calls = {"n": 0}
+
+    def fake_run_streaming(argv, *, on_line=None, popen_factory=None):
+        calls["n"] += 1
+        on_line(f"run {calls['n']}")
+
+    monkeypatch.setattr(headroom_installer, "run_streaming", fake_run_streaming)
+
+    client.post("/api/headroom-install")
+    client.post("/api/headroom-install")
+
+    status = client.get("/api/headroom-install-status").json()
+    assert status["lines"] == ["run 2"]
+
+
+def test_start_headroom_proxy_passes_explicit_port_flag(monkeypatch):
+    """Issue #203: `_start_headroom_proxy()` must pass `--port` explicitly
+    (matching `headroom_installer.HEADROOM_PROXY_PORT`) rather than relying
+    on Headroom's own implicit default, so the port Rhubarb assumes
+    (`cli_client`'s `ANTHROPIC_BASE_URL`) and the port the proxy actually
+    binds to can't silently drift apart."""
+    monkeypatch.setattr(app_module, "_headroom_proxy", None)
+    monkeypatch.setattr(headroom_installer, "resolve_headroom_command", lambda: "headroom")
+
+    captured = {}
+
+    class FakeProcess:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        return FakeProcess()
+
+    monkeypatch.setattr(app_module.subprocess, "Popen", fake_popen)
+
+    try:
+        app_module._start_headroom_proxy()
+
+        assert captured["argv"][0] == "headroom"
+        assert captured["argv"][1] == "proxy"
+        assert "--port" in captured["argv"]
+        port_value = captured["argv"][captured["argv"].index("--port") + 1]
+        assert port_value == str(headroom_installer.HEADROOM_PROXY_PORT)
+        assert port_value == "8787"
+    finally:
+        # `_start_headroom_proxy` calls the real `set_headroom_proxy_active`,
+        # which mutates a module-level flag in `cli_client` that isn't
+        # covered by `monkeypatch` -- reset it so this test can't leak
+        # Headroom-active state into any test that runs after it.
+        cli_client.set_headroom_proxy_active(False)
+
+
+# ---------------------------------------------------------------------------
+# Headroom savings widget/modal backend (issue #204, part of PRD #202)
+# ---------------------------------------------------------------------------
+
+
+def test_headroom_savings_returns_data_shape_when_command_succeeds_with_data(client, monkeypatch):
+    """A successful `headroom savings --json` run with real data is passed
+    through as `{"available": True, "empty": False, **parsed_json}` --
+    the frontend (later issues #205/#206) consumes Headroom's own field
+    names as-is rather than a reshaped guess."""
+    payload = {
+        "windows": {
+            "today": {"tokens_saved": 19000, "tokens_total": 28000, "percent": 67.9, "cost_usd": 0.085},
+            "last_7_days": {"tokens_saved": 47000, "tokens_total": 70000, "percent": 67.1, "cost_usd": 0.225},
+            "last_30_days": {"tokens_saved": 78000, "tokens_total": 120000, "percent": 65.0, "cost_usd": 0.268},
+        },
+        "by_model": [
+            {"model": "claude-opus-4-8", "cost_avoided_usd": 0.175},
+            {"model": "gpt-5.5", "cost_avoided_usd": 0.035},
+        ],
+        "by_client": [
+            {"client": "claude-code", "calls": 4, "tokens_saved": 60000},
+            {"client": "codex", "calls": 2, "tokens_saved": 18000},
+        ],
+    }
+    monkeypatch.setattr(app_module, "_run_headroom_savings_command", lambda: json.dumps(payload))
+
+    data = client.get("/api/headroom-savings").json()
+
+    assert data == {"available": True, "empty": False, **payload}
+
+
+def test_headroom_savings_reports_distinct_empty_shape_when_ledger_has_no_data(client, monkeypatch):
+    """A fresh install with no compressions recorded yet must be reported
+    as `{"available": True, "empty": True}` -- distinct from both a
+    working dashboard and a broken/missing command, so the frontend shows
+    "No savings recorded yet" instead of an error or blank UI."""
+    payload = {
+        "windows": {
+            "today": {"tokens_saved": 0, "tokens_total": 0, "percent": 0, "cost_usd": 0},
+            "last_7_days": {"tokens_saved": 0, "tokens_total": 0, "percent": 0, "cost_usd": 0},
+            "last_30_days": {"tokens_saved": 0, "tokens_total": 0, "percent": 0, "cost_usd": 0},
+        },
+        "by_model": [],
+        "by_client": [],
+    }
+    monkeypatch.setattr(app_module, "_run_headroom_savings_command", lambda: json.dumps(payload))
+
+    data = client.get("/api/headroom-savings").json()
+
+    assert data == {"available": True, "empty": True}
+
+
+def test_headroom_savings_reports_empty_when_windows_breakdown_is_entirely_absent(client, monkeypatch):
+    """Defensive parsing per issue #204: even if the payload doesn't carry
+    a `windows` key at all (unconfirmed exact schema), a payload with no
+    "tokens saved"-shaped field anywhere is still treated as empty, not
+    as unavailable or as a crash."""
+    monkeypatch.setattr(app_module, "_run_headroom_savings_command", lambda: json.dumps({}))
+
+    data = client.get("/api/headroom-savings").json()
+
+    assert data == {"available": True, "empty": True}
+
+
+def test_headroom_savings_reports_unavailable_when_command_fails_to_run(client, monkeypatch):
+    """Headroom not installed (or genuinely broken) must surface as a
+    distinct `{"available": False}` shape -- never a 500 or an unhandled
+    exception bubbling out of the route."""
+
+    def fake_run():
+        raise FileNotFoundError("headroom not found")
+
+    monkeypatch.setattr(app_module, "_run_headroom_savings_command", fake_run)
+
+    resp = client.get("/api/headroom-savings")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False}
+
+
+def test_headroom_savings_reports_unavailable_when_command_exits_nonzero(client, monkeypatch):
+    """A non-zero exit (Headroom installed but erroring) is the same
+    "unavailable" shape as not-installed -- the frontend doesn't need to
+    tell the two apart."""
+
+    def fake_run():
+        raise subprocess.CalledProcessError(1, ["headroom", "savings", "--json"])
+
+    monkeypatch.setattr(app_module, "_run_headroom_savings_command", fake_run)
+
+    data = client.get("/api/headroom-savings").json()
+
+    assert data == {"available": False}
+
+
+def test_headroom_savings_reports_unavailable_when_output_is_not_valid_json(client, monkeypatch):
+    """Garbled/unparseable stdout must also degrade to "unavailable"
+    rather than raising out of the route."""
+    monkeypatch.setattr(app_module, "_run_headroom_savings_command", lambda: "not json")
+
+    data = client.get("/api/headroom-savings").json()
+
+    assert data == {"available": False}
+
+
+def test_headroom_savings_runs_via_resolve_headroom_command(monkeypatch):
+    """`_run_headroom_savings_command` must resolve the CLI the same
+    PATH-safe way as the other Headroom call sites (`resolve_headroom_
+    command()`), not a bare `"headroom"`, and invoke `savings --json`."""
+    monkeypatch.setattr(headroom_installer, "resolve_headroom_command", lambda: "C:/fake/headroom.exe")
+
+    captured = {}
+
+    class FakeCompletedProcess:
+        stdout = '{"windows": {}}'
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr(app_module.subprocess, "run", fake_run)
+
+    result = app_module._run_headroom_savings_command()
+
+    assert captured["argv"] == ["C:/fake/headroom.exe", "savings", "--json"]
+    assert captured["kwargs"]["check"] is True
+    assert result == '{"windows": {}}'
+
+
+# ---------------------------------------------------------------------------
 # Caveman consent/install gate (issue #201)
 # ---------------------------------------------------------------------------
 
@@ -1216,7 +1437,7 @@ def test_caveman_install_is_a_noop_and_ok_when_already_present(client, monkeypat
 def test_caveman_install_runs_install_when_not_present(client, monkeypatch):
     calls = []
     monkeypatch.setattr(caveman_installer, "check_caveman_presence", lambda: caveman_installer.PRESENCE_NOT_PRESENT)
-    monkeypatch.setattr(caveman_installer, "install_caveman", lambda: calls.append("install"))
+    monkeypatch.setattr(caveman_installer, "install_caveman", lambda run=None: calls.append("install"))
 
     resp = client.post("/api/caveman-install")
 
@@ -1227,7 +1448,7 @@ def test_caveman_install_runs_install_when_not_present(client, monkeypatch):
 def test_caveman_install_reports_the_error_on_failure_instead_of_raising(client, monkeypatch):
     monkeypatch.setattr(caveman_installer, "check_caveman_presence", lambda: caveman_installer.PRESENCE_NOT_PRESENT)
 
-    def failing_install():
+    def failing_install(run=None):
         raise RuntimeError("npx not found")
 
     monkeypatch.setattr(caveman_installer, "install_caveman", failing_install)
@@ -1235,6 +1456,47 @@ def test_caveman_install_reports_the_error_on_failure_instead_of_raising(client,
     resp = client.post("/api/caveman-install")
 
     assert resp.json() == {"ok": False, "error": "npx not found"}
+
+
+def test_caveman_install_status_reflects_live_output_lines(client, monkeypatch):
+    """The install endpoint routes `caveman_installer.install_caveman`
+    through a `run` that streams live subprocess output into
+    `_caveman_install_lines` -- `/api/caveman-install-status` must expose
+    exactly what got streamed, so the UI can show real terminal output
+    instead of a static "please wait" message."""
+    monkeypatch.setattr(caveman_installer, "check_caveman_presence", lambda: caveman_installer.PRESENCE_NOT_PRESENT)
+
+    def fake_run_streaming(argv, *, on_line=None, popen_factory=None):
+        on_line("npm warn deprecated ...")
+        on_line("added 5 packages in 2s")
+
+    monkeypatch.setattr(caveman_installer, "run_streaming", fake_run_streaming)
+
+    resp = client.post("/api/caveman-install")
+    assert resp.json() == {"ok": True}
+
+    status = client.get("/api/caveman-install-status").json()
+    assert status["lines"] == ["npm warn deprecated ...", "added 5 packages in 2s"]
+
+
+def test_caveman_install_status_lines_reset_on_a_new_install(client, monkeypatch):
+    """A fresh install call must start from an empty log, not append onto
+    whatever a previous (possibly failed) install left behind."""
+    monkeypatch.setattr(caveman_installer, "check_caveman_presence", lambda: caveman_installer.PRESENCE_NOT_PRESENT)
+
+    calls = {"n": 0}
+
+    def fake_run_streaming(argv, *, on_line=None, popen_factory=None):
+        calls["n"] += 1
+        on_line(f"run {calls['n']}")
+
+    monkeypatch.setattr(caveman_installer, "run_streaming", fake_run_streaming)
+
+    client.post("/api/caveman-install")
+    client.post("/api/caveman-install")
+
+    status = client.get("/api/caveman-install-status").json()
+    assert status["lines"] == ["run 2"]
 
 
 def test_caveman_declined_calls_disable_caveman(client, monkeypatch):
