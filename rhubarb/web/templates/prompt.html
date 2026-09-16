@@ -17,6 +17,13 @@
        version pinned to match xterm@5.3.0 (the last major xterm-addon-fit
        line published under the unscoped package name). -->
   <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+  <!-- Markdown rendering (issue #212): marked.js converts free-form Claude
+       prose in the left card (preamble, blocked-session question/context,
+       interview header/footer) from raw text to formatted HTML so bold,
+       inline code, numbered lists, and paragraph breaks display correctly.
+       breaks:true so single \n becomes <br>, matching Claude's output style. -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
+  <script>marked.use({ breaks: true });</script>
   <!-- Grilling structured block feed (issue #186, step 3 of PRD #182): for a
        grilling card running under the new stream-json engine
        (rhubarb/stream_json_engine.py, issue #184), the Live Terminal panel
@@ -3543,14 +3550,14 @@
       const blocked = snapshot.blocked || {};
 
       const q = document.createElement("p");
-      q.className = "question-text";
-      q.textContent = blocked.question || "Implementation is blocked and needs your input.";
+      q.className = "question-text md-prose";
+      q.innerHTML = marked.parse(blocked.question || "Implementation is blocked and needs your input.");
       interviewEl.appendChild(q);
 
       if (blocked.context) {
         const ctx = document.createElement("p");
-        ctx.className = "preamble";
-        ctx.textContent = blocked.context;
+        ctx.className = "preamble md-prose";
+        ctx.innerHTML = marked.parse(blocked.context);
         interviewEl.appendChild(ctx);
       }
 
@@ -3696,8 +3703,8 @@
 
       if (preamble) {
         const p = document.createElement("p");
-        p.className = "preamble";
-        p.textContent = preamble;
+        p.className = "preamble md-prose";
+        p.innerHTML = marked.parse(preamble);
         interviewEl.appendChild(p);
       }
 
@@ -3755,8 +3762,8 @@
 
       if (data.header) {
         const p = document.createElement("p");
-        p.className = "preamble";
-        p.textContent = data.header;
+        p.className = "preamble md-prose";
+        p.innerHTML = marked.parse(data.header);
         interviewEl.appendChild(p);
       }
 
@@ -3920,8 +3927,8 @@
 
       if (data.footer) {
         const p = document.createElement("p");
-        p.className = "preamble";
-        p.textContent = data.footer;
+        p.className = "preamble md-prose";
+        p.innerHTML = marked.parse(data.footer);
         interviewEl.appendChild(p);
       }
 

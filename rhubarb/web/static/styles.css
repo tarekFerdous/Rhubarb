@@ -660,6 +660,38 @@ textarea.prompt-box:focus {
   min-height: 0;
 }
 
+/* Markdown-rendered prose surfaces (issue #212): .md-prose is added to any
+   element whose content is set via marked.parse() so these rules don't bleed
+   into other parts of the card that still use plain text. */
+.md-prose p {
+  margin: 0 0 10px;
+  color: inherit;
+}
+.md-prose p:last-child {
+  margin-bottom: 0;
+}
+.md-prose code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.82em;
+  background: rgba(127, 127, 127, 0.12);
+  border: 1px solid var(--card-border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  color: var(--fg);
+}
+.md-prose strong,
+.md-prose b {
+  color: var(--fg);
+}
+.md-prose ol,
+.md-prose ul {
+  padding-left: 1.4em;
+  margin: 0 0 10px;
+}
+.md-prose li {
+  margin-bottom: 4px;
+}
+
 .preamble {
   font-size: 0.85rem;
   color: var(--fg-muted);
