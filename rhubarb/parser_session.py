@@ -445,6 +445,20 @@ _EXTRACTION_PROMPT_TEMPLATE = (
     "question at all (this should be rare, since it was already flagged "
     'as needing input), return "questions": [] with the whole text as '
     '"header" and "" as "footer".\n\n'
+    "CRITICAL SPLITTING RULE: if the text contains multiple distinct "
+    "questions, each question MUST be a separate object in the "
+    '"questions" array -- never combine two or more questions into a '
+    "single entry. A question is distinct if it asks about a different "
+    "topic, offers a different set of options, or calls for a separate "
+    'recommendation. Use these signals to find question boundaries: '
+    '(1) explicit "Question N:" markers (e.g. "Question 1:", '
+    '"Question 2:") -- each N is a separate entry; '
+    "(2) numbered question lists (e.g. lines starting with "
+    '"1.", "2.", "3.") -- each number starts a new separate entry; '
+    "(3) structural separation such as blank lines or horizontal rules "
+    "between self-contained question blocks. When in doubt, split rather "
+    "than merge -- a Rhubarb UI card is rendered per entry, so merging "
+    "collapses distinct questions into one unreadable block.\n\n"
     "Text:\n{text}"
 )
 

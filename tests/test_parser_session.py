@@ -926,6 +926,125 @@ def test_drain_extracts_json_wrapped_in_a_markdown_code_fence(monkeypatch):
     assert results[0]["questions"] == _VALID_PAYLOAD_1["questions"]
 
 
+def test_drain_yields_all_questions_from_a_three_question_payload(monkeypatch):
+    """A parser-session response carrying three questions in `questions[]`
+    must pass through drain intact -- issue #207's core scenario: grilling
+    output with multiple questions must NOT be collapsed into one entry."""
+    three_q_payload = {
+        "header": "A few things to settle before we start.",
+        "footer": "",
+        "questions": [
+            {
+                "id": "q1",
+                "text": "Should this be Python or Node?",
+                "kind": "single",
+                "options": ["Python", "Node"],
+                "recommended": [1],
+                "recommended_text": None,
+            },
+            {
+                "id": "q2",
+                "text": "Which environments need support?",
+                "kind": "multi",
+                "options": ["Dev", "Staging", "Prod"],
+                "recommended": [1, 3],
+                "recommended_text": None,
+            },
+            {
+                "id": "q3",
+                "text": "Where should this run?",
+                "kind": "open",
+                "options": None,
+                "recommended": None,
+                "recommended_text": "On the existing droplet.",
+            },
+        ],
+    }
+    backend = FakeStreamJsonBackend([_extraction_result_line("session-abc", three_q_payload)], eof_after=False)
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(1, cwd="/repo"))
+    parser_session.enqueue_needs_input_turn(1, card_id=5, phase="grilling", text="three questions here")
+
+    results = run(_drain_all(1))
+
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+    assert results[0]["source_session_id"] == 5
+    assert len(results[0]["questions"]) == 3
+    assert results[0]["questions"] == three_q_payload["questions"]
+    assert results[0]["header"] == three_q_payload["header"]
+
+
+def test_drain_preserves_mixed_kind_payload_fields(monkeypatch):
+    """A mixed-kind payload (single / multi / open) must arrive at the
+    caller with every per-question field intact -- kind, options,
+    recommended, recommended_text -- so the left main card can render
+    each question in its correct UI shape."""
+    mixed_payload = {
+        "header": "",
+        "footer": "Thanks!",
+        "questions": [
+            {
+                "id": "q1",
+                "text": "Pick one language.",
+                "kind": "single",
+                "options": ["Python", "Go"],
+                "recommended": [2],
+                "recommended_text": None,
+            },
+            {
+                "id": "q2",
+                "text": "Which features are required?",
+                "kind": "multi",
+                "options": ["Auth", "Logging", "Metrics"],
+                "recommended": [1, 2],
+                "recommended_text": None,
+            },
+            {
+                "id": "q3",
+                "text": "Any other constraints?",
+                "kind": "open",
+                "options": None,
+                "recommended": None,
+                "recommended_text": "Keep it simple for now.",
+            },
+        ],
+    }
+    backend = FakeStreamJsonBackend([_extraction_result_line("session-abc", mixed_payload)], eof_after=False)
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(1, cwd="/repo"))
+    parser_session.enqueue_needs_input_turn(1, card_id=7, phase="grilling", text="mixed question types")
+
+    results = run(_drain_all(1))
+
+    q = results[0]["questions"]
+    assert q[0]["kind"] == "single" and q[0]["options"] == ["Python", "Go"] and q[0]["recommended"] == [2]
+    assert q[1]["kind"] == "multi" and q[1]["recommended"] == [1, 2] and q[1]["recommended_text"] is None
+    assert q[2]["kind"] == "open" and q[2]["options"] is None and q[2]["recommended_text"] == "Keep it simple for now."
+
+
+def test_extraction_prompt_contains_splitting_guidance(monkeypatch):
+    """The prompt written to the parser-session subprocess must include the
+    multi-question splitting guidance -- 'separate' and 'Question N:' -- so
+    a future text edit can't silently regress the instruction."""
+    backend = FakeStreamJsonBackend([_extraction_result_line("session-abc", _VALID_PAYLOAD_1)], eof_after=False)
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(1, cwd="/repo"))
+    parser_session.enqueue_needs_input_turn(1, card_id=5, phase="grilling", text="Does this matter?")
+
+    run(_drain_all(1))
+
+    # written_lines[0] is the init/resume handshake; written_lines[1] is the
+    # first user-turn JSON written to the subprocess stdin.
+    assert len(backend.written_lines) >= 1
+    prompt_json = backend.written_lines[-1]
+    assert "separate" in prompt_json
+    assert "Question N:" in prompt_json or "Question N" in prompt_json
+
+
 def test_drain_never_raises_when_no_parser_session_is_registered_for_the_project():
     """No live parser session at all is the LookupError branch of
     `_process_one_queued_item`'s `except Exception` -- the same
