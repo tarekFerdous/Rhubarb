@@ -94,7 +94,6 @@ def _rejoin_wrapped_json_strings(candidate: str) -> str:
 
 from rhubarb import db, error_log, parser_session
 from rhubarb.cli_client import ClaudeCLIError
-from rhubarb.github_publisher import GithubPublishError, publish_draft
 from rhubarb.live_stream import publish
 from rhubarb.ollama_rescue import (
     classify_turn_needs_input,
@@ -1608,42 +1607,6 @@ async def _run_grilling_turn(
     return parsed if parsed["questions"] else None
 
 
-def _draft_status_message(cwd: str | None, phase: str) -> str | None:
-    """Issue #154: after a `creating_prd`/`creating_issues` turn completes,
-    check whether `.claude/prd_draft.json` was actually written (by the
-    `/to-prd`/`/to-issues` skill -- see those SKILL.md files) and, if so,
-    return a short status line confirming it for the frontend to render.
-
-    Returns `None` -- no status to publish -- whenever the file is missing,
-    unreadable, not valid JSON, or doesn't yet carry the key this phase
-    expects (`prd` for `creating_prd`, an `issues` list for
-    `creating_issues`): a turn that didn't actually write the expected draft
-    content gets no incremental status here, same as before this existed --
-    the eventual error/success handling elsewhere is unaffected either way.
-    """
-    if not cwd:
-        return None
-    draft_path = Path(cwd) / ".claude" / "prd_draft.json"
-    try:
-        draft = json.loads(draft_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(draft, dict):
-        return None
-
-    if phase == "creating_prd":
-        return "PRD draft written." if isinstance(draft.get("prd"), dict) else None
-
-    if phase == "creating_issues":
-        issues = draft.get("issues")
-        if not isinstance(issues, list):
-            return None
-        count = len(issues)
-        noun = "issue" if count == 1 else "issues"
-        return f"Issues draft written ({count} {noun})."
-
-    return None
-
 
 async def _await_stalled_reply(
     card_id: int, conn, row, turn: dict, *, phase: str
@@ -1744,12 +1707,6 @@ async def _run_chain_step(
     On failure, publishes the error `turn` event and `done` itself -- the
     chain stops here exactly as the old blocking version did.
 
-    On success, publishes an intermediate `turn` event carrying a
-    `status_message` (issue #154) once `_draft_status_message` confirms the
-    draft file this phase is responsible for was actually written -- giving
-    the user live feedback mid-phase instead of nothing until the chain's
-    final `details` summary.
-
     Issue #177 (child of PRD #174): right after the turn resolves (and
     before any of the above success bookkeeping), the shared
     `handle_turn_completed` hook (issue #191) checks whether this turn's own
@@ -1782,18 +1739,16 @@ async def _run_chain_step(
         await _route_crash_to_blocked(card_id, conn, e, phase=phase)
         return False, None
     except ClaudeCLIError as e:
-        # /to-prd and /to-issues are explicitly forbidden from calling `gh`
-        # (see their skill instructions), so any match here would be a
-        # false positive -- always report no GitHub login is needed.
         _close_engine(card_id)
         message = str(e)
-        db.update_session(conn, row["id"], error_text=message, needs_github_login=0)
+        needs_login = 1 if _is_gh_auth_failure(message) else 0
+        db.update_session(conn, row["id"], error_text=message, needs_github_login=needs_login)
         publish(
             card_id,
             _turn_event(
                 phase=phase,
                 error=message,
-                needs_github_login=False,
+                needs_github_login=bool(needs_login),
                 card_id=card_id,
                 project_id=row["project_id"],
             ),
@@ -1825,68 +1780,8 @@ async def _run_chain_step(
         context_pct=turn.get("context_pct"),
     )
 
-    status_message = _draft_status_message(cwd, phase)
-    if status_message is not None:
-        publish(card_id, _turn_event(phase=phase, status_message=status_message))
-
     return True, turn["session_id"]
 
-
-async def _run_publish_step(card_id: int, conn, row, *, cwd: str | None) -> bool:
-    """Run the publishing step: reads `.claude/prd_draft.json` and calls
-    `github_publisher.publish_draft()` in a background thread -- a purely
-    scripted `gh` operation, no Claude CLI turn involved. Returns True on
-    success, having appended the publisher's result text to `console_text`
-    so `_finish_chain`'s `parse_details()` can parse PRD/issue numbers
-    unchanged. Returns False on failure, having published the error `turn`
-    and `done` itself here -- exactly like `_run_chain_step` does.
-
-    Issue #154: passes `publish_draft` an `on_progress` callback that
-    publishes an intermediate `turn` event -- "PRD published as #N" right
-    after the PRD issue is created, then "Created issue #N" after each child
-    issue -- instead of the caller only finding out once the whole publish
-    call has finished. `publish()` is documented safe to call from a worker
-    thread (see `live_stream.publish`), which is where `on_progress` actually
-    runs, since `publish_draft` itself executes via `asyncio.to_thread`
-    below.
-    """
-    db.update_session(conn, row["id"], phase="publishing", error_text=None, needs_github_login=0)
-    publish(card_id, {"type": "phase", "phase": "publishing"})
-
-    draft_path = Path(cwd) / ".claude" / "prd_draft.json" if cwd else Path(".claude/prd_draft.json")
-
-    def on_progress(event: dict) -> None:
-        if event["kind"] == "prd":
-            status_message = f"PRD published as #{event['number']}"
-        else:
-            status_message = f"Created issue #{event['number']}"
-        publish(card_id, _turn_event(phase="publishing", status_message=status_message))
-
-    try:
-        result_text = await asyncio.to_thread(publish_draft, draft_path, cwd, on_progress=on_progress)
-    except GithubPublishError as e:
-        message = str(e)
-        needs_login = 1 if _is_gh_auth_failure(message) else 0
-        db.update_session(conn, row["id"], error_text=message, needs_github_login=needs_login)
-        publish(
-            card_id,
-            _turn_event(
-                phase="publishing",
-                error=message,
-                needs_github_login=bool(needs_login),
-                card_id=card_id,
-                project_id=row["project_id"],
-            ),
-        )
-        publish(card_id, {"type": "done"})
-        return False
-
-    db.update_session(
-        conn,
-        row["id"],
-        console_text=row["console_text"] + "\n\n" + result_text if row["console_text"] else result_text,
-    )
-    return True
 
 
 async def _finish_chain(card_id: int, conn, claude_session_id: str, cwd: str | None) -> None:
@@ -1936,11 +1831,6 @@ async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
     ok, claude_session_id = await _run_chain_step(
         card_id, conn, row, phase="creating_issues", prompt="/rhubarb:to-issues", cwd=cwd, model=model, effort=effort
     )
-    if not ok:
-        return
-
-    row = db.get_session(conn, card_id)
-    ok = await _run_publish_step(card_id, conn, row, cwd=cwd)
     if not ok:
         return
 
@@ -2907,11 +2797,4 @@ async def retry_session_job(card_id: int, cwd: str | None) -> None:
             effort=row["effort"],
         )
         if ok:
-            row = db.get_session(conn, card_id)
-            ok = await _run_publish_step(card_id, conn, row, cwd=cwd)
-            if ok:
-                await _finish_chain(card_id, conn, claude_session_id, cwd)
-    elif row["phase"] == "publishing":
-        ok = await _run_publish_step(card_id, conn, row, cwd=cwd)
-        if ok:
-            await _finish_chain(card_id, conn, row["claude_session_id"], cwd)
+            await _finish_chain(card_id, conn, claude_session_id, cwd)

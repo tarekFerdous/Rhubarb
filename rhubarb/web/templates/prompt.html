@@ -895,6 +895,7 @@
       resetPromptBox();
       startForm.style.display = "";
       interviewEl.innerHTML = "";
+      interviewEl.scrollTop = 0;
       setHeading("What are we doing?");
       showOnly(mainFlowEl);
 
@@ -1151,6 +1152,7 @@
       resetPromptBox();
       startForm.style.display = "";
       interviewEl.innerHTML = "";
+      interviewEl.scrollTop = 0;
       resetParsedResultsRouting();
       activeProjectLineEl.hidden = true;
       prdButtonRowEl.innerHTML = "";
@@ -2852,6 +2854,7 @@
 
     function renderQaGrilling(data) {
       interviewEl.innerHTML = "";
+      interviewEl.scrollTop = 0;
       startForm.style.display = "none";
 
       appendRescueBadge(interviewEl, data.interview && data.interview.source);
@@ -2968,6 +2971,7 @@
       resetPromptBox();
       startForm.style.display = "";
       interviewEl.innerHTML = "";
+      interviewEl.scrollTop = 0;
       setHeading("What are we doing?");
       showOnly(mainFlowEl);
 
@@ -3400,6 +3404,7 @@
       resetPromptBox();
       startForm.style.display = "";
       interviewEl.innerHTML = "";
+      interviewEl.scrollTop = 0;
       setHeading("What are we doing?");
       showOnly(mainFlowEl);
 
@@ -3426,6 +3431,7 @@
         resetPromptBox();
         startForm.style.display = "";
         interviewEl.innerHTML = "";
+        interviewEl.scrollTop = 0;
         setHeading("What are we doing?");
         showOnly(mainFlowEl);
       }
@@ -3545,6 +3551,7 @@
 
     function renderBlockedSession(snapshot) {
       interviewEl.innerHTML = "";
+      interviewEl.scrollTop = 0;
       startForm.style.display = "none";
 
       const blocked = snapshot.blocked || {};
@@ -3607,6 +3614,7 @@
     // time), and every call re-claims curated reply mode the same way.
     function renderStalledSession(snapshot) {
       interviewEl.innerHTML = "";
+      interviewEl.scrollTop = 0;
       startForm.style.display = "none";
 
       const stalled = snapshot.stalled || {};
@@ -3680,6 +3688,11 @@
     async function sendConfirmAdvance(triggerBtn) {
       if (leftCardId === null) return;
       markButtonPending(triggerBtn);
+      // Disable sibling buttons (i.e. "No, keep discussing") so a conflicting
+      // reply cannot be sent while advance_past_grilling is already running.
+      triggerBtn.closest(".ready-to-proceed-actions")?.querySelectorAll("button").forEach(b => {
+        if (b !== triggerBtn) b.disabled = true;
+      });
       turnInFlight = true;
       const res = await fetch("/api/session/continue", {
         method: "POST",
@@ -3700,6 +3713,7 @@
 
     function renderReadyToProceed(preamble) {
       interviewEl.innerHTML = "";
+      interviewEl.scrollTop = 0;
 
       if (preamble) {
         const p = document.createElement("p");
@@ -3756,6 +3770,7 @@
     // pre-existing call site keeps behaving exactly as before.
     function renderInterview(data, submitFn = sendReply) {
       interviewEl.innerHTML = "";
+      interviewEl.scrollTop = 0;
       const answers = {};
 
       appendRescueBadge(interviewEl, data.source);
@@ -4005,6 +4020,7 @@
     function renderSessionStatus(session) {
       updateImplementingBanner(session);
       detailsViewEl.innerHTML = "";
+      detailsViewEl.scrollTop = 0;
       sessionErrorEl.hidden = true;
       sessionErrorActionsEl.hidden = true;
       githubLoginBtn.hidden = true;
@@ -4213,6 +4229,7 @@
         resetPromptBox();
         startForm.style.display = "";
         interviewEl.innerHTML = "";
+        interviewEl.scrollTop = 0;
         setHeading("What are we doing?");
         showOnly(mainFlowEl);
       }
@@ -4240,6 +4257,7 @@
       // but also show the form itself -- form is inside main-flow, so switch
       // to main-flow and show everything, then make the form visible.
       interviewEl.innerHTML = "";
+      interviewEl.scrollTop = 0;
       showOnly(mainFlowEl);
       setHeading("What are we doing?");
       startForm.querySelector("textarea").focus();

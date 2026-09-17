@@ -5,8 +5,6 @@ description: Turn the current conversation into a PRD and publish it to the proj
 
 This skill takes the current conversation context and codebase understanding and produces a PRD. Do NOT interview the user — just synthesize what you already know.
 
-Rhubarb-managed sessions publish to GitHub as a separate, external step that runs after `/rhubarb:to-prd` and `/rhubarb:to-issues` have both finished — it reads a local draft file rather than the CLI turn calling GitHub directly. Write to that draft file as instructed below. Do NOT run `gh issue create` or any other GitHub CLI command from this skill.
-
 ## Process
 
 1. Explore the repo to understand the current state of the codebase, if you haven't already. Use the project's domain glossary vocabulary throughout the PRD, and respect any ADRs in the area you're touching.
@@ -15,23 +13,21 @@ Rhubarb-managed sessions publish to GitHub as a separate, external step that run
 
 Check with the user that these seams match their expectations.
 
-3. Write the PRD using the template below, then write it to `.claude/prd_draft.json` at the project root — do NOT publish it to GitHub yourself.
+3. Write the PRD using the template below, then publish it to GitHub by running:
 
-   Write (creating the file if it doesn't exist, or overwriting just the `prd` key if it does):
-
-   ```json
-   {
-     "prd": {
-       "title": "<PRD title>",
-       "body": "<the full rendered PRD markdown, using the template below>",
-       "labels": ["ready-for-agent", "prd"]
-     }
-   }
+   ```
+   gh issue create --title "<PRD title>" --body "<the full rendered PRD markdown>" --label "ready-for-agent" --label "prd"
    ```
 
-   `body` is the complete PRD content (the rendered template below, as a markdown string) — the same content that would otherwise have gone into a GitHub issue body. Apply both the `ready-for-agent` label (so the AFK session runner picks it up) and the `prd` label (so it appears in the "To be implemented" panel, distinguishing it from `/rhubarb:to-issues`' child slices, which carry `ready-for-agent` only) in the `labels` array - no need for additional triage.
+   Apply both the `ready-for-agent` label (so the AFK session runner picks it up) and the `prd` label (so it appears in the "To be implemented" panel, distinguishing it from `/rhubarb:to-issues`' child slices, which carry `ready-for-agent` only) — no need for additional triage.
 
-   This file follows a fixed schema shared with `/rhubarb:to-issues` (which adds the `issues` array to the same file) and with `rhubarb/github_publisher.py`, the Python module that later reads this file and actually creates the GitHub issues. Keep the shape exactly as shown above so that reader can parse it without any special-casing.
+4. After `gh issue create` succeeds, parse the issue number from the URL it prints and output exactly one line in this format (where N is the real issue number):
+
+   ```
+   PRD #N: <title>
+   ```
+
+   This line is required — the backend parses the issue number from it.
 
 <prd-template>
 

@@ -7,7 +7,6 @@ import pytest
 
 from rhubarb import db, error_log, live_stream, parser_session, pty_engine, session_runner, stream_json_engine
 from rhubarb.cli_client import ClaudeCLIError
-from rhubarb.github_publisher import GithubPublishError
 from rhubarb.pty_engine import PtyEngineUnrecoverableError
 from rhubarb.qa_parser import parse_grilling_response
 from rhubarb.stream_json_engine import StreamJsonEngineUnrecoverableError
@@ -706,19 +705,15 @@ def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, 
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         seen_prompts.append(prompt)
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("Wrote PRD draft.")])
+            return iter([_result_event("PRD #5: My PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Wrote issues draft.")])
+            return iter([_result_event("Issue #6: Child one")])
         raise AssertionError(f"unexpected prompt {prompt!r} -- do chain must not auto-implement")
 
     _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    monkeypatch.setattr(
-        session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #5: My PRD\nIssue #6: Child one"
-    )
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
@@ -975,9 +970,9 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
         if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: First question?")])
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("Wrote PRD draft.")])
+            return iter([_result_event("PRD #5: My PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Wrote issues draft.")])
+            return iter([_result_event("Issue #6: Child one\nIssue #7: Child two")])
         # the grilling reply itself: no more bullet/heading questions -> grilling is done
         return iter([_result_event("Thanks, that's everything I need.")])
 
@@ -985,12 +980,6 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    monkeypatch.setattr(
-        session_runner,
-        "publish_draft",
-        lambda draft_path, cwd, on_progress=None: "PRD #5: My PRD\nIssue #6: Child one\nIssue #7: Child two",
-    )
 
     # The grilling reply itself: no more questions -> stays in grilling and
     # publishes the wrap-up turn, no auto-advance.
@@ -1020,69 +1009,11 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
     assert "$" not in json.dumps(events)
 
 
-def test_confirm_advance_runs_publishing_phase_with_no_extra_cli_calls(client, tmp_path, monkeypatch):
-    """Issue #58: the chain must sequence phase:creating_prd -> phase:creating_issues
-    -> phase:publishing -> turn(details), and github_publisher.publish_draft
-    (not a Claude CLI turn) must be what actually creates the GitHub issues.
-    Issue #196 (child of PRD #195): the chain pauses at details; no done event
-    and no implement turn fires automatically."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    seen_prompts = []
-
-    def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
-            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-        seen_prompts.append(prompt)
-        if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("Wrote PRD draft.")])
-        if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Wrote issues draft.")])
-        raise AssertionError(f"unexpected prompt {prompt!r} -- must not auto-implement")
-
-    _mock_engine(monkeypatch, handler)
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    seen_publish_calls = []
-
-    def fake_publish_draft(draft_path, cwd, on_progress=None):
-        seen_publish_calls.append((draft_path, cwd))
-        return "PRD #5: My PRD\nIssue #6: Child one"
-
-    monkeypatch.setattr(session_runner, "publish_draft", fake_publish_draft)
-
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
-
-    # /rhubarb:to-prd and /rhubarb:to-issues went through the CLI; publishing did not.
-    assert seen_prompts == ["/rhubarb:to-prd", "/rhubarb:to-issues"]
-    assert len(seen_publish_calls) == 1
-
-    row = db.get_session(conn, row_id)
-    assert row["phase"] == "details"
-    assert row["session_type"] == "do"
-    assert row["available_for_reuse"] == 0
-    details = json.loads(row["details_json"])
-    assert details["prd"] == {"number": 5, "title": "My PRD"}
-    assert details["issues"] == [{"number": 6, "title": "Child one"}]
-
-    events = live_stream._buffers.get(row_id, [])
-    chain_phases = [
-        e["phase"] for e in events if e.get("type") == "phase" and e["phase"] != "grilling"
-    ]
-    assert chain_phases == ["creating_prd", "creating_issues", "publishing"]
-    assert not any(e.get("type") == "done" for e in events)
-    assert any(e.get("type") == "turn" and e.get("phase") == "details" for e in events)
-    assert not any(e.get("type") == "minimize" for e in events)
-
-
-def test_publish_draft_failure_stops_chain_with_error_turn(client, tmp_path, monkeypatch):
-    """Issue #58: a GithubPublishError from publish_draft() must be caught,
-    logged as an error turn event (same shape as _run_chain_step failures),
-    followed by done -- with no unhandled exception -- and the chain must
-    stop before _finish_chain ever runs."""
+def test_chain_publishes_directly_and_details_reflect_issue_numbers(client, tmp_path, monkeypatch):
+    """Skills now call `gh issue create` themselves and print `PRD #N: <title>`
+    / `Issue #N: <title>` lines directly. The chain must reach `phase=details`
+    with correct issue numbers parsed from those lines -- no separate
+    publishing step and no `prd_draft.json` involved."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -1090,184 +1021,26 @@ def test_publish_draft_failure_stops_chain_with_error_turn(client, tmp_path, mon
         if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("Wrote PRD draft.")])
+            return iter([_result_event("PRD #5: My PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Wrote issues draft.")])
-        raise AssertionError(f"unexpected prompt {prompt!r}")
-
-    _mock_engine(monkeypatch, handler)
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    def failing_publish_draft(draft_path, cwd, on_progress=None):
-        raise GithubPublishError("gh: not logged in, run `gh auth login`")
-
-    monkeypatch.setattr(session_runner, "publish_draft", failing_publish_draft)
-
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
-
-    row = db.get_session(conn, row_id)
-    assert row["phase"] == "publishing"
-    assert bool(row["needs_github_login"]) is True
-    assert "not logged in" in row["error_text"]
-    # The chain never reached _finish_chain.
-    assert row["details_json"] is None
-    assert row["available_for_reuse"] == 0
-
-    events = live_stream._buffers.get(row_id, [])
-    assert events[-1] == {"type": "done"}
-    error_turns = [e for e in events if e.get("type") == "turn" and e.get("phase") == "publishing"]
-    assert len(error_turns) == 1
-    assert "not logged in" in error_turns[0]["error"]
-
-
-def test_retry_on_publishing_phase_reruns_publisher_and_completes(client, tmp_path, monkeypatch):
-    """Issue #58: retry_session_job must handle phase == 'publishing' -- a
-    session stuck there (the publisher errored, or the app restarted
-    mid-phase) resumes by re-running the publisher and completing the chain."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
-            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-        return iter([_result_event("draft written")])
-
-    _mock_engine(monkeypatch, handler)
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    def failing_publish_draft(draft_path, cwd, on_progress=None):
-        raise GithubPublishError("gh rate limited")
-
-    monkeypatch.setattr(session_runner, "publish_draft", failing_publish_draft)
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
-
-    row = db.get_session(conn, row_id)
-    assert row["phase"] == "publishing"
-    assert "gh rate limited" in row["error_text"]
-
-    monkeypatch.setattr(
-        session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #9: Retried PRD\nIssue #10: Only child"
-    )
-
-    asyncio.run(session_runner.retry_session_job(row_id, cwd))
-
-    row = db.get_session(conn, row_id)
-    assert row["phase"] == "details"
-    assert row["error_text"] is None
-    details = json.loads(row["details_json"])
-    assert details["prd"] == {"number": 9, "title": "Retried PRD"}
-    assert details["issues"] == [{"number": 10, "title": "Only child"}]
-
-
-def test_run_publish_step_publishes_intermediate_event_after_each_issue(client, tmp_path, monkeypatch):
-    """Issue #154: `_run_publish_step` must publish a `turn` event carrying
-    a `status_message` right after the PRD issue is created ("PRD published
-    as #N") and right after each child issue is created ("Created issue
-    #N") -- observable mid-call on the session's live stream, not only in
-    the final aggregate result. Drives the real `publish_draft`/
-    `create_issue` path (only the `gh` subprocess call itself is faked),
-    exercising the actual production per-issue loop rather than mocking
-    `publish_draft` away entirely."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    claude_dir = Path(cwd) / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    draft = {
-        "prd": {"title": "My PRD", "body": "PRD body", "labels": ["ready-for-agent"]},
-        "issues": [
-            {"title": "Child one", "body": "Body one", "labels": []},
-            {"title": "Child two", "body": "Body two", "labels": []},
-        ],
-    }
-    (claude_dir / "prd_draft.json").write_text(json.dumps(draft), encoding="utf-8")
-
-    def fake_run(args, **kwargs):
-        if "My PRD" in args:
-            return type("Result", (), {"returncode": 0, "stdout": "https://github.com/x/y/issues/5\n", "stderr": ""})()
-        if "Child one" in args:
-            return type("Result", (), {"returncode": 0, "stdout": "https://github.com/x/y/issues/6\n", "stderr": ""})()
-        if "Child two" in args:
-            return type("Result", (), {"returncode": 0, "stdout": "https://github.com/x/y/issues/7\n", "stderr": ""})()
-        raise AssertionError(f"unexpected args {args}")
-
-    monkeypatch.setattr("rhubarb.github_publisher.subprocess.run", fake_run)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    row = db.get_session(conn, row_id)
-
-    ok = asyncio.run(session_runner._run_publish_step(row_id, conn, row, cwd=cwd))
-    assert ok is True
-
-    events = live_stream._buffers.get(row_id, [])
-    status_messages = [
-        e["status_message"]
-        for e in events
-        if e.get("type") == "turn" and e.get("phase") == "publishing" and e.get("status_message")
-    ]
-    assert status_messages == [
-        "PRD published as #5",
-        "Created issue #6",
-        "Created issue #7",
-    ]
-
-
-def test_run_chain_step_publishes_status_once_draft_files_are_written(client, tmp_path, monkeypatch):
-    """Issue #154: while a session is in `creating_prd`/`creating_issues`,
-    the user must see a status update once the corresponding draft content
-    was actually written to `.claude/prd_draft.json` -- not just a generic
-    spinner. `_run_chain_step` detects this by reading the draft file back
-    after each turn completes."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-    claude_dir = Path(cwd) / ".claude"
-
-    def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
-            return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
-        if prompt == "/rhubarb:to-prd":
-            claude_dir.mkdir(parents=True, exist_ok=True)
-            (claude_dir / "prd_draft.json").write_text(
-                json.dumps({"prd": {"title": "My PRD", "body": "b", "labels": []}}), encoding="utf-8"
-            )
-            return iter([_result_event("Wrote PRD draft.")])
-        if prompt == "/rhubarb:to-issues":
-            (claude_dir / "prd_draft.json").write_text(
-                json.dumps(
-                    {
-                        "prd": {"title": "My PRD", "body": "b", "labels": []},
-                        "issues": [
-                            {"title": "Child one", "body": "b1", "labels": []},
-                            {"title": "Child two", "body": "b2", "labels": []},
-                        ],
-                    }
-                ),
-                encoding="utf-8",
-            )
-            return iter([_result_event("Wrote issues draft.")])
+            return iter([_result_event("Issue #6: Child one\nIssue #7: Child two")])
         return iter([_result_event("Implemented.")])
 
     _mock_engine(monkeypatch, handler)
-    monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #5: My PRD\nIssue #6: Child one\nIssue #7: Child two")
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
-    events = live_stream._buffers.get(row_id, [])
-    status_by_phase = {
-        e["phase"]: e["status_message"]
-        for e in events
-        if e.get("type") == "turn" and e.get("status_message")
-    }
-    assert status_by_phase["creating_prd"] == "PRD draft written."
-    assert status_by_phase["creating_issues"] == "Issues draft written (2 issues)."
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "details"
+    details = json.loads(row["details_json"])
+    assert details["prd"] == {"number": 5, "title": "My PRD"}
+    assert details["issues"] == [
+        {"number": 6, "title": "Child one"},
+        {"number": 7, "title": "Child two"},
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1311,10 +1084,12 @@ def test_grilling_claude_cli_error_never_sets_needs_github_login(client, tmp_pat
     assert error_turns[0]["needs_github_login"] is False
 
 
-def test_to_prd_claude_cli_error_never_sets_needs_github_login(client, tmp_path, monkeypatch):
-    """/to-prd is forbidden from calling `gh` (see its skill instructions), so
-    a ClaudeCLIError here -- even one containing gh-shaped auth text -- must
-    never be misclassified as a GitHub login need."""
+def test_creating_prd_gh_auth_failure_sets_needs_github_login(client, tmp_path, monkeypatch):
+    """`/rhubarb:to-prd` now calls `gh issue create` directly, so a
+    `ClaudeCLIError` whose message matches `_is_gh_auth_failure` during
+    `creating_prd` must set `needs_github_login=1` and publish a `turn` event
+    with `needs_github_login: true` -- so the frontend shows the GitHub login
+    prompt."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -1334,13 +1109,13 @@ def test_to_prd_claude_cli_error_never_sets_needs_github_login(client, tmp_path,
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "creating_prd"
-    assert bool(row["needs_github_login"]) is False
+    assert bool(row["needs_github_login"]) is True
     assert "not logged in" in row["error_text"]
 
     events = live_stream._buffers.get(row_id, [])
     assert events[-1] == {"type": "done"}
     error_turns = [e for e in events if e.get("type") == "turn" and e.get("phase") == "creating_prd"]
-    assert error_turns[0]["needs_github_login"] is False
+    assert error_turns[0]["needs_github_login"] is True
 
 
 def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypatch):
@@ -1356,9 +1131,9 @@ def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypa
             attempt["n"] += 1
             if attempt["n"] == 1:
                 raise ClaudeCLIError("not logged in")
-            return iter([_result_event("Wrote PRD draft.")])
+            return iter([_result_event("PRD #9: Retried PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Wrote issues draft.")])
+            return iter([_result_event("Issue #10: Only child")])
         return iter([_result_event("done")])
 
     _mock_engine(monkeypatch, handler)
@@ -1366,10 +1141,6 @@ def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypa
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
-
-    monkeypatch.setattr(
-        session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #9: Retried PRD\nIssue #10: Only child"
-    )
 
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
 
@@ -1492,9 +1263,9 @@ def test_retry_on_creating_prd_phase_is_unaffected_by_implement_branch(client, t
             attempt["n"] += 1
             if attempt["n"] == 1:
                 raise ClaudeCLIError("not logged in")
-            return iter([_result_event("Wrote PRD draft.")])
+            return iter([_result_event("PRD #30: Regression PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Wrote issues draft.")])
+            return iter([_result_event("Issue #31: Only child")])
         return iter([_result_event("done")])
 
     _mock_engine(monkeypatch, handler)
@@ -1502,10 +1273,6 @@ def test_retry_on_creating_prd_phase_is_unaffected_by_implement_branch(client, t
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
-
-    monkeypatch.setattr(
-        session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #30: Regression PRD\nIssue #31: Only child"
-    )
 
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
 
@@ -3958,17 +3725,15 @@ def test_finish_chain_pauses_at_details_instead_of_starting_implementing(client,
         if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("Wrote PRD draft.")])
+            return iter([_result_event("PRD #1: p")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Wrote issues draft.")])
+            return iter([_result_event("Issue #2: i")])
         raise AssertionError(f"unexpected prompt {prompt!r} -- must not auto-implement")
 
     _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "PRD #1: p\nIssue #2: i")
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
@@ -3997,17 +3762,15 @@ def test_finish_chain_pauses_at_details_even_when_no_prd_was_parsed(client, tmp_
         if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("Wrote PRD draft.")])
+            return iter([_result_event("no PRD numbers in here")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("no PRD/issue numbers in here at all")])
+            return iter([_result_event("no issue numbers in here at all")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    monkeypatch.setattr(session_runner, "publish_draft", lambda draft_path, cwd, on_progress=None: "no PRD/issue numbers in here at all")
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
@@ -4522,9 +4285,9 @@ def test_creating_prd_turn_is_classified_before_creating_issues_starts(client, t
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         seen_prompts.append(prompt)
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("Wrote PRD draft.")])
+            return iter([_result_event("PRD #5: My PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Wrote issues draft.")])
+            return iter([_result_event("Issue #6: Child one")])
         if prompt == "/rhubarb:implement prd: 5":
             return iter([_result_event("Implemented.")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
@@ -4533,12 +4296,6 @@ def test_creating_prd_turn_is_classified_before_creating_issues_starts(client, t
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    monkeypatch.setattr(
-        session_runner,
-        "publish_draft",
-        lambda draft_path, cwd, on_progress=None: "PRD #5: My PRD\nIssue #6: Child one",
-    )
 
     # Opt back into (fake) Ollama assistance for this test -- the module's
     # own autouse fixture defaults every other test here to declined so
@@ -4559,12 +4316,12 @@ def test_creating_prd_turn_is_classified_before_creating_issues_starts(client, t
 
     asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
-    assert calls[0] == (row_id, "creating_prd", "Wrote PRD draft.")
+    assert calls[0] == (row_id, "creating_prd", "PRD #5: My PRD")
     # /rhubarb:to-issues had NOT been sent yet at the moment creating_prd's
     # turn was classified -- classification runs before the automatic
     # continuation, not after.
     assert seen_prompts_at_creating_prd_call == ["/rhubarb:to-prd"]
-    assert calls[1] == (row_id, "creating_issues", "Wrote issues draft.")
+    assert calls[1] == (row_id, "creating_issues", "Issue #6: Child one")
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "details"
@@ -4589,7 +4346,7 @@ def test_creating_prd_positive_classification_shows_generic_stall_panel_not_rich
         if prompt == "/rhubarb:to-prd":
             return iter([_result_event("Wrote PRD draft, but scope is unclear.")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Wrote issues draft.")])
+            return iter([_result_event("Issue #6: Child one")])
         if prompt == "/rhubarb:implement prd: 5":
             return iter([_result_event("Implemented.")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
@@ -4599,18 +4356,12 @@ def test_creating_prd_positive_classification_shows_generic_stall_panel_not_rich
         # replied through the generic panel (forwarded unchanged by the
         # existing `/api/sessions/{card_id}/stall-reply` endpoint straight
         # into this same engine's stdin) -- see `_await_stalled_reply`.
-        return [_result_event("Understood, using Postgres for scope.")]
+        return [_result_event("PRD #5: My PRD")]
 
     _mock_engine(monkeypatch, handler, reply_handler=reply_handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    monkeypatch.setattr(
-        session_runner,
-        "publish_draft",
-        lambda draft_path, cwd, on_progress=None: "PRD #5: My PRD\nIssue #6: Child one",
-    )
 
     db.set_ollama_declined(conn, False)
 
@@ -4653,9 +4404,9 @@ def test_creating_prd_negative_classification_does_not_pause_the_chain(client, t
         if prompt == "/rhubarb:do a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("Wrote PRD draft.")])
+            return iter([_result_event("PRD #5: My PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Wrote issues draft.")])
+            return iter([_result_event("Issue #6: Child one")])
         if prompt == "/rhubarb:implement prd: 5":
             return iter([_result_event("Implemented.")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
@@ -4664,12 +4415,6 @@ def test_creating_prd_negative_classification_does_not_pause_the_chain(client, t
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    monkeypatch.setattr(
-        session_runner,
-        "publish_draft",
-        lambda draft_path, cwd, on_progress=None: "PRD #5: My PRD\nIssue #6: Child one",
-    )
 
     db.set_ollama_declined(conn, False)
 
