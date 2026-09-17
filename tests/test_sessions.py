@@ -656,6 +656,51 @@ def test_continue_session_job_with_no_more_questions_does_not_auto_advance(clien
     assert not any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
 
 
+def test_stream_json_grilling_turn_with_prd_in_output_auto_transitions_to_details(
+    client, tmp_path, monkeypatch
+):
+    """Issue #219: when the grilling skill completes the full /do chain in one
+    stream-json turn (no Question N: lines, but PRD and issue markers in the
+    result), the session must transition to phase=details and publish a
+    `turn` event with that phase -- without going through advance_past_grilling
+    or the confirm_advance signal."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def handler(prompt, **kw):
+        if prompt == "/rhubarb:do a feature":
+            # Natural-language format the real /do skill emits -- no ": " separator
+            # after the number, so _DETAIL_RE won't match but the loose re.search
+            # for PRD/Issue #N still triggers _finish_chain.
+            return iter(
+                [_result_event("Done. Created PRD #10 and its 2 issues: Issue #11 and Issue #12.")]
+            )
+        raise AssertionError(f"unexpected prompt {prompt!r} -- chain must not re-run")
+
+    _mock_engine(monkeypatch, handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "details"
+    assert row["session_type"] == "do"
+    assert row["available_for_reuse"] == 0
+
+    details = json.loads(row["details_json"])
+    # _DETAIL_RE needs ": " or "- " after the number, so structured prd/issues
+    # may not parse from natural-language output -- but summary carries the full text.
+    assert "PRD #10" in details["summary"]
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e["type"] == "turn"]
+    assert any(e["phase"] == "details" for e in turn_events), "must publish a details turn"
+    assert not any(e["phase"] == "grilling" for e in turn_events), "must not publish a grilling turn"
+    # The do-finished modal condition: session_type=do and phase=details -- no
+    # confirm_advance or advance_past_grilling involved.
+    assert not any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
+
+
 # ---------------------------------------------------------------------------
 # Issue #184: this whole block (Ollama rescue-path wiring for issue #114,
 # the PRD #158 corrective-retry mechanism, and the issue #178 needs-input

@@ -811,6 +811,17 @@ async def _run_grilling_turn_stream_json(
         context_pct=turn.get("context_pct"),
     )
 
+    # Issue #219: when the grilling skill auto-advances through the full /do
+    # chain (PRD + issues) in one turn, no questions come back but the result
+    # mentions a PRD/issue number. Use a loose presence check (not the strict
+    # title-extracting _DETAIL_RE, which requires ": " or "- " after the number
+    # and fails against natural-language summaries like "Created PRD #N and its
+    # issue #M") to detect this. _finish_chain re-reads console_text from DB
+    # (already persisted above) and uses summary= for the modal display text.
+    if not parsed["questions"] and re.search(r"\b(?:PRD|Issue)\s*#\d+", console_text, re.IGNORECASE):
+        await _finish_chain(card_id, conn, turn["session_id"], cwd, summary=turn["result"])
+        return None
+
     if parsed["questions"] or publish_when_empty:
         publish(card_id, _turn_event(phase="grilling", interview=parsed))
 
@@ -1701,8 +1712,8 @@ async def _await_stalled_reply(
 
 async def _run_chain_step(
     card_id: int, conn, row, *, phase: str, prompt: str, cwd: str | None, model: str | None, effort: str | None
-) -> tuple[bool, str | None]:
-    """Run one /to-prd or /to-issues step, live-streamed. Returns (ok, claude_session_id).
+) -> tuple[bool, str | None, str]:
+    """Run one /to-prd or /to-issues step, live-streamed. Returns (ok, claude_session_id, last_result).
 
     On failure, publishes the error `turn` event and `done` itself -- the
     chain stops here exactly as the old blocking version did.
@@ -1737,7 +1748,7 @@ async def _run_chain_step(
         )
     except PtyEngineUnrecoverableError as e:
         await _route_crash_to_blocked(card_id, conn, e, phase=phase)
-        return False, None
+        return False, None, ""
     except ClaudeCLIError as e:
         _close_engine(card_id)
         message = str(e)
@@ -1754,13 +1765,13 @@ async def _run_chain_step(
             ),
         )
         publish(card_id, {"type": "done"})
-        return False, None
+        return False, None, ""
 
     if turn is None:
         # Issue #144/#149: a genuine turn for this card_id is already in
         # flight -- `_run_turn` already published the duplicate-call error
         # itself; nothing more to do here.
-        return False, None
+        return False, None, ""
 
     classification = await handle_turn_completed(card_id, conn, row, turn["result"], phase)
     if classification is not None and classification.get("needs_input"):
@@ -1769,7 +1780,7 @@ async def _run_chain_step(
             # Already fully handled inside `_await_stalled_reply` (an
             # explicit error published/persisted, or no live engine left to
             # wait on) -- nothing further to do here.
-            return False, None
+            return False, None, ""
         turn = resumed
 
     db.update_session(
@@ -1780,20 +1791,26 @@ async def _run_chain_step(
         context_pct=turn.get("context_pct"),
     )
 
-    return True, turn["session_id"]
+    return True, turn["session_id"], turn["result"]
 
 
 
-async def _finish_chain(card_id: int, conn, claude_session_id: str, cwd: str | None) -> None:
+async def _finish_chain(card_id: int, conn, claude_session_id: str, cwd: str | None, *, summary: str = "") -> None:
     """`/rhubarb:do` just reached `details` (PRD + issues published). Publishes
     the `details` turn event then stops -- the resident engine stays alive and
     idle, waiting on the user's next action (Continue or Close session via the
-    do-finished banner, issue #195). Implementation is never started
-    automatically from here; the user either clicks a PRD in "To be
-    implemented," the AFK self-implement timer picks it up, or they click
-    Continue to start a fresh grilling round on the same card."""
+    do-finished modal). Implementation is never started automatically from
+    here; the user either clicks a PRD in "To be implemented," the AFK
+    self-implement timer picks it up, or they click Continue to start a fresh
+    grilling round on the same card.
+
+    `summary` is Claude's own closing paragraph from the final chain step
+    (the `creating_issues` turn result). Stored in `details` so the
+    do-finished modal can display it verbatim without an extra fetch."""
     row = db.get_session(conn, card_id)
     details = parse_details(row["console_text"])
+    if summary:
+        details["summary"] = summary
     db.update_session(
         conn, card_id, phase="details", details_json=json.dumps(details), claude_session_id=claude_session_id
     )
@@ -1821,20 +1838,20 @@ async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
     row = db.get_session(conn, card_id)
     model = row["model"]
     effort = row["effort"]
-    ok, _ = await _run_chain_step(
+    ok, _, _prd_result = await _run_chain_step(
         card_id, conn, row, phase="creating_prd", prompt="/rhubarb:to-prd", cwd=cwd, model=model, effort=effort
     )
     if not ok:
         return
 
     row = db.get_session(conn, card_id)
-    ok, claude_session_id = await _run_chain_step(
+    ok, claude_session_id, last_result = await _run_chain_step(
         card_id, conn, row, phase="creating_issues", prompt="/rhubarb:to-issues", cwd=cwd, model=model, effort=effort
     )
     if not ok:
         return
 
-    await _finish_chain(card_id, conn, claude_session_id, cwd)
+    await _finish_chain(card_id, conn, claude_session_id, cwd, summary=last_result)
 
 
 async def start_do_continue_job(card_id: int, prompt: str, *, cwd: str | None) -> None:
@@ -2786,7 +2803,7 @@ async def retry_session_job(card_id: int, cwd: str | None) -> None:
     if row["phase"] == "creating_prd":
         await advance_past_grilling(card_id, cwd)
     elif row["phase"] == "creating_issues":
-        ok, claude_session_id = await _run_chain_step(
+        ok, claude_session_id, last_result = await _run_chain_step(
             card_id,
             conn,
             row,
@@ -2797,4 +2814,4 @@ async def retry_session_job(card_id: int, cwd: str | None) -> None:
             effort=row["effort"],
         )
         if ok:
-            await _finish_chain(card_id, conn, claude_session_id, cwd)
+            await _finish_chain(card_id, conn, claude_session_id, cwd, summary=last_result)
