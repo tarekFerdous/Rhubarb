@@ -429,6 +429,10 @@ textarea.prompt-box:focus {
   margin: 0 0 16px;
 }
 
+.modal-text {
+  overflow-wrap: anywhere;
+}
+
 .current-root-dir {
   color: var(--fg-muted);
   font-size: 0.85rem;

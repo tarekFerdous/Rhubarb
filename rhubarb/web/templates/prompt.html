@@ -129,13 +129,6 @@
           <p id="implementing-banner-text" class="implementing-banner-text"></p>
           <button id="implementing-banner-proceed-btn" class="glass-btn implementing-banner-btn" type="button">Proceed</button>
         </div>
-        <div id="do-finished-banner" class="implementing-banner" hidden>
-          <p class="implementing-banner-text">Want to do something right away?</p>
-          <div class="do-finished-banner-actions">
-            <button id="do-finished-continue-btn" class="glass-btn implementing-banner-btn" type="button">Continue</button>
-            <button id="do-finished-close-session-btn" class="glass-btn implementing-banner-btn" type="button">Close session</button>
-          </div>
-        </div>
         <p id="phase-label" class="phase-label"></p>
         <p id="phase-status-message" class="phase-status-message" hidden></p>
         <div class="scroll-wrap"><div id="details-view" class="details-list"></div></div>
@@ -510,6 +503,24 @@
     </div>
   </div>
 
+  <!-- Do-finished modal: shown when a /do session reaches the `details`
+       pause point (PRD + issues published). Displays the session summary
+       (PRD and issue numbers) and offers two actions:
+       - Continue → starts a fresh /do grilling round on the same session
+         (context preserved, prompt box shown for a new prompt).
+       - Close session → ends this session; next /do will start with a blank
+         context (equivalent to /clear). -->
+  <div id="do-finished-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 class="modal-heading">Done!</h2>
+      <p id="do-finished-summary" class="modal-text md-prose"></p>
+      <div class="ready-to-proceed-actions">
+        <button id="do-finished-continue-btn" class="glass-btn" type="button">Continue in the same session</button>
+        <button id="do-finished-close-session-btn" class="glass-btn" type="button">Close the session</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Confirmation for the session-queue close button (issue #122): a
        closed session's PtyEngine is killed outright, so this warns before
        an irreversible action. -->
@@ -567,7 +578,8 @@
     const implementingBannerEl = document.getElementById("implementing-banner");
     const implementingBannerTextEl = document.getElementById("implementing-banner-text");
     const implementingBannerProceedBtn = document.getElementById("implementing-banner-proceed-btn");
-    const doFinishedBannerEl = document.getElementById("do-finished-banner");
+    const doFinishedModalEl = document.getElementById("do-finished-modal");
+    const doFinishedSummaryEl = document.getElementById("do-finished-summary");
     const doFinishedContinueBtnEl = document.getElementById("do-finished-continue-btn");
     const doFinishedCloseSessionBtnEl = document.getElementById("do-finished-close-session-btn");
     const activeProjectLineEl = document.getElementById("active-project-line");
@@ -892,6 +904,7 @@
       backgroundSources.clear();
       resetParsedResultsRouting();
 
+      doFinishedModalEl.hidden = true;
       resetPromptBox();
       startForm.style.display = "";
       interviewEl.innerHTML = "";
@@ -1149,6 +1162,7 @@
       resetGrillingFeed();
       setLiveTerminalFeedMode(false);
       rightCards.clear();
+      doFinishedModalEl.hidden = true;
       resetPromptBox();
       startForm.style.display = "";
       interviewEl.innerHTML = "";
@@ -4009,12 +4023,39 @@
         implementingBannerEl.hidden = false;
       }
 
-      // Issue #197 (child of PRD #195): show the do-finished banner when a /do
-      // session is sitting at the `details` pause point, derived purely from
-      // session_type/phase so it re-appears correctly on reload/reconnect.
+      // Show the do-finished modal when a /do session is sitting at the
+      // `details` pause point -- derived from session_type/phase so it
+      // re-appears correctly on reload/reconnect. The summary line is built
+      // from `session.details` (PRD + issues) so no separate storage field
+      // is needed.
       const showDoFinished = session && !session.error &&
         session.session_type === "do" && session.phase === "details";
-      doFinishedBannerEl.hidden = !showDoFinished;
+      if (showDoFinished) {
+        // Prefer Claude's own closing paragraph (stored as details.summary by
+        // the backend once the blocker issue lands). Fall back to a computed
+        // string from the structured details for sessions created before that
+        // change, so existing paused sessions still render something useful.
+        let summary = session.details?.summary || "";
+        if (!summary) {
+          const prd = session.details?.prd;
+          const issues = session.details?.issues || [];
+          if (prd) {
+            summary = `PRD #${prd.number}: ${prd.title}`;
+            if (issues.length > 0) {
+              const nums = issues.map(i => `#${i.number}`).join(", ");
+              summary += ` and ${issues.length} issue${issues.length > 1 ? "s" : ""} (${nums}) are ready to implement.`;
+            } else {
+              summary += " is ready to implement.";
+            }
+          } else {
+            summary = "Publishing complete.";
+          }
+        }
+        doFinishedSummaryEl.innerHTML = marked.parse(summary);
+        doFinishedModalEl.hidden = false;
+      } else {
+        doFinishedModalEl.hidden = true;
+      }
     }
 
     function renderSessionStatus(session) {
@@ -4240,16 +4281,43 @@
     closeSessionCancelBtnEl.addEventListener("click", dismissCloseSessionModal);
     closeSessionConfirmBtnEl.addEventListener("click", confirmCloseSession);
 
-    // Issue #197: Close session button on the do-finished banner -- reuses the
-    // existing confirmation modal wired to the focused left card.
-    doFinishedCloseSessionBtnEl.addEventListener("click", () => {
-      if (leftCardId !== null) openCloseSessionModal(leftCardId);
+    // Close session button on the do-finished modal -- direct close, no
+    // confirmation dialog (the user has already made a deliberate choice).
+    doFinishedCloseSessionBtnEl.addEventListener("click", async () => {
+      const cardId = leftCardId;
+      doFinishedModalEl.hidden = true;
+      if (cardId === null) return;
+
+      await fetch(`/api/sessions/${cardId}/close`, { method: "POST" });
+
+      closedCardIds.add(cardId);
+      rightCards.delete(cardId);
+      cardSnapshots.delete(cardId);
+      const bgEs = backgroundSources.get(cardId);
+      if (bgEs) { bgEs.close(); backgroundSources.delete(cardId); }
+
+      if (eventSource) { eventSource.close(); eventSource = null; }
+      leftCardId = null;
+      turnInFlight = false;
+      syncPtySocket();
+      currentLeftSession = null;
+      resetGrillingFeed();
+      setLiveTerminalFeedMode(false);
+      refreshModelEffortCard();
+      resetPromptBox();
+      startForm.style.display = "";
+      interviewEl.innerHTML = "";
+      interviewEl.scrollTop = 0;
+      setHeading("What are we doing?");
+      showOnly(mainFlowEl);
+      renderQueue();
     });
 
-    // Issue #198: Continue button -- show the prompt box so the user can type
-    // a new prompt; form submission detects the do-details state and routes to
-    // the continue-do endpoint instead of creating a new session.
+    // Continue button -- dismiss the modal, then show the prompt box so the
+    // user can type a new prompt; form submission detects the do-details state
+    // and routes to the continue-do endpoint instead of creating a new session.
     doFinishedContinueBtnEl.addEventListener("click", () => {
+      doFinishedModalEl.hidden = true;
       resetPromptBox();
       startForm.style.display = "";
       showOnly(sessionStatusEl);

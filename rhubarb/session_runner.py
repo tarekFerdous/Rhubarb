@@ -96,6 +96,7 @@ from rhubarb import db, error_log, parser_session
 from rhubarb.cli_client import ClaudeCLIError
 from rhubarb.live_stream import publish
 from rhubarb.ollama_rescue import (
+    _is_valid_grilling_shape,
     classify_turn_needs_input,
     rescue_grilling_response,
     rescue_qa_response,
@@ -717,6 +718,47 @@ async def _run_grilling_stream_json_turn(
         return holder["turn"]
 
 
+async def _extract_grilling_questions_via_parser_session(project_id: int, text: str) -> dict | None:
+    """Issue #221 (child of PRD #187/#220): drive `project_id`'s already-
+    running parser session synchronously to extract structured questions out
+    of `text` -- a grilling turn's raw result that `parse_grilling_response`
+    already regex-parsed to zero questions. Uses the exact same extraction
+    prompt/validation `parser_session._process_one_queued_item` uses for the
+    needs-input queue (`_EXTRACTION_PROMPT_TEMPLATE`, `_extract_json_object`,
+    `_is_valid_grilling_shape`), just called inline here instead of via that
+    queue -- grilling has no need for the queue's async/routing machinery
+    since this call's result is used immediately, in the same request.
+
+    Returns a `{header, questions, footer, source: "parser_session"}` dict on
+    a successful, schema-valid parse. Returns `None` on any failure -- a
+    dead/missing parser session, a turn that produced no `result` event, or
+    a response that isn't valid JSON matching the expected shape -- so a
+    caller treats `None` exactly like "the parser session found no questions
+    either" and falls through to the existing `publish_when_empty` handling.
+    Deliberately no legacy regex/Ollama-rescue fallback here (unlike
+    `parser_session.drain_needs_input_queue`'s own queue path): the regex
+    parser has already run and found nothing before this is ever called, so
+    falling back to it again would just re-run the same failed parse."""
+    prompt = parser_session._EXTRACTION_PROMPT_TEMPLATE.format(phase="grilling", text=text)
+
+    try:
+        result_text = None
+        async for event in parser_session.stream_turn(project_id, prompt):
+            if event.get("type") == "result":
+                result_text = event.get("result")
+    except Exception:  # noqa: BLE001 -- a dead/failed parser session must not crash the grilling turn
+        return None
+
+    if result_text is None:
+        return None
+
+    data = parser_session._extract_json_object(result_text)
+    if data is None or not _is_valid_grilling_shape(data):
+        return None
+
+    return {"header": data["header"], "questions": data["questions"], "footer": data["footer"], "source": "parser_session"}
+
+
 async def _run_grilling_turn_stream_json(
     card_id: int,
     conn,
@@ -750,7 +792,16 @@ async def _run_grilling_turn_stream_json(
     the question file or invoke the Ollama rescue path. That existing
     chain is left completely untouched and still fully exercised by every
     other phase that has its own equivalent (`_QA_QUESTION_FILE`,
-    `_IMPLEMENT_BLOCKED_FILE`)."""
+    `_IMPLEMENT_BLOCKED_FILE`).
+
+    Issue #221 (child of PRD #187/#220): a turn `parse_grilling_response`
+    can't find questions in also gets one synchronous parser-session pass
+    (`_extract_grilling_questions_via_parser_session`) before falling back to
+    `publish_when_empty` -- this replaced the old `handle_turn_completed`
+    Ollama needs-input classifier gate for this phase specifically, which
+    the issue's acceptance criteria requires be gone (grilling always
+    transitions to PRD next; there is no "needs input" holding state for it
+    to gate into)."""
     publish(card_id, {"type": "phase", "phase": "grilling"})
 
     try:
@@ -782,23 +833,47 @@ async def _run_grilling_turn_stream_json(
     parsed = parse_grilling_response(turn["result"])
     console_text = row["console_text"] + "\n\n" + turn["result"] if row["console_text"] else turn["result"]
 
+    # Issue #219: when the grilling skill auto-advances through the full /do
+    # chain (PRD + issues) in one turn, no questions come back but the result
+    # mentions a PRD/issue number. Use a loose presence check (not the strict
+    # title-extracting _DETAIL_RE, which requires ": " or "- " after the number
+    # and fails against natural-language summaries like "Created PRD #N and its
+    # issue #M") to detect this. This chain-completion guard runs BEFORE the
+    # issue #221 parser-session dispatch below and is unchanged by it -- a
+    # turn that already completed the chain never needs question extraction.
+    if not parsed["questions"] and re.search(r"\b(?:PRD|Issue)\s*#\d+", console_text, re.IGNORECASE):
+        db.update_session(
+            conn,
+            card_id,
+            model=model,
+            effort=effort,
+            claude_session_id=turn["session_id"],
+            console_text=console_text,
+            interview_json=json.dumps(parsed),
+            context_pct=turn.get("context_pct"),
+        )
+        # _finish_chain re-reads console_text from DB (already persisted
+        # above) and uses summary= for the modal display text.
+        await _finish_chain(card_id, conn, turn["session_id"], cwd, summary=turn["result"])
+        return None
+
     if not parsed["questions"]:
-        # Issue #191 (child of PRD #187): this engine's own question-parsing
-        # is deliberately simple -- no file-preference read, no Ollama
-        # rescue-extraction fallback, no corrective retry (see this
-        # function's own docstring) -- but a turn that came back with no
-        # parseable questions still needs the same needs-input classifier
-        # every other phase now runs through the shared
-        # `handle_turn_completed` hook, so a genuinely open question this
-        # turn's prose contains (just not in the `Question N: "..."`
-        # format) gets gated and, if flagged, queued onto this project's
-        # needs-input queue for its parser session (issue #192) instead of
-        # silently being treated as "no more questions". This call makes NO
-        # UI decision of its own -- no rich extraction attempt, no stalled
-        # panel, matching this engine's deliberately simple contract -- it's
-        # gating + queueing only; `parsed` and this function's own return
-        # value below are completely unaffected by its result.
-        await handle_turn_completed(card_id, conn, row, turn["result"], "grilling")
+        # Issue #221 (child of PRD #187/#220): this engine's own regex-only
+        # parsing (`parse_grilling_response`) doesn't recognise every format
+        # the grilling skill can emit (e.g. `❓ **Q1** - **title**: body`), so
+        # a turn that regex-parsed to zero questions gets one more shot via
+        # this project's live parser session -- the SAME synchronous-
+        # extraction contract `parser_session._process_one_queued_item`
+        # already uses for the needs-input queue, just driven inline here
+        # instead of via that queue. Replaces the old `handle_turn_completed`
+        # Ollama needs-input classifier gate entirely: grilling always
+        # transitions to PRD next, so there is no "needs input" holding
+        # state for it to gate into anymore.
+        extracted = await _extract_grilling_questions_via_parser_session(
+            row["project_id"], turn["result"]
+        )
+        if extracted is not None:
+            parsed = extracted
 
     db.update_session(
         conn,
@@ -810,17 +885,6 @@ async def _run_grilling_turn_stream_json(
         interview_json=json.dumps(parsed),
         context_pct=turn.get("context_pct"),
     )
-
-    # Issue #219: when the grilling skill auto-advances through the full /do
-    # chain (PRD + issues) in one turn, no questions come back but the result
-    # mentions a PRD/issue number. Use a loose presence check (not the strict
-    # title-extracting _DETAIL_RE, which requires ": " or "- " after the number
-    # and fails against natural-language summaries like "Created PRD #N and its
-    # issue #M") to detect this. _finish_chain re-reads console_text from DB
-    # (already persisted above) and uses summary= for the modal display text.
-    if not parsed["questions"] and re.search(r"\b(?:PRD|Issue)\s*#\d+", console_text, re.IGNORECASE):
-        await _finish_chain(card_id, conn, turn["session_id"], cwd, summary=turn["result"])
-        return None
 
     if parsed["questions"] or publish_when_empty:
         publish(card_id, _turn_event(phase="grilling", interview=parsed))

@@ -245,6 +245,57 @@ def _mock_engine(monkeypatch, handler, *, fresh_ids=None, reply_handler=None):
     return fake_class
 
 
+def _mock_parser_session_extraction(monkeypatch, project_id, cwd, *, header="", questions=None, footer=""):
+    """Issue #221: register a live, fake parser session for `project_id`
+    whose every turn replies with the given `{header, questions, footer}`
+    payload as JSON -- for tests exercising `_run_grilling_turn_stream_json`'s
+    synchronous parser-session dispatch (the `not parsed["questions"]`
+    branch) without spawning a real subprocess. Mirrors
+    `tests/test_parser_session.py`'s own `_mock_parser_engine` fake-class
+    shape, plus an explicit `ensure_parser_session` call so the session is
+    registered and ready *before* the test drives any grilling turn --
+    `open_project`'s own pre-warm of this is fire-and-forget and racy, so
+    tests that need this path deterministic can't rely on it."""
+    payload = json.dumps({"header": header, "questions": questions or [], "footer": footer})
+
+    class FakeParserEngine:
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+            self.session_id = resume_session_id or "parser-session-fake"
+            self._alive = False
+
+        def start(self):
+            self._alive = True
+            return self
+
+        def close(self):
+            self._alive = False
+
+        def isalive(self):
+            return self._alive
+
+        async def stream_turn(self, prompt):
+            yield {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": payload,
+                "session_id": self.session_id,
+            }
+
+    monkeypatch.setattr(parser_session, "StreamJsonEngine", FakeParserEngine)
+    # `_open_project`'s own `/open` POST fire-and-forgets its own parser-
+    # session warm (`open_project` -> `_warm_project_engines` ->
+    # `ensure_parser_session`) -- a background task that may or may not have
+    # already registered (and started) a DIFFERENT (default no-op) engine
+    # for this project_id by the time this helper runs, racily. Drop any
+    # such entry first so `ensure_parser_session` below is forced to spawn
+    # fresh under `FakeParserEngine` rather than silently reusing whatever
+    # the race already registered (double-checked locking treats "already
+    # registered and alive" as nothing to do).
+    parser_session._parser_sessions.pop(project_id, None)
+    asyncio.run(parser_session.ensure_parser_session(project_id, cwd=cwd))
+
+
 def _mock_stream_json_engine(monkeypatch, handler, *, fresh_ids=None, reply_handler=None):
     """Monkeypatch ONLY `session_runner.StreamJsonEngine` with the fake class
     driven by `handler` -- for tests that exercise code paths that exclusively
@@ -578,6 +629,14 @@ def test_start_session_job_publishes_interview_even_with_no_structured_questions
         monkeypatch,
         lambda prompt, **kw: iter([_result_event("Sure, tell me more about what you have in mind.")]),
     )
+    # Issue #221: the regex parser finds no structured questions in this
+    # plain-prose reply, so `_run_grilling_turn_stream_json` now falls
+    # through to a synchronous parser-session extraction pass -- scripted
+    # here to also find none (a genuine wrap-up), same as this test always
+    # expected.
+    _mock_parser_session_extraction(
+        monkeypatch, project_id, cwd, header="Sure, tell me more about what you have in mind."
+    )
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -636,6 +695,11 @@ def test_continue_session_job_with_no_more_questions_does_not_auto_advance(clien
         return iter([_result_event("Thanks, that's everything I need.")])
 
     _mock_engine(monkeypatch, handler)
+    # Issue #221: the second turn's reply has no regex-recognizable
+    # questions, so it falls through to the parser-session extraction pass
+    # -- scripted here to also find none, matching this test's original
+    # "genuine wrap-up" expectation.
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="Thanks, that's everything I need.")
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -654,6 +718,61 @@ def test_continue_session_job_with_no_more_questions_does_not_auto_advance(clien
     assert turn_events[-1]["interview"]["questions"] == []
     assert turn_events[-1]["interview"]["header"]
     assert not any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
+
+
+def test_stream_json_grilling_turn_uses_parser_session_for_emoji_question_format(client, tmp_path, monkeypatch):
+    """Issue #221 (child of PRD #187/#220): the grilling skill's real
+    `❓ **Q1** - **title**: body` question format isn't recognized by the
+    regex parser (`parse_grilling_response`), so `_run_grilling_turn_stream_
+    json` must fall through to a synchronous parser-session extraction pass
+    and publish ITS structured result as the turn's `interview` payload."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    turn_text = "❓ **Q1** - **Scope**: Should this cover mobile too?"
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(turn_text)]))
+    _mock_parser_session_extraction(
+        monkeypatch,
+        project_id,
+        cwd,
+        header="",
+        questions=[
+            {
+                "id": "q1",
+                "text": "Should this cover mobile too?",
+                "kind": "single",
+                "options": ["Yes", "No"],
+                "recommended": [1],
+                "recommended_text": None,
+            }
+        ],
+        footer="",
+    )
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "grilling"
+    interview = json.loads(row["interview_json"])
+    assert interview["source"] == "parser_session"
+    assert interview["questions"] == [
+        {
+            "id": "q1",
+            "text": "Should this cover mobile too?",
+            "kind": "single",
+            "options": ["Yes", "No"],
+            "recommended": [1],
+            "recommended_text": None,
+        }
+    ]
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e["type"] == "turn"]
+    assert len(turn_events) == 1
+    assert turn_events[0]["phase"] == "grilling"
+    assert turn_events[0]["interview"] == interview
 
 
 def test_stream_json_grilling_turn_with_prd_in_output_auto_transitions_to_details(
@@ -756,6 +875,12 @@ def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, 
         raise AssertionError(f"unexpected prompt {prompt!r} -- do chain must not auto-implement")
 
     _mock_engine(monkeypatch, handler)
+    # Issue #221: "❓ **Q1**" isn't a format the regex parser recognizes
+    # either, so the first turn now falls through to the parser-session
+    # extraction pass -- scripted here to find nothing, since this test
+    # doesn't care about the parsed interview, only that confirm_advance
+    # skips straight to the chain afterward.
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="❓ **Q1** - **Scope**: Only question?")
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
@@ -5239,36 +5364,38 @@ def test_handle_turn_completed_keeps_different_projects_queues_separate(client, 
 # ---------------------------------------------------------------------------
 
 
-def test_grilling_last_resort_needs_input_classification_enqueues_onto_project_queue(
-    client, tmp_path, monkeypatch
-):
-    """Issue #191: grilling's own last-resort needs-input check
-    (`_maybe_extract_needs_input_grilling`, issue #178) now also enqueues a
-    positively-classified turn, tagged with this session's own card id and
-    phase `"grilling"`, onto its project's needs-input queue."""
+def test_grilling_turn_no_longer_enqueues_onto_needs_input_queue(client, tmp_path, monkeypatch):
+    """Issue #221 (child of PRD #187/#220): `_run_grilling_turn_stream_json`
+    no longer calls `handle_turn_completed` at all -- grilling always
+    transitions to PRD next, so there is no "needs input" holding state for
+    it to gate into, and the Ollama classifier gate that used to enqueue a
+    positively-classified turn onto the project's needs-input queue for
+    grilling specifically is dead code, removed.
+
+    Supersedes `test_grilling_last_resort_needs_input_classification_
+    enqueues_onto_project_queue` (removed rather than kept red: the behavior
+    it asserted no longer exists for this phase by design, not by
+    regression). QA/implement/creating_prd/creating_issues keep the real
+    `handle_turn_completed` wiring untouched -- see their own equivalent
+    tests elsewhere in this file (e.g.
+    `test_qa_grilling_last_resort_needs_input_classification_enqueues_onto_project_queue`)."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    # No "question " trigger at all -- `should_attempt_grilling_rescue`
-    # never fires, so only the last-resort classifier check flags this turn.
     prose = "Still thinking this through -- should I use REST or GraphQL here?"
     _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(prose, session_id="g1")]))
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header=prose)
 
     async def fake_classify(card_id, conn_arg, text, phase, *, http_post=None):
-        return {"needs_input": True, "reason": "Asked REST vs GraphQL."}
+        raise AssertionError("classify_needs_input must not be called for a grilling turn (issue #221)")
 
     monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
-    # `start_session_job` runs only grilling's own first turn and stops --
-    # the chain never auto-advances into creating_prd without an explicit
-    # later `continue_session_job(confirm_advance=True)` call, so this
-    # project's queue reflects only this one grilling turn.
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
-    queue = parser_session.get_needs_input_queue(project_id)
-    assert queue == [{"project_id": project_id, "card_id": row_id, "phase": "grilling", "text": prose}]
+    assert parser_session.get_needs_input_queue(project_id) == []
 
 
 def test_qa_grilling_last_resort_needs_input_classification_enqueues_onto_project_queue(
