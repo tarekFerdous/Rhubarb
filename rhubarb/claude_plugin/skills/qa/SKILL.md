@@ -7,7 +7,7 @@ description: Reads the implement tracker file, runs the QA grilling loop, closes
 
 Pick up where `/rhubarb:implement` left off. Reads the tracker file, runs QA, closes everything, commits, and cleans up. Follow each phase in order without skipping.
 
-**Never spawn a subagent.** No part of this workflow — applying QA-requested fixes, closing issues, committing, or anything invoked from here including `/rhubarb:qa-grilling` — may dispatch a subagent (via the Agent tool, a fork, or any other delegation mechanism). Everything happens directly, in this same continuous session.
+**Never spawn a subagent.** No part of this workflow — applying QA-requested fixes, closing issues, committing, or anything invoked from here including `/rhubarb:qa-grilling` — may dispatch a subagent (via the Agent tool, a fork, or any other delegation mechanism) or run anything in parallel. Everything happens directly, one thing at a time, in this same continuous session.
 
 ---
 

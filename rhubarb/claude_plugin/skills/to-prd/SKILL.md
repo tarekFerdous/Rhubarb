@@ -1,9 +1,13 @@
 ---
 name: to-prd
-description: Turn the current conversation into a PRD and publish it to the project issue tracker — no interview, just synthesis of what you've already discussed.
+description: Turn the current conversation into a drafted PRD — no interview, no publishing, just synthesis of what you've already discussed for /rhubarb:publish-to-github to publish next.
 ---
 
 This skill takes the current conversation context and codebase understanding and produces a PRD. Do NOT interview the user — just synthesize what you already know.
+
+This is a pure drafting step, only ever reached through the automated `/do` chain — it is never used interactively on its own. Do NOT run `gh issue create` and do NOT pause to check anything with the user: write the PRD and output it in full; the next phase (`/rhubarb:publish-to-github`, a resumed turn of this same conversation) is the one place that publishes it.
+
+**Never spawn a subagent.** All exploration and drafting below happens directly, in this same session — never dispatch a subagent (via the Agent tool, a fork, or any other delegation mechanism), and never run anything in parallel.
 
 ## Process
 
@@ -11,23 +15,13 @@ This skill takes the current conversation context and codebase understanding and
 
 2. Sketch out the seams at which you're going to test the feature. Existing seams should be preferred to new ones. Use the highest seam possible. If new seams are needed, propose them at the highest point you can. The fewer seams across the codebase, the better - the ideal number is one.
 
-Check with the user that these seams match their expectations.
-
-3. Write the PRD using the template below, then publish it to GitHub by running:
+3. Write the PRD using the template below and output the full result in your reply, starting with exactly one title line in this format:
 
    ```
-   gh issue create --title "<PRD title>" --body "<the full rendered PRD markdown>" --label "ready-for-agent" --label "prd"
+   PRD Draft: <title>
    ```
 
-   Apply both the `ready-for-agent` label (so the AFK session runner picks it up) and the `prd` label (so it appears in the "To be implemented" panel, distinguishing it from `/rhubarb:to-issues`' child slices, which carry `ready-for-agent` only) — no need for additional triage.
-
-4. After `gh issue create` succeeds, parse the issue number from the URL it prints and output exactly one line in this format (where N is the real issue number):
-
-   ```
-   PRD #N: <title>
-   ```
-
-   This line is required — the backend parses the issue number from it.
+   followed by the rendered PRD markdown in full. `/rhubarb:publish-to-github` reads this straight out of this same conversation's context — no file, no marker beyond the title line above.
 
 <prd-template>
 

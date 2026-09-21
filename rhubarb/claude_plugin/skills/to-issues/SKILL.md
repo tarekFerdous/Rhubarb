@@ -1,11 +1,15 @@
 ---
 name: to-issues
-description: Break a plan, spec, or PRD into independently-grabbable issues on the project issue tracker using tracer-bullet vertical slices.
+description: Break a plan, spec, or PRD into independently-grabbable draft issues using tracer-bullet vertical slices, for /rhubarb:publish-to-github to publish next.
 ---
 
 # /rhubarb:to-issues
 
 Break a plan into independently-grabbable issues using vertical slices (tracer bullets).
+
+This is a pure drafting step, only ever reached through the automated `/do` chain — it is never used interactively on its own. Do NOT run `gh issue create` and do NOT quiz the user about the breakdown: draft the slices and output them; the next phase (`/rhubarb:publish-to-github`, a resumed turn of this same conversation) is the one place that publishes them.
+
+**Never spawn a subagent.** All exploration and drafting below happens directly, in this same session — never dispatch a subagent (via the Agent tool, a fork, or any other delegation mechanism), and never run anything in parallel.
 
 ## Process
 
@@ -31,44 +35,22 @@ Break the plan into **tracer bullet** issues. Each issue is a thin vertical slic
 
 </vertical-slice-rules>
 
-### 4. Quiz the user
+### 4. Output the draft slices
 
-Present the proposed breakdown as a numbered list. For each slice, show:
+Assign each slice a stable per-run label in dependency order: `S1`, `S2`, `S3`, ... These labels exist only to let `/rhubarb:publish-to-github` resolve sibling cross-references later in this same conversation — they are never shown to the user and never published anywhere.
 
-- **Title**: short descriptive name
-- **Blocked by**: which other slices (if any) must complete first
-- **User stories covered**: which user stories this addresses (if the source material has them)
-
-Ask the user:
-
-- Does the granularity feel right? (too coarse / too fine)
-- Are the dependency relationships correct?
-- Should any slices be merged or split further?
-
-Iterate until the user approves the breakdown.
-
-### 5. Publish the issues to GitHub
-
-For each approved slice, in dependency order (blockers first), run:
+For each slice, output exactly one label line in this format, followed by the issue body using the template below:
 
 ```
-gh issue create --title "<title>" --body "<body>" --label "ready-for-agent"
+Issue Draft S1: <title>
 ```
 
-After each `gh issue create` succeeds, parse the issue number from the URL it prints and output exactly one line in this format (where N is the real issue number):
-
-```
-Issue #N: <title>
-```
-
-These lines are required — the backend parses issue numbers from them.
-
-Use the issue body template below for each issue's `body`. In the "Blocked by" section, use real `#N` references from the issues you have already created in this same run (earlier in dependency order), not placeholders.
+Use the issue body template below for each drafted issue's body. The real parent PRD issue number doesn't exist yet at draft time, so leave `## Parent` as a placeholder. Likewise, no sibling has been published yet, so in "Blocked by" reference the blocking slice's own label (`S1`, `S2`, ...) instead of a real `#N` — `/rhubarb:publish-to-github` resolves every label into the real issue number it just created for that slice, in the same dependency order established here (blockers first).
 
 <issue-template>
 ## Parent
 
-A reference to the parent issue on the issue tracker (if the source was an existing issue, otherwise omit this section).
+(assigned by /rhubarb:publish-to-github once the PRD is published)
 
 ## What to build
 
@@ -84,7 +66,7 @@ Avoid specific file paths or code snippets — they go stale fast. Exception: if
 
 ## Blocked by
 
-- #N (real issue number, assigned above)
+- S1 (per-run label of the blocking slice, assigned above)
 
 Or "None - can start immediately" if no blockers.
 
