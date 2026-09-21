@@ -1025,10 +1025,18 @@ def test_drain_preserves_mixed_kind_payload_fields(monkeypatch):
     assert q[2]["kind"] == "open" and q[2]["options"] is None and q[2]["recommended_text"] == "Keep it simple for now."
 
 
-def test_extraction_prompt_contains_splitting_guidance(monkeypatch):
-    """The prompt written to the parser-session subprocess must include the
-    multi-question splitting guidance -- 'separate' and 'Question N:' -- so
-    a future text edit can't silently regress the instruction."""
+def test_extraction_prompt_invokes_the_parse_interview_skill_with_phase_and_text(monkeypatch):
+    """Issue #228: the inline `_EXTRACTION_PROMPT_TEMPLATE` prompt string is
+    gone -- the multi-question splitting guidance and the `Recommended:`
+    mapping rule now live in the `rhubarb` plugin's own
+    `/rhubarb:parse-interview` skill file
+    (`rhubarb/claude_plugin/skills/parse-interview/SKILL.md`), discoverable
+    by every parser-session subprocess via `--plugin-dir` regardless of
+    phase. What this module must still get right is invoking that skill,
+    uniformly, with this item's own `phase` and raw `text` -- so this
+    asserts the prompt actually written to the subprocess references the
+    skill and carries both inputs through, rather than re-asserting prose
+    that no longer lives in this file."""
     backend = FakeStreamJsonBackend([_extraction_result_line("session-abc", _VALID_PAYLOAD_1)], eof_after=False)
     factory, _calls = _sequenced_process_factory([backend])
     _patch_stream_json_engine_process_factory(monkeypatch, factory)
@@ -1041,8 +1049,93 @@ def test_extraction_prompt_contains_splitting_guidance(monkeypatch):
     # first user-turn JSON written to the subprocess stdin.
     assert len(backend.written_lines) >= 1
     prompt_json = backend.written_lines[-1]
-    assert "separate" in prompt_json
-    assert "Question N:" in prompt_json or "Question N" in prompt_json
+    assert "/rhubarb:parse-interview" in prompt_json
+    assert "phase: grilling" in prompt_json
+    assert "Does this matter?" in prompt_json
+
+
+def test_build_extraction_prompt_invokes_the_skill_uniformly_across_phases():
+    """No phase-specific branching (issue #228's acceptance criterion): the
+    same `/rhubarb:parse-interview` invocation shape is produced for every
+    phase that routes through this extraction path, differing only in the
+    `phase:` value itself."""
+    for phase in ("grilling", "qa", "qa_grilling", "implement"):
+        prompt = parser_session._build_extraction_prompt(phase=phase, text="raw turn text")
+
+        assert prompt.startswith("/rhubarb:parse-interview ")
+        assert f"phase: {phase}" in prompt
+        assert "raw turn text" in prompt
+
+
+def test_reproduces_original_bug_scenario_prompt_carries_the_full_raw_text_through(monkeypatch):
+    """Issue #228's regression scenario (root cause of PRD #227): a turn
+    whose raw text has a paragraph of prose, then a transition phrase, then
+    a `❓ **Q5**` block with options and a `Recommended:` line, where the
+    old inline prompt had no explicit rule for mapping that line onto
+    `recommended`/`recommended_text` and silently dropped it. This module
+    can't verify the skill's actual parsing accuracy (that's the skill's own
+    prose, exercised via worked examples, not this Python code) -- what it
+    verifies is (a) the prompt actually sent to the parser session invokes
+    the new skill with this exact raw text intact, and (b) a scripted
+    response that correctly preserves `options`/`recommended` threads all
+    the way through the existing JSON-response handling to the tagged
+    result, end to end."""
+    raw_text = (
+        "We've settled the schema and the API shape already. The last open "
+        "branch is how retries should behave under load, since that changes "
+        "how aggressively the client backs off.\n\n"
+        "One more branch to close:\n\n"
+        "❓ **Q5** - **Retry backoff**: How should the client back off "
+        "between retries?\n"
+        "- Fixed 1s delay\n"
+        "- Exponential backoff\n"
+        "- No retry, fail fast\n"
+        "Recommended: Exponential backoff\n"
+    )
+    scripted_response = {
+        "header": (
+            "We've settled the schema and the API shape already. The last open "
+            "branch is how retries should behave under load, since that changes "
+            "how aggressively the client backs off.\n\nOne more branch to close:"
+        ),
+        "footer": "",
+        "questions": [
+            {
+                "id": "q5",
+                "text": "How should the client back off between retries?",
+                "kind": "single",
+                "options": ["Fixed 1s delay", "Exponential backoff", "No retry, fail fast"],
+                "recommended": [2],
+                "recommended_text": None,
+            }
+        ],
+    }
+    backend = FakeStreamJsonBackend([_extraction_result_line("session-abc", scripted_response)], eof_after=False)
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(1, cwd="/repo"))
+    parser_session.enqueue_needs_input_turn(1, card_id=5, phase="grilling", text=raw_text)
+
+    results = run(_drain_all(1))
+
+    # (a) the constructed prompt invokes the new skill and carries the raw
+    # text (including the transition phrase) through untouched.
+    prompt_json = backend.written_lines[-1]
+    assert "/rhubarb:parse-interview" in prompt_json
+    assert "phase: grilling" in prompt_json
+    assert "One more branch to close" in prompt_json
+    assert "Recommended: Exponential backoff" in prompt_json
+
+    # (b) the scripted response's populated options/recommended thread
+    # through the existing response handling untouched.
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+    assert results[0]["source"] == "parser_session"
+    question = results[0]["questions"][0]
+    assert question["kind"] == "single"
+    assert question["options"] == ["Fixed 1s delay", "Exponential backoff", "No retry, fail fast"]
+    assert question["recommended"] == [2]
+    assert question["recommended_text"] is None
 
 
 def test_drain_never_raises_when_no_parser_session_is_registered_for_the_project():
@@ -1220,23 +1313,25 @@ def test_parsed_results_endpoint_keeps_different_projects_independent(monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# Legacy fallback on parse failure (issue #194, `gh issue view 194` for full
-# context): when a queued item's primary parser-session extraction fails --
-# subprocess error/timeout, or a response failing schema validation -- that
-# ONE item's raw turn text falls back to the pre-existing regex-parser +
-# Ollama-rescue extraction pipeline (`qa_parser.parse_grilling_response` /
-# `ollama_rescue.rescue_grilling_response`), tagged `"source": "fallback"`
-# either way (`ok: True` if the fallback recovered a question, `ok: False`
-# if it didn't) so the frontend can always raise its failure-variant toast.
-# A clean primary-path success is now also tagged, `"source":
-# "parser_session"`, so a test (or the frontend) can positively distinguish
-# "parsed normally" from "fell back" rather than only ever checking for the
-# fallback marker's absence.
+# Legacy fallback on parse failure (issue #194 originally, `gh issue view
+# 194` for context; retired by issue #230, `gh issue view 230`): when a
+# queued item's primary parser-session extraction fails -- subprocess
+# error/timeout, or a response failing schema validation -- that ONE item's
+# result is tagged `"source": "fallback"`. This used to also attempt a
+# regex-parser + Ollama-rescue extraction pipeline (`qa_parser.
+# parse_grilling_response` / `ollama_rescue.rescue_grilling_response`) as a
+# second try, which could still recover a question (`ok: True`); issue #230
+# retired that chain -- the parser-session pipeline is now the ONLY
+# extraction mechanism, so a primary failure is always `ok: False` now. A
+# clean primary-path success is still tagged `"source": "parser_session"`,
+# so a test (or the frontend) can positively distinguish "parsed normally"
+# from "failed" rather than only ever checking for the fallback marker's
+# absence.
 #
 # Nothing here persists any per-project or per-session state -- each item's
-# own primary-vs-fallback outcome is decided completely independently
-# (retry-per-turn, never a permanent downgrade); see
-# `test_retry_per_turn_...`/`test_repeated_failures_...` below.
+# own outcome is decided completely independently (retry-per-turn, never a
+# permanent downgrade); see `test_retry_per_turn_...`/
+# `test_repeated_failures_...` below.
 # ---------------------------------------------------------------------------
 
 _GRILLING_FORMAT_TEXT = (
@@ -1264,30 +1359,30 @@ def test_primary_success_is_tagged_with_the_parser_session_source(monkeypatch):
     assert results[0]["source"] == "parser_session"
 
 
-def test_primary_subprocess_error_falls_back_to_regex_extraction_and_tags_it():
-    """Acceptance criterion: "A parser-session turn that errors (subprocess
-    error, timeout) falls back to the existing regex/Ollama-rescue
-    extraction for that turn." No parser session is registered for this
-    project at all, so `stream_turn` raises `LookupError` -- the same
-    subprocess-failure shape `_process_one_queued_item`'s `except Exception`
-    branch treats generically. The queued item's raw text parses cleanly via
-    the free regex parser alone, so the fallback succeeds without needing
-    Ollama at all."""
+def test_primary_subprocess_error_produces_a_tagged_fallback_failure():
+    """Acceptance criterion (issue #230): a parser-session turn that errors
+    (subprocess error, timeout) is tagged `"source": "fallback"` with
+    `ok: False` -- issue #230 retired the regex/Ollama-rescue extraction that
+    used to be attempted as a second try here, so there is nothing left that
+    could recover a question; a primary failure is now always just a tagged
+    failure. No parser session is registered for this project at all, so
+    `stream_turn` raises `LookupError` -- the same subprocess-failure shape
+    `_process_one_queued_item`'s `except Exception` branch treats
+    generically."""
     parser_session.enqueue_needs_input_turn(2002, card_id=6, phase="grilling", text=_GRILLING_FORMAT_TEXT)
 
     results = run(_drain_all(2002))
 
     assert len(results) == 1
     result = results[0]
-    assert result["ok"] is True
+    assert result["ok"] is False
     assert result["source_session_id"] == 6
     assert result["source"] == "fallback"
-    assert result["questions"][0]["text"] == "Should this be Python or Node?"
-    assert result["questions"][0]["options"] == ["Python", "Node"]
+    assert "error" in result
     assert parser_session.get_needs_input_queue(2002) == []
 
 
-def test_primary_timeout_falls_back_the_same_way(monkeypatch):
+def test_primary_timeout_produces_a_tagged_fallback_failure_the_same_way(monkeypatch):
     """Acceptance criterion: a timeout is another "parser-session turn
     errors" shape -- simulated here by making `stream_turn` itself raise
     `TimeoutError`, exercised the same way `_process_one_queued_item`'s own
@@ -1302,14 +1397,15 @@ def test_primary_timeout_falls_back_the_same_way(monkeypatch):
 
     results = run(_drain_all(2003))
 
-    assert results[0]["ok"] is True
+    assert results[0]["ok"] is False
     assert results[0]["source"] == "fallback"
     assert results[0]["source_session_id"] == 7
 
 
-def test_primary_schema_invalid_response_falls_back_the_same_way(monkeypatch):
+def test_primary_schema_invalid_response_produces_a_tagged_fallback_failure_the_same_way(monkeypatch):
     """Acceptance criterion: "A parser-session turn that returns a response
-    failing schema validation also falls back, the same way." """
+    failing schema validation" is tagged the same way as any other primary
+    failure -- `ok: False`, `"source": "fallback"`."""
     invalid_payload = {"header": "", "questions": []}  # missing required "footer"
     backend = FakeStreamJsonBackend([_extraction_result_line("session-abc", invalid_payload)], eof_after=False)
     factory, _calls = _sequenced_process_factory([backend])
@@ -1319,68 +1415,9 @@ def test_primary_schema_invalid_response_falls_back_the_same_way(monkeypatch):
 
     results = run(_drain_all(2004))
 
-    assert results[0]["ok"] is True
-    assert results[0]["source"] == "fallback"
-    assert results[0]["source_session_id"] == 8
-    assert results[0]["questions"][0]["options"] == ["Python", "Node"]
-
-
-def test_fallback_uses_ollama_rescue_when_regex_alone_finds_nothing(monkeypatch):
-    """Mirrors `session_runner.py`'s own grilling-turn extraction order:
-    text that LOOKS like it was trying to contain a question (the "question "
-    trigger substring) but that the regex parser can't cleanly match falls
-    through to Ollama rescue as a second attempt."""
-    malformed_text = 'Question 1: "Should this be Python or Node (missing the closing quote)\n'
-    rescued_payload = {
-        "header": "",
-        "footer": "",
-        "questions": [
-            {
-                "id": "q1",
-                "text": "Should this be Python or Node?",
-                "kind": "open",
-                "options": None,
-                "recommended": None,
-                "recommended_text": None,
-            }
-        ],
-        "source": "ollama_rescue",
-    }
-
-    def fake_rescue(text, *, http_post=None):
-        assert text == malformed_text
-        return rescued_payload
-
-    monkeypatch.setattr(parser_session, "rescue_grilling_response", fake_rescue)
-    parser_session.enqueue_needs_input_turn(2005, card_id=9, phase="grilling", text=malformed_text)
-
-    results = run(_drain_all(2005))
-
-    assert results[0]["ok"] is True
-    assert results[0]["source"] == "fallback"
-    assert results[0]["source_session_id"] == 9
-    assert results[0]["questions"] == rescued_payload["questions"]
-
-
-def test_fallback_failure_when_neither_regex_nor_rescue_recover_a_question(monkeypatch):
-    """When the fallback ALSO fails to produce a usable question, the
-    result is still tagged (so the frontend can still identify the affected
-    session and raise its failure toast) but `ok` stays False -- there is
-    genuinely nothing to route."""
-
-    def fake_rescue(text, *, http_post=None):
-        return None
-
-    monkeypatch.setattr(parser_session, "rescue_grilling_response", fake_rescue)
-    text = 'Question 1: "unterminated (looks like a question, but nothing rescues it)\n'
-    parser_session.enqueue_needs_input_turn(2006, card_id=10, phase="grilling", text=text)
-
-    results = run(_drain_all(2006))
-
-    assert len(results) == 1
     assert results[0]["ok"] is False
     assert results[0]["source"] == "fallback"
-    assert results[0]["source_session_id"] == 10
+    assert results[0]["source_session_id"] == 8
     assert "error" in results[0]
 
 
@@ -1467,9 +1504,453 @@ def test_repeated_failures_never_accumulate_into_a_permanent_downgrade(monkeypat
 
     assert len(results) == 3
     assert all(r["source"] == "fallback" for r in results)
-    assert all(r["ok"] is True for r in results)  # the free regex parser recovers the question every time
+    assert all(r["ok"] is False for r in results)  # no fallback recovers any of them (issue #230)
     assert [r["source_session_id"] for r in results] == [14, 15, 16]
     # Exactly one subprocess spawn throughout, and one turn written per
     # queued item -- no extra "downgrade" bookkeeping turns snuck in.
     assert len(calls) == 1
     assert len(_written_prompts(backend)) == 3
+
+
+# ---------------------------------------------------------------------------
+# Post-extraction validation + single corrective retry (issue #229, `gh
+# issue view 229` for full context; parent PRD #227). After a schema-valid
+# primary extraction, `_detect_extraction_mismatches` compares it against
+# the turn's raw text (Recommended:/Recommended text: line counts, nearby
+# bulleted-option lines vs. the returned `options` array) and, on a
+# mismatch, `_process_one_queued_item` sends exactly one corrective retry
+# to the same parser session before returning. Driven the same way as the
+# #192/#194 tests above (a fake `process_factory`, no real subprocess).
+# ---------------------------------------------------------------------------
+
+_CLEAN_SINGLE_QUESTION_TEXT = (
+    "❓ **Q1** - **Language**: Which language should we use?\n"
+    "- Python\n"
+    "- Node\n"
+    "Recommended: Python\n"
+)
+
+_CLEAN_SINGLE_QUESTION_PAYLOAD = {
+    "header": "",
+    "footer": "",
+    "questions": [
+        {
+            "id": "q1",
+            "text": "Which language should we use?",
+            "kind": "single",
+            "options": ["Python", "Node"],
+            "recommended": [1],
+            "recommended_text": None,
+        }
+    ],
+}
+
+
+def test_clean_first_response_never_triggers_a_retry(monkeypatch):
+    """Acceptance criterion: "A first-response success ... must never
+    trigger a retry at all." The raw text's single `Recommended:` line
+    matches the one question that ended up with a populated `recommended`
+    field, and its two bulleted option lines match a two-entry `options`
+    array -- nothing here should look mismatched, so exactly one write
+    (the primary extraction turn) must reach the subprocess."""
+    backend = FakeStreamJsonBackend(
+        [_extraction_result_line("session-abc", _CLEAN_SINGLE_QUESTION_PAYLOAD)], eof_after=False
+    )
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(3001, cwd="/repo"))
+    parser_session.enqueue_needs_input_turn(3001, card_id=20, phase="grilling", text=_CLEAN_SINGLE_QUESTION_TEXT)
+
+    results = run(_drain_all(3001))
+
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+    assert results[0]["source"] == "parser_session"
+    assert "extraction_incomplete" not in results[0]["questions"][0]
+    # Exactly one write reached the subprocess -- no retry turn at all.
+    assert len(_written_prompts(backend)) == 1
+
+
+_MISMATCH_SINGLE_QUESTION_TEXT = (
+    "We've settled the schema already.\n\n"
+    "❓ **Q1** - **Language**: Which language should we use?\n"
+    "- Python\n"
+    "- Node\n"
+    "Recommended: Python\n"
+)
+
+# First attempt silently drops both the options and the recommendation --
+# exactly the PRD #227 bug scenario (a `kind: "open"` question with nothing
+# populated, despite the raw text clearly carrying both signals).
+_MISMATCHED_FIRST_PAYLOAD = {
+    "header": "We've settled the schema already.",
+    "footer": "",
+    "questions": [
+        {
+            "id": "q1",
+            "text": "Which language should we use?",
+            "kind": "open",
+            "options": None,
+            "recommended": None,
+            "recommended_text": None,
+        }
+    ],
+}
+
+_CORRECTED_SECOND_PAYLOAD = {
+    "header": "We've settled the schema already.",
+    "footer": "",
+    "questions": [
+        {
+            "id": "q1",
+            "text": "Which language should we use?",
+            "kind": "single",
+            "options": ["Python", "Node"],
+            "recommended": [1],
+            "recommended_text": None,
+        }
+    ],
+}
+
+
+def test_mismatched_first_response_retries_once_and_succeeds(monkeypatch):
+    """Acceptance criterion: on a detected mismatch, exactly one retry is
+    sent naming the specific mismatch, and a corrected second response
+    leaves the final result with no `extraction_incomplete` anywhere."""
+    backend = FakeStreamJsonBackend(
+        [
+            _extraction_result_line("session-abc", _MISMATCHED_FIRST_PAYLOAD),
+            _extraction_result_line("session-abc", _CORRECTED_SECOND_PAYLOAD),
+        ],
+        eof_after=False,
+    )
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(3002, cwd="/repo"))
+    parser_session.enqueue_needs_input_turn(3002, card_id=21, phase="grilling", text=_MISMATCH_SINGLE_QUESTION_TEXT)
+
+    results = run(_drain_all(3002))
+
+    written = _written_prompts(backend)
+    assert len(written) == 2  # exactly one retry, not zero and not more
+    retry_prompt = written[1]
+    # The retry names the specific mismatch: which question, and what was
+    # found wrong with it.
+    assert "question index 0" in retry_prompt
+    assert "q1" in retry_prompt
+    assert "recommended" in retry_prompt.lower()
+    assert "/rhubarb:parse-interview" in retry_prompt
+
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+    question = results[0]["questions"][0]
+    assert question["kind"] == "single"
+    assert question["options"] == ["Python", "Node"]
+    assert question["recommended"] == [1]
+    assert "extraction_incomplete" not in question  # retry succeeded -- no flag needed
+
+
+_TWO_QUESTION_TEXT = (
+    "❓ **Q1** - **Language**: Which language should we use?\n"
+    "- Python\n"
+    "- Node\n"
+    "Recommended: Python\n\n"
+    "❓ **Q2** - **Deploy target**: Where should this run?\n"
+    "Recommended: On the existing droplet.\n"
+)
+
+# Q1 drops its options/recommendation (the mismatch); Q2 is extracted
+# correctly from the very first attempt.
+_TWO_QUESTION_FIRST_PAYLOAD = {
+    "header": "",
+    "footer": "",
+    "questions": [
+        {
+            "id": "q1",
+            "text": "Which language should we use?",
+            "kind": "open",
+            "options": None,
+            "recommended": None,
+            "recommended_text": None,
+        },
+        {
+            "id": "q2",
+            "text": "Where should this run?",
+            "kind": "open",
+            "options": None,
+            "recommended": None,
+            "recommended_text": "On the existing droplet.",
+        },
+    ],
+}
+
+# The retry recovers Q1's options but STILL drops the recommendation itself
+# (still fails the same check) -- Q2 comes back with a slightly different
+# (but still populated) recommended_text, to prove the final result is
+# "whatever the last attempt produced," not a merge with the first.
+_TWO_QUESTION_RETRY_PAYLOAD = {
+    "header": "",
+    "footer": "",
+    "questions": [
+        {
+            "id": "q1",
+            "text": "Which language should we use?",
+            "kind": "single",
+            "options": ["Python", "Node"],
+            "recommended": None,
+            "recommended_text": None,
+        },
+        {
+            "id": "q2",
+            "text": "Where should this run?",
+            "kind": "open",
+            "options": None,
+            "recommended": None,
+            "recommended_text": "On the existing droplet, near the API.",
+        },
+    ],
+}
+
+
+def test_still_mismatched_retry_tags_only_the_affected_question_and_does_not_retry_again(monkeypatch):
+    """Acceptance criteria: "If the retry still fails the same check, tag
+    the specific affected question(s) ... never retry again" and "all other
+    questions ... in the same turn unaffected." Only Q1 is broken in both
+    attempts; Q2 is fine throughout and must never be tagged."""
+    backend = FakeStreamJsonBackend(
+        [
+            _extraction_result_line("session-abc", _TWO_QUESTION_FIRST_PAYLOAD),
+            _extraction_result_line("session-abc", _TWO_QUESTION_RETRY_PAYLOAD),
+        ],
+        eof_after=False,
+    )
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(3003, cwd="/repo"))
+    parser_session.enqueue_needs_input_turn(3003, card_id=22, phase="grilling", text=_TWO_QUESTION_TEXT)
+
+    results = run(_drain_all(3003))
+
+    # Exactly one retry -- not a second one even though it's still broken.
+    assert len(_written_prompts(backend)) == 2
+
+    assert len(results) == 1
+    questions = results[0]["questions"]
+    assert len(questions) == 2
+
+    q1, q2 = questions
+    assert q1["id"] == "q1"
+    assert q1["extraction_incomplete"] is True
+    # Q1's other fields are preserved from the retry (the last attempt),
+    # not the first attempt or some merge of the two.
+    assert q1["kind"] == "single"
+    assert q1["options"] == ["Python", "Node"]
+    assert q1["recommended"] is None
+    assert q1["recommended_text"] is None
+
+    assert q2["id"] == "q2"
+    assert "extraction_incomplete" not in q2  # completely unaffected
+    assert q2["recommended_text"] == "On the existing droplet, near the API."
+
+
+def test_retry_turn_failure_falls_back_to_the_first_attempt_tagged_incomplete(monkeypatch):
+    """The retry itself is never guaranteed to succeed -- if the retry turn
+    produces no usable JSON at all, the function must still return
+    something usable (issue #229: "never raise/error ... always return
+    something usable"), built from the FIRST attempt's own data, tagged."""
+    backend = FakeStreamJsonBackend(
+        [
+            _extraction_result_line("session-abc", _MISMATCHED_FIRST_PAYLOAD),
+            _result_line_with_usage("session-abc", text="Sorry, I can't produce that JSON."),
+        ],
+        eof_after=False,
+    )
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(3004, cwd="/repo"))
+    parser_session.enqueue_needs_input_turn(3004, card_id=23, phase="grilling", text=_MISMATCH_SINGLE_QUESTION_TEXT)
+
+    results = run(_drain_all(3004))
+
+    assert len(_written_prompts(backend)) == 2  # still exactly one retry attempt, no more
+    assert len(results) == 1
+    assert results[0]["ok"] is True
+    question = results[0]["questions"][0]
+    assert question["extraction_incomplete"] is True
+    # Falls back to the first attempt's own (still-broken) fields -- there
+    # was nothing better to prefer.
+    assert question["kind"] == "open"
+    assert question["options"] is None
+    assert question["recommended_text"] is None
+
+
+def test_detect_extraction_mismatches_flags_missing_recommendation():
+    mismatches = parser_session._detect_extraction_mismatches(
+        _MISMATCH_SINGLE_QUESTION_TEXT, _MISMATCHED_FIRST_PAYLOAD
+    )
+    assert len(mismatches) == 1
+    assert mismatches[0]["index"] == 0
+    assert mismatches[0]["id"] == "q1"
+
+
+def test_detect_extraction_mismatches_returns_empty_for_a_clean_payload():
+    mismatches = parser_session._detect_extraction_mismatches(
+        _CLEAN_SINGLE_QUESTION_TEXT, _CLEAN_SINGLE_QUESTION_PAYLOAD
+    )
+    assert mismatches == []
+
+
+def test_tag_extraction_incomplete_only_touches_named_indices():
+    data = {
+        "header": "",
+        "footer": "",
+        "questions": [{"id": "q1", "text": "a"}, {"id": "q2", "text": "b"}],
+    }
+
+    tagged = parser_session._tag_extraction_incomplete(data, [{"index": 1, "id": "q2", "reasons": ["x"]}])
+
+    assert "extraction_incomplete" not in tagged["questions"][0]
+    assert tagged["questions"][1]["extraction_incomplete"] is True
+    # Original data is untouched (no in-place mutation).
+    assert "extraction_incomplete" not in data["questions"][1]
+
+
+def test_tag_extraction_incomplete_with_no_mismatches_returns_data_unchanged():
+    data = {"header": "", "footer": "", "questions": [{"id": "q1", "text": "a"}]}
+
+    assert parser_session._tag_extraction_incomplete(data, []) is data
+
+
+# ---------------------------------------------------------------------------
+# `extract_with_validation` (PRD #227 follow-up, gap 1, `gh issue view 227`):
+# the one shared implementation of "call the skill, validate, retry once on
+# mismatch, tag extraction_incomplete" that both `_process_one_queued_item`
+# above (already exercised by every test above this point) and
+# `session_runner._extract_questions_via_parser_session` (the live-turn path
+# -- see `tests/test_sessions.py` for its own end-to-end coverage) now call.
+# These tests exercise the function directly, at the module level, the same
+# fake-`process_factory` way the rest of this file already does.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_with_validation_clean_response_returns_data_with_no_retry(monkeypatch):
+    backend = FakeStreamJsonBackend(
+        [_extraction_result_line("session-abc", _CLEAN_SINGLE_QUESTION_PAYLOAD)], eof_after=False
+    )
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(3010, cwd="/repo"))
+
+    result = run(
+        parser_session.extract_with_validation(3010, _CLEAN_SINGLE_QUESTION_TEXT, phase="grilling")
+    )
+
+    assert len(_written_prompts(backend)) == 1  # no retry -- nothing looked mismatched
+    assert result["source"] == "parser_session"
+    assert result["questions"][0]["options"] == ["Python", "Node"]
+    assert "extraction_incomplete" not in result["questions"][0]
+
+
+def test_extract_with_validation_retries_once_on_mismatch_and_returns_corrected_data(monkeypatch):
+    backend = FakeStreamJsonBackend(
+        [
+            _extraction_result_line("session-abc", _MISMATCHED_FIRST_PAYLOAD),
+            _extraction_result_line("session-abc", _CORRECTED_SECOND_PAYLOAD),
+        ],
+        eof_after=False,
+    )
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(3011, cwd="/repo"))
+
+    result = run(
+        parser_session.extract_with_validation(3011, _MISMATCH_SINGLE_QUESTION_TEXT, phase="implementing")
+    )
+
+    written = _written_prompts(backend)
+    assert len(written) == 2  # exactly one corrective retry
+    assert "/rhubarb:parse-interview" in written[1]
+    assert "phase: implementing" in written[0]  # phase passed straight through, no branching in this module
+
+    question = result["questions"][0]
+    assert question["options"] == ["Python", "Node"]
+    assert question["recommended"] == [1]
+    assert "extraction_incomplete" not in question  # the retry recovered everything
+
+
+def test_extract_with_validation_still_mismatched_after_retry_tags_extraction_incomplete(monkeypatch):
+    backend = FakeStreamJsonBackend(
+        [
+            _extraction_result_line("session-abc", _MISMATCHED_FIRST_PAYLOAD),
+            _result_line_with_usage("session-abc", text="Sorry, I can't produce that JSON."),
+        ],
+        eof_after=False,
+    )
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(3012, cwd="/repo"))
+
+    result = run(
+        parser_session.extract_with_validation(3012, _MISMATCH_SINGLE_QUESTION_TEXT, phase="grilling")
+    )
+
+    assert len(_written_prompts(backend)) == 2
+    assert result["questions"][0]["extraction_incomplete"] is True
+
+
+def test_extract_with_validation_with_detect_mismatches_false_skips_the_retry_safety_net(monkeypatch):
+    """Gap 2 of PRD #227's follow-up: the nested QA-grilling shape opts out
+    of issue #229's mismatch-detection/retry entirely (`detect_mismatches=
+    False`), a deliberate narrower-scope judgment call rather than
+    generalizing `_detect_extraction_mismatches` to the nested `issues[].
+    questions` structure. Scripted here with a QA-shaped response that,
+    if it went through the flat-shape mismatch check at all, would look
+    identical to `_MISMATCHED_FIRST_PAYLOAD` in spirit (a `Recommended
+    text:` line present in the raw text with nothing populated in the
+    JSON) -- proving no retry is attempted and the response is returned
+    exactly as received, once `detect_mismatches=False` is passed."""
+    from rhubarb.ollama_rescue import _is_valid_qa_shape
+
+    qa_payload = {
+        "prd": None,
+        "issues": [
+            {
+                "number": 1,
+                "title": "Some issue",
+                "questions": [{"id": "issue1-q1", "text": "Does it work?", "recommended_text": None}],
+            }
+        ],
+    }
+    raw_text = 'Issue 1: "Some issue"\nQuestion 1: "Does it work?"\nRecommended text: "Yes."\n'
+    backend = FakeStreamJsonBackend([_extraction_result_line("session-abc", qa_payload)], eof_after=False)
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(3013, cwd="/repo"))
+
+    result = run(
+        parser_session.extract_with_validation(
+            3013, raw_text, phase="qa_grilling_issues", validator=_is_valid_qa_shape, detect_mismatches=False
+        )
+    )
+
+    assert len(_written_prompts(backend)) == 1  # no retry attempted at all
+    assert result == {**qa_payload, "source": "parser_session"}
+
+
+def test_extract_with_validation_returns_none_on_schema_invalid_response(monkeypatch):
+    backend = FakeStreamJsonBackend(
+        [_result_line_with_usage("session-abc", text=json.dumps({"not": "the right shape"}))], eof_after=False
+    )
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(3014, cwd="/repo"))
+
+    result = run(parser_session.extract_with_validation(3014, "some text", phase="grilling"))
+
+    assert result is None
+
+
+def test_extract_with_validation_returns_none_when_no_live_session():
+    result = run(parser_session.extract_with_validation(999999, "some text", phase="grilling"))
+
+    assert result is None

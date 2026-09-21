@@ -1,14 +1,13 @@
 import asyncio
 import json
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from rhubarb import db, error_log, live_stream, parser_session, pty_engine, session_runner, stream_json_engine
+from rhubarb import db, error_log, live_stream, parser_session, session_runner, stream_json_engine
 from rhubarb.cli_client import ClaudeCLIError
-from rhubarb.pty_engine import PtyEngineUnrecoverableError
-from rhubarb.qa_parser import parse_grilling_response
 from rhubarb.stream_json_engine import StreamJsonEngineUnrecoverableError
 from rhubarb.web import app as app_module
 
@@ -113,54 +112,42 @@ async def _run_and_drain(coro):
 
 
 def _make_fake_engine_class(handler, *, fresh_ids=None, reply_handler=None):
-    """Build a fake stand-in for the `PtyEngine` class, for monkeypatching
-    `session_runner.PtyEngine` in these tests -- see `tests/test_pty_engine.py`
-    for the equivalent fake-backend style one level down (the real PTY
-    backend, rather than the engine built on top of it).
+    """Build a fake stand-in for `session_runner.StreamJsonEngine` -- the
+    sole engine transport since issue #225 removed `PtyEngine` (every phase
+    dispatches to it now, not just grilling since issue #184). Public shape
+    (`__init__` kwargs, `start`/`close`/`isalive`/`stream_turn`) matches the
+    real class. `session_id` is exposed as an alias for `claude_session_id`
+    (kept as this class's own internal attribute name for minimal diff
+    against this file's long history) so a test exercising the standby-claim
+    path (`register_stream_json_engine`, which reads `.session_id`) works
+    against this same fake.
 
-    Issue #184: this same fake class is ALSO used (via `_mock_engine`, see
-    below) as the stand-in for `session_runner.StreamJsonEngine` -- a
-    grilling card's turns now dispatch to that engine instead, and its
-    public shape (`__init__` kwargs, `start`/`close`/`isalive`/`stream_turn`)
-    is identical for the purposes every existing test here already cares
-    about. `session_id` is exposed as an alias for `claude_session_id` (the
-    real `StreamJsonEngine`'s own attribute name) so a test exercising the
-    stream-json standby-claim path (`register_stream_json_engine`, which
-    reads `.session_id`) works against this same fake without needing a
-    second, parallel fake class.
-
-    `reply_handler()` (issue #177), if given, stands in for
-    `PtyEngine.stream_reply` -- returns an iterable of raw event dicts (same
-    shape `handler` returns), simulating the live process's response to a
-    reply already written directly into its stdin out of band (e.g. via the
-    `/stall-reply` endpoint) rather than a prompt this engine wrote itself.
-    A test that never expects `stream_reply` to be called at all (i.e.
-    never drives a `classify_needs_input` positive result into
-    `_await_stalled_reply`) can omit it -- the fake then raises
-    `AssertionError` if it's ever actually called, the same "fail loudly on
-    an unexpected call" shape `handler`'s own `raise AssertionError` fallback
-    branches already use throughout this file.
+    `reply_handler()`, if given, stands in for a resumed-turn call driven
+    directly against `_run_stream_json_turn` in tests that bypass the
+    higher-level job functions -- returns an iterable of raw event dicts
+    (same shape `handler` returns). A test that never expects it to be
+    called at all can omit it -- the fake then raises `AssertionError` if
+    it's ever actually called, the same "fail loudly on an unexpected call"
+    shape `handler`'s own `raise AssertionError` fallback branches already
+    use throughout this file.
 
     `handler(prompt, *, session_id, cwd, model, effort)` returns an iterable
     of raw event dicts -- the same shape the old `stream_prompt` fakes
     already produced, minus `card_id` (that concept is gone: every phase
-    now drives its turns through the same one-resident-tab-per-card_id
-    mechanism, not just the /do chain).
+    drives its turns through the same one-resident-tab-per-card_id
+    mechanism).
 
-    Since `session_runner` now keeps ONE engine alive across every turn for
-    a card (see `session_runner._get_or_create_engine`), a fake engine
-    forwards every turn over its own lifetime to this SAME `handler` --
-    tests that used to swap `stream_prompt` mid-test to change behavior
-    between calls instead give `handler` one prompt-keyed dispatcher
-    covering the whole scenario (a resident engine wouldn't see a mock
-    swapped out from under it either).
+    Since `session_runner` keeps ONE engine alive across every turn for a
+    card (see `session_runner._get_or_create_stream_json_engine`), a fake
+    engine forwards every turn over its own lifetime to this SAME `handler`
+    -- a test needing different behavior across turns gives `handler` one
+    prompt-keyed dispatcher covering the whole scenario (a resident engine
+    wouldn't see a mock swapped out from under it either).
 
     `fresh_ids`, if given, is a queue of ids handed out (in order) to
-    successive *fresh* (no `resume_session_id`) constructions -- standing
-    in for what a genuinely fresh `PtyEngine`'s own generated uuid would be,
-    so a test can pin down the exact id a "clear"/"pool" produces, the way
-    tests used to control `cli_client.clear_session`'s return value
-    directly.
+    successive *fresh* (no `resume_session_id`) constructions -- standing in
+    for what a genuinely fresh engine's own generated uuid would be, so a
+    test can pin down the exact id a "clear"/"pool" produces.
     """
     fresh_queue = list(fresh_ids or [])
 
@@ -223,39 +210,31 @@ def _make_fake_engine_class(handler, *, fresh_ids=None, reply_handler=None):
 
 
 def _mock_engine(monkeypatch, handler, *, fresh_ids=None, reply_handler=None):
-    """Monkeypatch BOTH `session_runner.PtyEngine` and
-    `session_runner.StreamJsonEngine` with the SAME fake class driven by
-    `handler` -- see `_make_fake_engine_class`. Returns the fake class so a
-    test can inspect `.instances` (e.g. to assert an engine was/wasn't
-    reconstructed, or to check constructor args).
-
-    Issue #184: a grilling card's turns now dispatch to `StreamJsonEngine`
-    instead of `PtyEngine`, while every later phase (creating_prd,
-    creating_issues, implementing, qa, ...) still dispatches to `PtyEngine`
-    exactly as before -- patching both class names in `session_runner`'s own
-    namespace with the same fake means `handler` (and every existing test
-    written against it) doesn't need to know or care which phase's turn
-    it's actually being called for; the fake responds identically either
-    way, exactly like `translate_event()` doesn't care which engine
-    produced a given raw event shape (see `stream_json_engine.py`'s own
-    `test_stream_turn_events_are_compatible_with_translate_event`)."""
+    """Monkeypatch `session_runner.StreamJsonEngine` -- the sole engine
+    transport since issue #225 removed `PtyEngine` -- with a fake class
+    driven by `handler` (see `_make_fake_engine_class`). Returns the fake
+    class so a test can inspect `.instances` (e.g. to assert an engine
+    was/wasn't reconstructed, or to check constructor args). `handler`
+    doesn't need to know or care which phase's turn it's actually being
+    called for; the fake responds identically regardless of phase."""
     fake_class = _make_fake_engine_class(handler, fresh_ids=fresh_ids, reply_handler=reply_handler)
-    monkeypatch.setattr(session_runner, "PtyEngine", fake_class)
     monkeypatch.setattr(session_runner, "StreamJsonEngine", fake_class)
     return fake_class
 
 
 def _mock_parser_session_extraction(monkeypatch, project_id, cwd, *, header="", questions=None, footer=""):
-    """Issue #221: register a live, fake parser session for `project_id`
-    whose every turn replies with the given `{header, questions, footer}`
-    payload as JSON -- for tests exercising `_run_grilling_turn_stream_json`'s
-    synchronous parser-session dispatch (the `not parsed["questions"]`
-    branch) without spawning a real subprocess. Mirrors
-    `tests/test_parser_session.py`'s own `_mock_parser_engine` fake-class
-    shape, plus an explicit `ensure_parser_session` call so the session is
-    registered and ready *before* the test drives any grilling turn --
-    `open_project`'s own pre-warm of this is fire-and-forget and racy, so
-    tests that need this path deterministic can't rely on it."""
+    """Issue #221, simplified by issue #230: register a live, fake parser
+    session for `project_id` whose every turn replies with the given
+    `{header, questions, footer}` payload as JSON -- for tests exercising
+    `_run_grilling_turn_stream_json`'s synchronous parser-session dispatch
+    (now the ONLY extraction path -- issue #230 removed the regex-first
+    attempt this used to be a fallback for) without spawning a real
+    subprocess. Mirrors `tests/test_parser_session.py`'s own
+    `_mock_parser_engine` fake-class shape, plus an explicit
+    `ensure_parser_session` call so the session is registered and ready
+    *before* the test drives any grilling turn -- `open_project`'s own
+    pre-warm of this is fire-and-forget and racy, so tests that need this
+    path deterministic can't rely on it."""
     payload = json.dumps({"header": header, "questions": questions or [], "footer": footer})
 
     class FakeParserEngine:
@@ -296,18 +275,149 @@ def _mock_parser_session_extraction(monkeypatch, project_id, cwd, *, header="", 
     asyncio.run(parser_session.ensure_parser_session(project_id, cwd=cwd))
 
 
-def _mock_stream_json_engine(monkeypatch, handler, *, fresh_ids=None, reply_handler=None):
-    """Monkeypatch ONLY `session_runner.StreamJsonEngine` with the fake class
-    driven by `handler` -- for tests that exercise code paths that exclusively
-    use `StreamJsonEngine` (e.g. `start_do_continue_job`), where patching
-    `PtyEngine` too would be misleading."""
-    fake_class = _make_fake_engine_class(handler, fresh_ids=fresh_ids, reply_handler=reply_handler)
-    monkeypatch.setattr(session_runner, "StreamJsonEngine", fake_class)
-    return fake_class
+_QUESTION_QUOTE_RE = re.compile(r'Question\s+\d+[^\n:]*:\s*"([^"]*)"', re.IGNORECASE)
+_OPTION_QUOTE_RE = re.compile(r'Option\s+\d+\s*:\s*"([^"]*)"', re.IGNORECASE)
+_RECOMMENDED_IDX_RE = re.compile(r"Recommended:\s*\[\s*([\d,\s]+)\]", re.IGNORECASE)
+
+# PRD #227 gap 2: `_extract_qa_issues_via_skill` now goes through the same
+# `/rhubarb:parse-interview` skill invocation (`_build_extraction_prompt`)
+# grilling/implement use, just with `phase: qa_grilling_issues`, asking for
+# the nested `{prd, issues: [{number, title, questions}]}` shape -- these
+# mirror the qa-grilling skill's own `QA session for PRD N: "..."` /
+# `Issue N: "..."` / `Question N: "..."` / `Recommended text: "..."` format
+# closely enough to fake that extraction from these tests' own fixtures.
+_QA_PRD_HEADER_RE = re.compile(r'QA session for PRD\s+(\d+)\s*:\s*"([^"]*)"', re.IGNORECASE)
+_QA_ISSUE_HEADER_RE = re.compile(r'Issue\s+(\d+)\s*:\s*"([^"]*)"', re.IGNORECASE)
+_QA_QUESTION_RE = re.compile(r'Question\s+(\d+)\s*:\s*"([^"]*)"', re.IGNORECASE)
+_QA_RECOMMENDED_TEXT_RE = re.compile(r'Recommended text:\s*"([^"]*)"', re.IGNORECASE)
+
+
+def _fake_autoextract_grilling_shape(prompt: str) -> dict:
+    """Pulls every `Question N: "..."` text appearing in a turn's own prompt
+    (the raw reply `_extract_questions_via_parser_session` embeds via
+    `parser_session._build_extraction_prompt`) back out as one question
+    apiece, in order -- a minimal stand-in for what a real LLM extraction
+    pass would produce from these simple fixtures. A question's own trailing
+    `Option N: "..."` lines and `Recommended: [...]` line (up to the next
+    `Question N:` header, or end of prompt) are folded in too, so tests that
+    check the extracted `options`/`recommended` survive the round trip. A
+    prompt with no quoted `Question N:` text (a genuine wrap-up turn) yields
+    zero questions, exactly like a real extraction of prose with nothing
+    left to ask would."""
+    matches = list(_QUESTION_QUOTE_RE.finditer(prompt))
+    questions = []
+    for i, match in enumerate(matches):
+        block_end = matches[i + 1].start() if i + 1 < len(matches) else len(prompt)
+        block = prompt[match.end() : block_end]
+        options = _OPTION_QUOTE_RE.findall(block)
+        rec_match = _RECOMMENDED_IDX_RE.search(block)
+        recommended = [int(n) for n in rec_match.group(1).split(",") if n.strip()] if rec_match else None
+        questions.append(
+            {
+                "id": f"q{i + 1}",
+                "text": match.group(1),
+                "kind": "single" if options else "open",
+                "options": options or None,
+                "recommended": recommended if options else None,
+                "recommended_text": None,
+            }
+        )
+    return {"header": "", "questions": questions, "footer": ""}
+
+
+def _fake_autoextract_qa_shape(prompt: str) -> dict:
+    """The QA-grilling analogue of `_fake_autoextract_grilling_shape` --
+    pulls a `QA session for PRD N: "..."` header and its `Issue N: "..."` /
+    `Question N: "..."` / `Recommended text: "..."` groups back out of the
+    prompt's own embedded raw text into the nested `{prd, issues}` shape
+    `_extract_qa_issues_via_skill` expects."""
+    prd_match = _QA_PRD_HEADER_RE.search(prompt)
+    prd = {"number": int(prd_match.group(1)), "title": prd_match.group(2)} if prd_match else None
+
+    issue_matches = list(_QA_ISSUE_HEADER_RE.finditer(prompt))
+    issues = []
+    for i, issue_match in enumerate(issue_matches):
+        issue_end = issue_matches[i + 1].start() if i + 1 < len(issue_matches) else len(prompt)
+        issue_block = prompt[issue_match.end() : issue_end]
+        issue_number = int(issue_match.group(1))
+
+        question_matches = list(_QA_QUESTION_RE.finditer(issue_block))
+        questions = []
+        for qi, q_match in enumerate(question_matches):
+            q_end = question_matches[qi + 1].start() if qi + 1 < len(question_matches) else len(issue_block)
+            q_block = issue_block[q_match.end() : q_end]
+            rec_match = _QA_RECOMMENDED_TEXT_RE.search(q_block)
+            questions.append(
+                {
+                    "id": f"issue{issue_number}-q{q_match.group(1)}",
+                    "text": q_match.group(2),
+                    "recommended_text": rec_match.group(1) if rec_match else None,
+                }
+            )
+
+        issues.append({"number": issue_number, "title": issue_match.group(2), "questions": questions})
+
+    return {"prd": prd, "issues": issues}
+
+
+def _mock_parser_session_autoextract(monkeypatch, project_id, cwd):
+    """Issue #230: register a live, fake parser session for `project_id`
+    that fakes a real LLM extraction pass from whatever raw text a turn's
+    own prompt embeds -- for tests whose real subject is unrelated to
+    extraction accuracy (session pooling/reuse, engine lifecycle,
+    concurrency, the QA-grilling corrective-retry/needs-input chain's own
+    control flow) but that still need a real, distinguishable question (or
+    QA issue) to come back, now that a real parser-session round trip
+    (mocked or not) is the only way one survives, per issue #230's removal
+    of the regex-first fast paths these tests used to rely on instead.
+
+    Dispatches on the prompt's own `phase:` line -- every extraction call
+    now goes through the same `/rhubarb:parse-interview` skill invocation
+    (`_build_extraction_prompt`, PRD #227 gap 2's unification of the
+    QA-grilling extraction call `_extract_qa_issues_via_skill` onto the
+    skill too), so this fakes the skill's OWN phase-based branching instead
+    of the prompt's outer shape: `phase: qa_grilling_issues` (the nested-
+    shape phase `_extract_qa_issues_via_skill` sends) gets the nested
+    `{prd, issues}` shape (`_fake_autoextract_qa_shape`); every other phase
+    (grilling/implementing's flat `{header, questions, footer}` shape) gets
+    `_fake_autoextract_grilling_shape`."""
+
+    class FakeParserEngine:
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+            self.session_id = resume_session_id or "parser-session-fake"
+            self._alive = False
+
+        def start(self):
+            self._alive = True
+            return self
+
+        def close(self):
+            self._alive = False
+
+        def isalive(self):
+            return self._alive
+
+        async def stream_turn(self, prompt):
+            if "phase: qa_grilling_issues" in prompt:
+                data = _fake_autoextract_qa_shape(prompt)
+            else:
+                data = _fake_autoextract_grilling_shape(prompt)
+            payload = json.dumps(data)
+            yield {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": payload,
+                "session_id": self.session_id,
+            }
+
+    monkeypatch.setattr(parser_session, "StreamJsonEngine", FakeParserEngine)
+    parser_session._parser_sessions.pop(project_id, None)
+    asyncio.run(parser_session.ensure_parser_session(project_id, cwd=cwd))
 
 
 def _make_blocking_fake_engine_class(entered, release, enter_count, *, result_text, session_id=None):
-    """Build a fake stand-in for `PtyEngine` whose `stream_turn` genuinely
+    """Build a fake stand-in for `StreamJsonEngine` whose `stream_turn` genuinely
     suspends mid-turn -- used by the issue #144 lock tests to put a turn
     "in flight" on purpose and hold it there, so a second, overlapping call
     for the same card_id can be made while the first has not yet finished.
@@ -346,6 +456,12 @@ def _make_blocking_fake_engine_class(entered, release, enter_count, *, result_te
         def isalive(self):
             return self.started and not self.closed
 
+        @property
+        def session_id(self):
+            # `StreamJsonEngine`'s own attribute name for the same concept
+            # `claude_session_id` already tracks here.
+            return self.claude_session_id
+
         async def stream_turn(self, prompt):
             enter_count["n"] += 1
             entered.set()
@@ -383,48 +499,15 @@ def test_start_session_job_publishes_usage_from_a_rate_limit_event(client, tmp_p
     assert live_stream.last_usage() == {"type": "usage", "five_hour_pct": 12.5, "seven_day_pct": 3.1}
 
 
-def test_start_session_job_publishes_terminal_output_events_from_the_pty(client, tmp_path, monkeypatch):
-    """Issue #88: a `terminal_output` raw event yielded by (a faked)
-    `PtyEngine.stream_turn` must reach the session's live-stream buffer
-    verbatim -- this is what the SSE endpoint hands the frontend's terminal
-    view."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    raw_chunk = "\x1b[2K\rWorking on it...\r\n"
-    _mock_engine(
-        monkeypatch,
-        lambda prompt, **kw: iter(
-            [
-                {"type": "terminal_output", "data": raw_chunk},
-                _result_event("❓ **Q1** - **Scope**: Only question?"),
-            ]
-        ),
-    )
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    events = live_stream._buffers.get(row_id, [])
-    assert {"type": "terminal_output", "data": raw_chunk} in events
-
-
-def test_open_pty_tab_count_tracks_tabs_as_sessions_open_and_close(client, tmp_path, monkeypatch):
+def test_count_resident_engines_tracks_tabs_as_sessions_open_and_close(client, tmp_path, monkeypatch):
     """Backs the web UI's tab-count indicator (issue #88):
-    `session_runner.open_pty_tab_count()` must accurately reflect how many
-    engine tabs are currently resident as sessions start (opening a tab, one
-    per card_id) and close (dropping it).
-
-    Issue #184: both sessions here are grilling-phase, so their resident
-    tabs are `StreamJsonEngine`s, closed via `_close_stream_json_engine`
-    (not the `PtyEngine`-only `_close_engine`) -- `open_pty_tab_count()`
-    itself counts both registries, so the indicator stays accurate either
-    way."""
+    `session_runner.count_resident_engines()` must accurately reflect how
+    many engine tabs are currently resident as sessions start (opening a
+    tab, one per card_id) and close (dropping it)."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    assert session_runner.open_pty_tab_count() == 0
+    assert session_runner.count_resident_engines() == 0
 
     _mock_engine(
         monkeypatch,
@@ -434,17 +517,17 @@ def test_open_pty_tab_count_tracks_tabs_as_sessions_open_and_close(client, tmp_p
     conn = db.get_connection()
     row_a = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_a, "feature A", cwd=cwd))
-    assert session_runner.open_pty_tab_count() == 1
+    assert session_runner.count_resident_engines() == 1
 
     row_b = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_b, "feature B", cwd=cwd))
-    assert session_runner.open_pty_tab_count() == 2
+    assert session_runner.count_resident_engines() == 2
 
     session_runner._close_stream_json_engine(row_a)
-    assert session_runner.open_pty_tab_count() == 1
+    assert session_runner.count_resident_engines() == 1
 
     session_runner._close_stream_json_engine(row_b)
-    assert session_runner.open_pty_tab_count() == 0
+    assert session_runner.count_resident_engines() == 0
 
 
 def test_close_session_terminates_a_live_resident_engine(client, tmp_path, monkeypatch):
@@ -453,18 +536,18 @@ def test_close_session_terminates_a_live_resident_engine(client, tmp_path, monke
 
     fake_class = _mock_engine(
         monkeypatch,
-        lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")]),
+        lambda prompt, **kw: iter([_result_event('Question 1: "Only question?"')]),
     )
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-    assert session_runner.open_pty_tab_count() == 1
+    assert session_runner.count_resident_engines() == 1
 
     session_runner.close_session(conn, row_id)
 
     assert fake_class.instances[0].closed is True
-    assert session_runner.open_pty_tab_count() == 0
+    assert session_runner.count_resident_engines() == 0
 
 
 def test_close_session_on_a_card_with_no_resident_engine_does_not_raise(client, tmp_path):
@@ -500,13 +583,14 @@ def test_two_sessions_advance_concurrently_without_cross_contamination(client, t
     row_b = db.create_session(conn, project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do feature A":
+        if prompt == "/rhubarb:grilling feature A":
             return iter([_result_event('Question 1: "Question A?"', session_id="sA")])
-        if prompt == "/rhubarb:do feature B":
+        if prompt == "/rhubarb:grilling feature B":
             return iter([_result_event('Question 1: "Question B?"', session_id="sB")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     async def run_both():
         await asyncio.gather(
@@ -546,6 +630,7 @@ def test_no_cap_on_the_number_of_sessions_running_at_once(client, tmp_path, monk
         monkeypatch,
         lambda prompt, **kw: iter([_result_event(f'Question 1: "{prompt}?"', session_id=prompt)]),
     )
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     async def run_all():
         await asyncio.gather(
@@ -556,9 +641,9 @@ def test_no_cap_on_the_number_of_sessions_running_at_once(client, tmp_path, monk
 
     for i, row_id in enumerate(row_ids):
         row = db.get_session(conn, row_id)
-        assert row["claude_session_id"] == f"/rhubarb:do feature {i}"
+        assert row["claude_session_id"] == f"/rhubarb:grilling feature {i}"
         interview = json.loads(row["interview_json"])
-        assert interview["questions"][0]["text"] == f"/rhubarb:do feature {i}?"
+        assert interview["questions"][0]["text"] == f"/rhubarb:grilling feature {i}?"
 
 
 def test_start_session_job_returns_card_with_grilling_questions(client, tmp_path, monkeypatch):
@@ -577,6 +662,7 @@ def test_start_session_job_returns_card_with_grilling_questions(client, tmp_path
             ]
         ),
     )
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -619,16 +705,26 @@ def _write_question_file(cwd, filename, content):
 
 
 def test_start_session_job_publishes_interview_even_with_no_structured_questions(client, tmp_path, monkeypatch):
-    """A real /rhubarb:do turn can reply with plain prose (no bullet/heading
-    questions qa_parser recognizes as structured). The left card must still
-    render that turn -- it must not look like nothing happened."""
+    """A real /rhubarb:grilling turn can reply with plain prose (no
+    bullet/heading questions qa_parser recognizes as structured). The left
+    card must still render that turn -- it must not look like nothing
+    happened -- even though zero questions auto-advances the chain right
+    after (issue #223)."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    _mock_engine(
-        monkeypatch,
-        lambda prompt, **kw: iter([_result_event("Sure, tell me more about what you have in mind.")]),
-    )
+    def handler(prompt, **kw):
+        if prompt == "/rhubarb:grilling a new feature":
+            return iter([_result_event("Sure, tell me more about what you have in mind.")])
+        if prompt == "/rhubarb:to-prd":
+            return iter([_result_event("PRD Draft: My PRD")])
+        if prompt == "/rhubarb:to-issues":
+            return iter([_result_event("Issue Draft S1: Child one")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #5: My PRD\nIssue #6: Child one")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
+
+    _mock_engine(monkeypatch, handler)
     # Issue #221: the regex parser finds no structured questions in this
     # plain-prose reply, so `_run_grilling_turn_stream_json` now falls
     # through to a synchronous parser-session extraction pass -- scripted
@@ -644,26 +740,30 @@ def test_start_session_job_publishes_interview_even_with_no_structured_questions
 
     events = live_stream._buffers.get(row_id, [])
     turn_events = [e for e in events if e["type"] == "turn"]
-    assert len(turn_events) == 1
-    assert turn_events[0]["interview"]["questions"] == []
-    assert turn_events[0]["interview"]["header"]
+    grilling_turns = [e for e in turn_events if e["phase"] == "grilling"]
+    assert len(grilling_turns) == 1
+    assert grilling_turns[0]["interview"]["questions"] == []
+    assert grilling_turns[0]["interview"]["header"]
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "details"
 
 
 def test_continue_session_job_with_remaining_questions_does_not_auto_advance(client, tmp_path, monkeypatch):
     """A reply that still has follow-up questions must never auto-advance --
-    this was already true before #33, but this test locks it in explicitly
-    and confirms it needs no `confirm_advance` flag."""
+    only a genuinely empty frontier triggers the chain (issue #223)."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt in ("/rhubarb:to-prd", "/rhubarb:to-issues"):
-            raise AssertionError(f"chain must not run without confirm_advance, got {prompt!r}")
-        if prompt == "/rhubarb:do a feature":
+        if prompt in ("/rhubarb:to-prd", "/rhubarb:to-issues", "/rhubarb:publish-to-github"):
+            raise AssertionError(f"chain must not run while questions remain, got {prompt!r}")
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event('Question 1: "First question?"')])
         return iter([_result_event('Question 1: "A follow-up question?"')])
 
     _mock_engine(monkeypatch, handler)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -680,19 +780,26 @@ def test_continue_session_job_with_remaining_questions_does_not_auto_advance(cli
     assert turn_events[-1]["interview"]["questions"]
 
 
-def test_continue_session_job_with_no_more_questions_does_not_auto_advance(client, tmp_path, monkeypatch):
-    """Issue #33: a reply that comes back with zero remaining questions must
-    stay in grilling and publish the wrap-up turn -- it must NOT silently
-    fire /rhubarb:to-prd on its own anymore."""
+def test_continue_session_job_with_no_more_questions_auto_advances(client, tmp_path, monkeypatch):
+    """Issue #223 (child of PRD #222): a reply that comes back with zero
+    remaining questions now auto-advances straight into
+    /rhubarb:to-prd -> /rhubarb:to-issues -> /rhubarb:publish-to-github ->
+    details, with no confirmation click required."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt in ("/rhubarb:to-prd", "/rhubarb:to-issues"):
-            raise AssertionError(f"chain must not run without confirm_advance, got {prompt!r}")
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event('Question 1: "First question?"')])
-        return iter([_result_event("Thanks, that's everything I need.")])
+        if prompt == "/rhubarb:to-prd":
+            return iter([_result_event("PRD Draft: My PRD")])
+        if prompt == "/rhubarb:to-issues":
+            return iter([_result_event("Issue Draft S1: Child one")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #5: My PRD\nIssue #6: Child one")])
+        if prompt == "all good":
+            return iter([_result_event("Thanks, that's everything I need.")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
     # Issue #221: the second turn's reply has no regex-recognizable
@@ -707,17 +814,17 @@ def test_continue_session_job_with_no_more_questions_does_not_auto_advance(clien
     asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
 
     row = db.get_session(conn, row_id)
-    assert row["phase"] == "grilling"
+    assert row["phase"] == "details"
     assert row["error_text"] is None
+    details = json.loads(row["details_json"])
+    assert details["prd"] == {"number": 5, "title": "My PRD"}
+    assert details["issues"] == [{"number": 6, "title": "Child one"}]
 
     events = live_stream._buffers.get(row_id, [])
     turn_events = [e for e in events if e["type"] == "turn"]
-    # One turn from start_session_job's first question, one from this reply.
-    assert len(turn_events) == 2
-    assert turn_events[-1]["phase"] == "grilling"
-    assert turn_events[-1]["interview"]["questions"] == []
-    assert turn_events[-1]["interview"]["header"]
-    assert not any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
+    assert any(e["phase"] == "grilling" and e["interview"]["questions"] == [] for e in turn_events)
+    assert any(e["phase"] == "details" for e in turn_events)
+    assert any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
 
 
 def test_stream_json_grilling_turn_uses_parser_session_for_emoji_question_format(client, tmp_path, monkeypatch):
@@ -775,6 +882,147 @@ def test_stream_json_grilling_turn_uses_parser_session_for_emoji_question_format
     assert turn_events[0]["interview"] == interview
 
 
+def _mock_parser_session_sequence(monkeypatch, project_id, cwd, payloads):
+    """Like `_mock_parser_session_extraction`, but hands out a DIFFERENT
+    scripted `{header, questions, footer}` payload per successive turn sent
+    to this project's parser session, instead of one fixed payload for
+    every turn -- for tests that need to script a first (broken) primary
+    response followed by a corrected (or still-broken) retry response
+    (issue #229's mismatch-detection/single-retry path, `gh issue view
+    229`), which `_mock_parser_session_extraction`'s single fixed payload
+    can't represent. The LAST payload in `payloads` is reused for any
+    further turn beyond the scripted ones, mirroring a real parser session
+    that keeps answering rather than raising once the script runs out."""
+    remaining = list(payloads)
+
+    class FakeParserEngine:
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+            self.session_id = resume_session_id or "parser-session-fake"
+            self._alive = False
+
+        def start(self):
+            self._alive = True
+            return self
+
+        def close(self):
+            self._alive = False
+
+        def isalive(self):
+            return self._alive
+
+        async def stream_turn(self, prompt):
+            payload = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+            yield {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": json.dumps(payload),
+                "session_id": self.session_id,
+            }
+
+    monkeypatch.setattr(parser_session, "StreamJsonEngine", FakeParserEngine)
+    parser_session._parser_sessions.pop(project_id, None)
+    asyncio.run(parser_session.ensure_parser_session(project_id, cwd=cwd))
+
+
+def test_stream_json_grilling_turn_retries_mismatched_extraction_and_flags_incomplete(
+    client, tmp_path, monkeypatch
+):
+    """PRD #227 follow-up, gap 1 (`gh issue view 227`, discovered during
+    manual testing/design review after #228/#229/#230 were already closed
+    out in code): before this fix, the LIVE grilling-turn extraction path
+    (`_run_grilling_turn_stream_json` -> `_extract_grilling_questions_via_
+    parser_session` -> `_extract_questions_via_parser_session`) called
+    `parser_session.stream_turn`/`_extract_json_object`/
+    `_is_valid_grilling_shape` directly, with NO call into issue #229's
+    post-extraction mismatch-detection/single-retry/`extraction_incomplete`
+    logic at all -- so the ORIGINAL PRD #227 bug (a question with a
+    paragraph of prior context and a transition phrase before it, whose
+    bulleted options and `Recommended:` line get silently dropped) was not
+    actually protected against on the exact live-turn path that produced
+    it; only the async needs-input queue's own consumer
+    (`parser_session._process_one_queued_item`, covered by issue #229's own
+    tests) had that protection.
+
+    This reproduces that bug scenario end to end through the REAL
+    `start_session_job` -> `_run_grilling_turn_stream_json` ->
+    `_extract_grilling_questions_via_parser_session` chain (not
+    `_process_one_queued_item` directly) and asserts the shared
+    `extract_with_validation` retry now fires on this path too, and a
+    still-broken retry result is flagged `extraction_incomplete`."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    turn_text = (
+        "We've settled the schema and the API shape already. The last open "
+        "branch is how retries should behave under load, since that changes "
+        "how aggressively the client backs off.\n\n"
+        "One more branch to close:\n\n"
+        "❓ **Q5** - **Retry backoff**: How should the client back off "
+        "between retries?\n"
+        "- Fixed 1s delay\n"
+        "- Exponential backoff\n"
+        "Recommended: Exponential backoff\n"
+    )
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(turn_text)]))
+
+    header_text = (
+        "We've settled the schema and the API shape already. The last open branch is how retries should "
+        "behave under load, since that changes how aggressively the client backs off.\n\nOne more branch to close:"
+    )
+    # First attempt silently drops both the options and the recommendation --
+    # exactly the PRD #227 bug scenario.
+    broken_payload = {
+        "header": header_text,
+        "footer": "",
+        "questions": [
+            {
+                "id": "q5",
+                "text": "How should the client back off between retries?",
+                "kind": "open",
+                "options": None,
+                "recommended": None,
+                "recommended_text": None,
+            }
+        ],
+    }
+    # The retry recovers the options but still drops the recommendation --
+    # still fails the same check, so it must come back flagged.
+    still_broken_retry_payload = {
+        "header": header_text,
+        "footer": "",
+        "questions": [
+            {
+                "id": "q5",
+                "text": "How should the client back off between retries?",
+                "kind": "single",
+                "options": ["Fixed 1s delay", "Exponential backoff"],
+                "recommended": None,
+                "recommended_text": None,
+            }
+        ],
+    }
+    _mock_parser_session_sequence(monkeypatch, project_id, cwd, [broken_payload, still_broken_retry_payload])
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    interview = json.loads(row["interview_json"])
+    assert interview["source"] == "parser_session"
+    question = interview["questions"][0]
+    # The retry actually fired and its (still imperfect) result won, tagged.
+    assert question["kind"] == "single"
+    assert question["options"] == ["Fixed 1s delay", "Exponential backoff"]
+    assert question["extraction_incomplete"] is True
+
+    events = live_stream._buffers.get(row_id, [])
+    turn_events = [e for e in events if e["type"] == "turn" and e["phase"] == "grilling"]
+    assert len(turn_events) == 1
+    assert turn_events[0]["interview"]["questions"][0]["extraction_incomplete"] is True
+
+
 def test_stream_json_grilling_turn_with_prd_in_output_auto_transitions_to_details(
     client, tmp_path, monkeypatch
 ):
@@ -787,7 +1035,7 @@ def test_stream_json_grilling_turn_with_prd_in_output_auto_transitions_to_detail
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             # Natural-language format the real /do skill emits -- no ": " separator
             # after the number, so _DETAIL_RE won't match but the loose re.search
             # for PRD/Issue #N still triggers _finish_chain.
@@ -839,56 +1087,58 @@ def test_stream_json_grilling_turn_with_prd_in_output_auto_transitions_to_detail
 # chain to compensate for, and the issue's acceptance criteria explicitly
 # requires grilling under this engine to skip it entirely (no file read, no
 # Ollama rescue call). These tests are removed rather than kept red: the
-# behavior they asserted no longer exists for this phase by design. The
-# mechanism itself (`rescue_grilling_response`, `should_attempt_grilling_rescue`,
-# `classify_needs_input`) is untouched and still fully exercised by its
-# QA/implement equivalents elsewhere in this file
-# (`test_start_implement_job_uses_ollama_rescue_when_qa_regex_parser_finds_nothing`,
-# `test_qa_corrective_retry_fires_once_and_uses_reformatted_result`,
-# `test_qa_needs_input_classification_renders_rich_ui_on_genuine_wrapup`,
-# etc.). New tests below
+# behavior they asserted no longer exists for this phase by design. At the
+# time, `rescue_grilling_response`/`should_attempt_grilling_rescue` were
+# still untouched and exercised by QA/implement's own equivalents elsewhere
+# in this file -- issue #230 has since migrated those onto the
+# parser-session pipeline too and deleted both functions entirely (see
+# `test_qa_needs_input_classification_rescues_after_corrective_retry_also_
+# failed`/`test_qa_corrective_retry_fires_once_and_uses_reformatted_result`
+# for their current, parser-session-based equivalents; `classify_needs_input`
+# itself is untouched). New tests below
 # (`test_grilling_turn_under_new_engine_never_touches_the_question_file`,
 # `test_grilling_turn_under_new_engine_skips_ollama_rescue_entirely`) cover
 # the new engine's "must not touch that mechanism" requirement directly.
 # ---------------------------------------------------------------------------
 
 
-def test_confirm_advance_skips_grilling_turn_and_advances_through_chain(client, tmp_path, monkeypatch):
-    """Issue #33: the explicit "Yes, proceed" path (confirm_advance=True)
-    must go straight to /rhubarb:to-prd -> /rhubarb:to-issues -> details, resuming the
-    session's existing claude_session_id, WITHOUT sending another grilling
-    CLI turn first. Issue #196 (child of PRD #195): the chain now pauses at
-    `details` instead of auto-continuing into /rhubarb:implement."""
+def test_start_session_job_with_empty_frontier_auto_advances_through_chain(client, tmp_path, monkeypatch):
+    """Issue #223 (child of PRD #222): the moment a grilling turn's frontier
+    comes back empty, the chain must go straight to /rhubarb:to-prd ->
+    /rhubarb:to-issues -> /rhubarb:publish-to-github -> details on its own,
+    with no confirmation click and no `confirm_advance` flag anymore. Issue
+    #196 (child of PRD #195): the chain still pauses at `details` instead of
+    auto-continuing into /rhubarb:implement."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     seen_prompts = []
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         seen_prompts.append(prompt)
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("PRD #5: My PRD")])
+            return iter([_result_event("PRD Draft: My PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Issue #6: Child one")])
+            return iter([_result_event("Issue Draft S1: Child one")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #5: My PRD\nIssue #6: Child one")])
         raise AssertionError(f"unexpected prompt {prompt!r} -- do chain must not auto-implement")
 
     _mock_engine(monkeypatch, handler)
     # Issue #221: "❓ **Q1**" isn't a format the regex parser recognizes
     # either, so the first turn now falls through to the parser-session
     # extraction pass -- scripted here to find nothing, since this test
-    # doesn't care about the parsed interview, only that confirm_advance
-    # skips straight to the chain afterward.
+    # doesn't care about the parsed interview, only that the empty frontier
+    # advances straight into the chain afterward.
     _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="❓ **Q1** - **Scope**: Only question?")
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
-
-    # Only the two chain prompts -- no /rhubarb:implement, no grilling reply.
-    assert seen_prompts == ["/rhubarb:to-prd", "/rhubarb:to-issues"]
+    # Only the three chain prompts -- no /rhubarb:implement, no grilling reply.
+    assert seen_prompts == ["/rhubarb:to-prd", "/rhubarb:to-issues", "/rhubarb:publish-to-github"]
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "details"
@@ -916,9 +1166,10 @@ def test_start_session_job_passes_the_configured_model_to_the_cli(client, tmp_pa
 
     def handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
         seen_models.append(model)
-        return iter([_result_event("- Only question?")])
+        return iter([_result_event('Question 1: "Only question?"')])
 
     _mock_engine(monkeypatch, handler)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
@@ -951,9 +1202,10 @@ def test_start_implement_job_passes_the_model_the_session_was_launched_with(clie
 
 
 def test_chain_steps_use_the_model_the_session_was_created_with(client, tmp_path, monkeypatch):
-    """/rhubarb:to-prd and /rhubarb:to-issues (run via advance_past_grilling) must be
-    invoked with the same model the session's grilling turn used, not
-    whatever `settings.model` currently is."""
+    """/rhubarb:to-prd, /rhubarb:to-issues, and /rhubarb:publish-to-github
+    (all run via advance_past_grilling) must be invoked with the same model
+    the session's grilling turn used, not whatever `settings.model` currently
+    is."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -963,26 +1215,33 @@ def test_chain_steps_use_the_model_the_session_was_created_with(client, tmp_path
     seen_models = []
 
     def handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
-        if prompt == "/rhubarb:do a feature":
-            return iter([_result_event("- Only question?")])
+        if prompt == "/rhubarb:grilling a feature":
+            return iter([_result_event('Question 1: "Only question?"')])
         seen_models.append((prompt, model))
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("PRD #5: My PRD")])
+            return iter([_result_event("PRD Draft: My PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Issue #6: Child one")])
+            return iter([_result_event("Issue Draft S1: Child one")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #5: My PRD\nIssue #6: Child one")])
         return iter([_result_event("Thanks, that's everything I need.")])
 
     _mock_engine(monkeypatch, handler)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
+    # Issue #223: this reply's unstructured wrap-up text goes through the
+    # parser-session extraction pass, finds nothing (no quoted `Question N:`
+    # text in this prose), and auto-advances straight into the chain -- no
+    # confirm_advance flag anymore.
     asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
     assert seen_models == [
         ("all good", "claude-opus-4-8"),
         ("/rhubarb:to-prd", "claude-opus-4-8"),
         ("/rhubarb:to-issues", "claude-opus-4-8"),
+        ("/rhubarb:publish-to-github", "claude-opus-4-8"),
     ]
 
 
@@ -1005,17 +1264,12 @@ def test_model_selector_change_respawns_only_the_open_cards_engine(client, tmp_p
 
     _mock_engine(monkeypatch, handler)
 
-    # The card under test -- already has a live resident engine. Issue #184:
-    # model/effort respawn-on-settings-change is only built for `PtyEngine`
-    # (a grilling card's resident tab is a `StreamJsonEngine`, which this
-    # mechanism deliberately isn't extended to -- out of this issue's
-    # scope), so the engine is seeded directly via `_get_or_create_engine`
-    # rather than through `start_session_job` (which would now dispatch a
-    # fresh session to the new engine instead, since every fresh session
-    # starts in grilling) -- this test is about the respawn mechanism
+    # The card under test -- already has a live resident engine, seeded
+    # directly via `_get_or_create_stream_json_engine` rather than through
+    # `start_session_job` -- this test is about the respawn mechanism
     # itself, not about grilling.
     row_id = db.create_session(conn, project_id)
-    original_engine = session_runner._get_or_create_engine(
+    original_engine = session_runner._get_or_create_stream_json_engine(
         row_id, cwd=cwd, model="claude-opus-4-8", effort="auto", resume_session_id=None
     )
     assert original_engine.model == "claude-opus-4-8"
@@ -1024,16 +1278,18 @@ def test_model_selector_change_respawns_only_the_open_cards_engine(client, tmp_p
     # A different card, also with a live resident engine -- must be left
     # completely untouched below.
     other_row_id = db.create_session(conn, project_id)
-    other_engine = session_runner._get_or_create_engine(
+    other_engine = session_runner._get_or_create_stream_json_engine(
         other_row_id, cwd=cwd, model="claude-opus-4-8", effort="auto", resume_session_id=None
     )
 
     # The project's pre-warmed standby engine -- also must be left
     # completely untouched below.
     asyncio.run(
-        session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-opus-4-8", effort=db.DEFAULT_EFFORT)
+        session_runner.ensure_standby_stream_json_engine(
+            project_id, cwd=cwd, model="claude-opus-4-8", effort=db.DEFAULT_EFFORT
+        )
     )
-    standby_engine, _, _ = session_runner._standby_engines[project_id]
+    standby_engine, _, _ = session_runner._standby_stream_json_engines[project_id]
 
     resp = client.post("/api/settings/model", json={"model": "claude-sonnet-4-6", "card_id": row_id})
     assert resp.json() == {"model": "claude-sonnet-4-6", "respawned": True}
@@ -1041,7 +1297,7 @@ def test_model_selector_change_respawns_only_the_open_cards_engine(client, tmp_p
     # (a) The open card's engine was torn down and replaced with a fresh,
     # unresumed one under the new model (effort carried over unchanged).
     assert original_engine.closed is True
-    new_engine = session_runner._pty_engines[row_id]
+    new_engine = session_runner._stream_json_engines[row_id]
     assert new_engine is not original_engine
     assert new_engine.model == "claude-sonnet-4-6"
     assert new_engine.effort == "auto"
@@ -1060,11 +1316,11 @@ def test_model_selector_change_respawns_only_the_open_cards_engine(client, tmp_p
 
     # (b) A different card's engine, and the project's standby engine, are
     # provably untouched.
-    assert session_runner._pty_engines[other_row_id] is other_engine
+    assert session_runner._stream_json_engines[other_row_id] is other_engine
     assert other_engine.closed is False
     assert other_engine.model == "claude-opus-4-8"
 
-    assert session_runner._standby_engines[project_id][0] is standby_engine
+    assert session_runner._standby_stream_json_engines[project_id][0] is standby_engine
     assert standby_engine.closed is False
     assert standby_engine.model == "claude-opus-4-8"
 
@@ -1086,29 +1342,29 @@ def test_effort_selector_change_respawns_only_the_open_cards_engine(client, tmp_
 
     # See `test_model_selector_change_respawns_only_the_open_cards_engine`'s
     # docstring above for why this seeds the engine directly rather than
-    # through `start_session_job` (issue #184).
+    # through `start_session_job`.
     row_id = db.create_session(conn, project_id, effort="low")
-    original_engine = session_runner._get_or_create_engine(
+    original_engine = session_runner._get_or_create_stream_json_engine(
         row_id, cwd=cwd, model="claude-opus-4-8", effort="low", resume_session_id=None
     )
     assert original_engine.effort == "low"
 
     other_row_id = db.create_session(conn, project_id, effort="low")
-    other_engine = session_runner._get_or_create_engine(
+    other_engine = session_runner._get_or_create_stream_json_engine(
         other_row_id, cwd=cwd, model="claude-opus-4-8", effort="low", resume_session_id=None
     )
 
     resp = client.post("/api/settings/effort", json={"effort": "high", "card_id": row_id})
     assert resp.json() == {"effort": "high", "respawned": True}
 
-    new_engine = session_runner._pty_engines[row_id]
+    new_engine = session_runner._stream_json_engines[row_id]
     assert new_engine is not original_engine
     assert original_engine.closed is True
     assert new_engine.model == "claude-opus-4-8"
     assert new_engine.effort == "high"
     assert new_engine.resume_session_id is None
 
-    assert session_runner._pty_engines[other_row_id] is other_engine
+    assert session_runner._stream_json_engines[other_row_id] is other_engine
     assert other_engine.closed is False
     assert other_engine.effort == "low"
 
@@ -1124,11 +1380,11 @@ def test_settings_change_with_no_live_engine_for_the_card_only_updates_the_globa
 
     # A row that exists but was never given a live engine.
     row_id = db.create_session(conn, project_id)
-    assert row_id not in session_runner._pty_engines
+    assert row_id not in session_runner._stream_json_engines
 
     resp = client.post("/api/settings/model", json={"model": "claude-opus-4-8", "card_id": row_id})
     assert resp.json() == {"model": "claude-opus-4-8", "respawned": False}
-    assert row_id not in session_runner._pty_engines
+    assert row_id not in session_runner._stream_json_engines
     assert db.get_model(conn) == "claude-opus-4-8"
 
 
@@ -1137,29 +1393,31 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
-            return iter([_result_event("❓ **Q1** - **Scope**: First question?")])
+        if prompt == "/rhubarb:grilling a feature":
+            return iter([_result_event('Question 1: "First question?"')])
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("PRD #5: My PRD")])
+            return iter([_result_event("PRD Draft: My PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Issue #6: Child one\nIssue #7: Child two")])
+            return iter([_result_event("Issue Draft S1: Child one\nIssue Draft S2: Child two")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #5: My PRD\nIssue #6: Child one\nIssue #7: Child two")])
         # the grilling reply itself: no more bullet/heading questions -> grilling is done
         return iter([_result_event("Thanks, that's everything I need.")])
 
     _mock_engine(monkeypatch, handler)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
-    # The grilling reply itself: no more questions -> stays in grilling and
-    # publishes the wrap-up turn, no auto-advance.
-    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
     row = db.get_session(conn, row_id)
     assert row["phase"] == "grilling"
 
-    # Explicit "Yes, proceed" advances to details and pauses -- no auto-implement
-    # (issue #196, child of PRD #195).
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+    # Issue #223 (child of PRD #222): the reply's wrap-up (no more questions)
+    # now auto-advances straight through to-prd -> to-issues -> details, with
+    # no confirmation click, and no auto-implement either (issue #196, child
+    # of PRD #195).
+    asyncio.run(session_runner.continue_session_job(row_id, "all good", cwd=cwd))
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "details"
@@ -1180,28 +1438,35 @@ def test_continue_session_job_advances_through_prd_and_issues_to_details(client,
 
 
 def test_chain_publishes_directly_and_details_reflect_issue_numbers(client, tmp_path, monkeypatch):
-    """Skills now call `gh issue create` themselves and print `PRD #N: <title>`
-    / `Issue #N: <title>` lines directly. The chain must reach `phase=details`
-    with correct issue numbers parsed from those lines -- no separate
-    publishing step and no `prd_draft.json` involved."""
+    """Issue #225 (child of PRD #222): `/rhubarb:to-prd`/`/rhubarb:to-issues`
+    are pure drafting steps with no GitHub side effects of their own --
+    `/rhubarb:publish-to-github` is the one place that calls `gh issue create`
+    and prints the `PRD #N: <title>` / `Issue #N: <title>` lines the chain
+    parses. The chain must reach `phase=details` with correct issue numbers
+    parsed from those lines."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("PRD #5: My PRD")])
+            return iter([_result_event("PRD Draft: My PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Issue #6: Child one\nIssue #7: Child two")])
+            return iter([_result_event("Issue Draft S1: Child one\nIssue Draft S2: Child two")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #5: My PRD\nIssue #6: Child one\nIssue #7: Child two")])
         return iter([_result_event("Implemented.")])
 
     _mock_engine(monkeypatch, handler)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
+    # Issue #223: the first turn's frontier already comes back empty (the
+    # emoji-format text isn't regex-parseable, and the default no-op parser
+    # session finds nothing either) -- the chain auto-advances straight
+    # through to details from this single call, no confirmation needed.
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "details"
@@ -1254,63 +1519,78 @@ def test_grilling_claude_cli_error_never_sets_needs_github_login(client, tmp_pat
     assert error_turns[0]["needs_github_login"] is False
 
 
-def test_creating_prd_gh_auth_failure_sets_needs_github_login(client, tmp_path, monkeypatch):
-    """`/rhubarb:to-prd` now calls `gh issue create` directly, so a
-    `ClaudeCLIError` whose message matches `_is_gh_auth_failure` during
-    `creating_prd` must set `needs_github_login=1` and publish a `turn` event
-    with `needs_github_login: true` -- so the frontend shows the GitHub login
+def test_publishing_gh_auth_failure_sets_needs_github_login(client, tmp_path, monkeypatch):
+    """Issue #225 (child of PRD #222): `/rhubarb:publish-to-github` is now the
+    only phase that calls `gh issue create` (`/rhubarb:to-prd`/`to-issues` are
+    pure drafting steps with no GitHub side effects), so a `ClaudeCLIError`
+    whose message matches `_is_gh_auth_failure` during `publishing` must set
+    `needs_github_login=1` and publish a `turn` event with
+    `needs_github_login: true` -- so the frontend shows the GitHub login
     prompt."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/rhubarb:to-prd":
+            return iter([_result_event("PRD Draft: My PRD")])
+        if prompt == "/rhubarb:to-issues":
+            return iter([_result_event("Issue Draft S1: Child one")])
+        if prompt == "/rhubarb:publish-to-github":
             raise ClaudeCLIError("gh: not logged in, run `gh auth login`")
-        return iter([_result_event("Thanks, that's everything I need.")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
+    # Issue #223: the first turn's empty frontier auto-advances straight
+    # through to-prd -> to-issues -> publishing within this same call -- no
+    # confirmation click needed.
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
-
     row = db.get_session(conn, row_id)
-    assert row["phase"] == "creating_prd"
+    assert row["phase"] == "publishing"
     assert bool(row["needs_github_login"]) is True
     assert "not logged in" in row["error_text"]
 
     events = live_stream._buffers.get(row_id, [])
     assert events[-1] == {"type": "done"}
-    error_turns = [e for e in events if e.get("type") == "turn" and e.get("phase") == "creating_prd"]
+    error_turns = [e for e in events if e.get("type") == "turn" and e.get("phase") == "publishing"]
     assert error_turns[0]["needs_github_login"] is True
 
 
 def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypatch):
+    """Issue #225 (child of PRD #222): a `publishing`-phase failure (the only
+    phase that calls `gh issue create` now) retries straight into another
+    `/rhubarb:publish-to-github` turn via `retry_session_job`'s new
+    `publishing` branch."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     attempt = {"n": 0}
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/rhubarb:to-prd":
+            return iter([_result_event("PRD Draft: Retried PRD")])
+        if prompt == "/rhubarb:to-issues":
+            return iter([_result_event("Issue Draft S1: Only child")])
+        if prompt == "/rhubarb:publish-to-github":
             attempt["n"] += 1
             if attempt["n"] == 1:
                 raise ClaudeCLIError("not logged in")
-            return iter([_result_event("PRD #9: Retried PRD")])
-        if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Issue #10: Only child")])
-        return iter([_result_event("done")])
+            return iter([_result_event("PRD #9: Retried PRD\nIssue #10: Only child")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "publishing"
 
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
 
@@ -1427,22 +1707,23 @@ def test_retry_on_creating_prd_phase_is_unaffected_by_implement_branch(client, t
     attempt = {"n": 0}
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/rhubarb:to-prd":
             attempt["n"] += 1
             if attempt["n"] == 1:
                 raise ClaudeCLIError("not logged in")
-            return iter([_result_event("PRD #30: Regression PRD")])
+            return iter([_result_event("PRD Draft: Regression PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Issue #31: Only child")])
-        return iter([_result_event("done")])
+            return iter([_result_event("Issue Draft S1: Only child")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #30: Regression PRD\nIssue #31: Only child")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
     asyncio.run(session_runner.retry_session_job(row_id, cwd))
 
@@ -1674,7 +1955,7 @@ def test_parallel_mode_gives_each_prd_its_own_independent_engine(client, tmp_pat
     # Two independent tabs were constructed for the two turns (plus the two
     # pooling-time fresh engines) -- never one shared instance.
     assert len(fake_class.instances) >= 2
-    assert session_runner._pty_engines == {}
+    assert session_runner._stream_json_engines == {}
 
 
 def test_serial_mode_queues_second_prd_and_drains_it_when_first_finishes(client, tmp_path, monkeypatch):
@@ -1748,9 +2029,10 @@ def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch)
 
     def recording_handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
         seen_session_ids.append(session_id)
-        return iter([_result_event("❓ **Q1** - **Scope**: Another question?", session_id="new")])
+        return iter([_result_event('Question 1: "Another question?"', session_id="new")])
 
     _mock_engine(monkeypatch, recording_handler)
+    _mock_parser_session_autoextract(monkeypatch, project_a, cwd_a)
 
     # Same project: should resume the pooled session.
     reused = db.claim_available_session(conn, project_a)
@@ -1762,11 +2044,158 @@ def test_session_reuse_pool_is_scoped_per_project(client, tmp_path, monkeypatch)
     # A different project must never be handed project A's pooled session.
     project_b = _open_project(client, tmp_path, "proj_b")
     cwd_b = _cwd_for(project_b)
+    _mock_parser_session_autoextract(monkeypatch, project_b, cwd_b)
     reused_b = db.claim_available_session(conn, project_b)
     resume_id_b = reused_b["claude_session_id"] if reused_b is not None else None
     row_id_b = db.create_session(conn, project_b, claude_session_id=resume_id_b)
     asyncio.run(session_runner.start_session_job(row_id_b, "unrelated feature", cwd=cwd_b))
     assert seen_session_ids[-1] is None
+
+
+# ---------------------------------------------------------------------------
+# `_extract_qa_issues_via_skill` (PRD #227 follow-up, gap 2, `gh issue view
+# 227`): a prior agent, needing a nested `{prd, issues: [{questions}]}` shape
+# for QA-grilling the flat parse-interview skill couldn't represent, built a
+# completely separate mechanism (`_QA_EXTRACTION_PROMPT_TEMPLATE` sent
+# directly via `parser_session.stream_turn`, bypassing the skill) instead of
+# extending it. This was flagged as a real inconsistency and unified: the
+# skill's own `qa_grilling_issues`-phase section now emits the nested shape,
+# and `_extract_qa_issues_via_skill` invokes it the same way grilling/
+# implement's own extraction does.
+# ---------------------------------------------------------------------------
+
+
+def test_extract_qa_issues_via_skill_invokes_the_parse_interview_skill(client, tmp_path, monkeypatch):
+    """The prompt actually sent to the parser session must reference the
+    `/rhubarb:parse-interview` skill with `phase: qa_grilling_issues` (a
+    distinct phase from the `qa_grilling` phase the needs-input queue's own
+    flat-shape extraction already uses for this same raw text via a
+    different mechanism -- see `_extract_qa_issues_via_skill`'s own
+    docstring for why that distinction matters), and the returned data must
+    be the nested `{prd, issues: [...]}` shape with 2+ issues, each with
+    their own question(s), for a scripted multi-issue response."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    scripted_response = {
+        "prd": {"number": 12, "title": "Add retry backoff"},
+        "issues": [
+            {
+                "number": 13,
+                "title": "Client retry loop",
+                "questions": [
+                    {
+                        "id": "issue13-q1",
+                        "text": "Does the client actually stop retrying after 3 attempts?",
+                        "recommended_text": "Yes, confirmed in the logs.",
+                    }
+                ],
+            },
+            {
+                "number": 14,
+                "title": "Backoff timing",
+                "questions": [
+                    {"id": "issue14-q1", "text": "Is the backoff delay actually exponential?", "recommended_text": None},
+                    {"id": "issue14-q2", "text": "Is jitter applied between attempts?", "recommended_text": None},
+                ],
+            },
+        ],
+    }
+    seen_prompts = []
+
+    class FakeParserEngine:
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+            self.session_id = resume_session_id or "parser-session-fake"
+            self._alive = False
+
+        def start(self):
+            self._alive = True
+            return self
+
+        def close(self):
+            self._alive = False
+
+        def isalive(self):
+            return self._alive
+
+        async def stream_turn(self, prompt):
+            seen_prompts.append(prompt)
+            yield {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": json.dumps(scripted_response),
+                "session_id": self.session_id,
+            }
+
+    monkeypatch.setattr(parser_session, "StreamJsonEngine", FakeParserEngine)
+    parser_session._parser_sessions.pop(project_id, None)
+    asyncio.run(parser_session.ensure_parser_session(project_id, cwd=cwd))
+
+    raw_text = (
+        'QA session for PRD 12: "Add retry backoff"\n\n'
+        'Issue 13: "Client retry loop"\n'
+        'Question 1: "Does the client actually stop retrying after 3 attempts?"\n'
+        'Recommended text: "Yes, confirmed in the logs."\n\n'
+        'Issue 14: "Backoff timing"\n'
+        'Question 1: "Is the backoff delay actually exponential?"\n'
+        'Question 2: "Is jitter applied between attempts?"\n'
+    )
+    result = asyncio.run(session_runner._extract_qa_issues_via_skill(project_id, raw_text))
+
+    # The prompt sent invokes the skill uniformly, same convention as the
+    # existing grilling/implement extraction calls.
+    assert len(seen_prompts) == 1
+    assert "/rhubarb:parse-interview" in seen_prompts[0]
+    assert "phase: qa_grilling_issues" in seen_prompts[0]
+    assert raw_text in seen_prompts[0]
+
+    assert result["source"] == "parser_session"
+    assert result["prd"] == {"number": 12, "title": "Add retry backoff"}
+    assert len(result["issues"]) == 2
+    assert result["issues"][0]["number"] == 13
+    assert len(result["issues"][0]["questions"]) == 1
+    assert result["issues"][0]["questions"][0]["recommended_text"] == "Yes, confirmed in the logs."
+    assert result["issues"][1]["number"] == 14
+    assert len(result["issues"][1]["questions"]) == 2
+    assert result["issues"][1]["questions"][1]["text"] == "Is jitter applied between attempts?"
+
+
+def test_extract_qa_issues_via_skill_returns_none_on_schema_invalid_response(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    class FakeParserEngine:
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+            self.session_id = "parser-session-fake"
+            self._alive = False
+
+        def start(self):
+            self._alive = True
+            return self
+
+        def close(self):
+            self._alive = False
+
+        def isalive(self):
+            return self._alive
+
+        async def stream_turn(self, prompt):
+            yield {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": json.dumps({"not": "the right shape"}),
+                "session_id": self.session_id,
+            }
+
+    monkeypatch.setattr(parser_session, "StreamJsonEngine", FakeParserEngine)
+    parser_session._parser_sessions.pop(project_id, None)
+    asyncio.run(parser_session.ensure_parser_session(project_id, cwd=cwd))
+
+    result = asyncio.run(session_runner._extract_qa_issues_via_skill(project_id, "some text"))
+
+    assert result is None
 
 
 # ---------------------------------------------------------------------------
@@ -1828,6 +2257,7 @@ def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(c
         'Recommended text: "Yes."\n'
     )
     _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(qa_turn_text, session_id="qa-session-id")]))
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -1860,11 +2290,13 @@ def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(c
     assert impl_events[-1] == {"type": "done"}
 
     # The implement card's own tab is closed -- the new QA row starts fresh.
-    assert row_id not in session_runner._pty_engines
+    assert row_id not in session_runner._stream_json_engines
 
-    # The nested issues/questions structure was parsed from the turn's free
-    # text (parse_qa_response) and published on the new QA session's stream
-    # -- the qa_grilling JSON block itself only carried the {phase, prd} signal.
+    # The nested issues/questions structure was extracted from the turn's
+    # free text via the parser-session pipeline
+    # (`_extract_qa_issues_via_skill`) and published on the new QA
+    # session's stream -- the qa_grilling JSON block itself only carried the
+    # {phase, prd} signal.
     qa_events = live_stream._buffers.get(qa_row["id"], [])
     qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
     assert len(qa_turn_events) == 1
@@ -1900,6 +2332,7 @@ def test_start_implement_job_prefers_rhubarb_qa_file_over_terminal_text(client, 
 
     # Terminal text carries the handoff signal block but no recognizable QA session text.
     _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(_QA_BLOCK, session_id="qa-session-id")]))
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -1936,6 +2369,7 @@ def test_rhubarb_qa_file_is_not_deleted_merely_by_being_read(client, tmp_path, m
     _write_question_file(cwd, "rhubarb_qa.md", 'QA session for PRD 7: "Tracked PRD"\n\nIssue 8: "Child"\nQuestion 1: "Does it work?"\n')
 
     _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(_QA_BLOCK, session_id="qa-session-id")]))
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -1985,6 +2419,7 @@ def test_malformed_rhubarb_qa_file_is_deleted_and_falls_back_to_terminal_text(cl
         'Question 1: "From terminal text"\n'
     )
     _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(qa_turn_text, session_id="qa-session-id")]))
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -2001,13 +2436,19 @@ def test_malformed_rhubarb_qa_file_is_deleted_and_falls_back_to_terminal_text(cl
     assert not (Path(cwd) / ".claude" / "rhubarb_qa.md").exists()
 
 
-def test_start_implement_job_uses_ollama_rescue_when_qa_regex_parser_finds_nothing(client, tmp_path, monkeypatch):
-    """A QA handoff turn whose free text looks like it was trying to be a
-    QA session (contains "QA session for PRD") but doesn't match the
-    strict regex format must be rescued via Ollama, and a valid rescue
-    result must be what gets published on the new QA session's stream."""
+def test_start_implement_job_qa_extraction_ignores_ollama_declined_setting(client, tmp_path, monkeypatch):
+    """Issue #230: the QA-grilling extraction chain no longer has any
+    Ollama-rescue step at all, so `ollama_declined` (issue #119's opt-out,
+    which used to gate that rescue call) has no effect on it any more -- a
+    well-formed QA round extracts identically via the parser-session
+    pipeline whether or not the user has declined Ollama assistance.
+    Supersedes `test_start_implement_job_skips_ollama_rescue_when_declined`/
+    `test_start_implement_job_uses_ollama_rescue_when_not_declined` (removed
+    rather than kept red: the Ollama-rescue mechanism they exercised no
+    longer exists)."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     tracker = {
         "prd": {"number": 7, "title": "Tracked PRD"},
@@ -2019,80 +2460,13 @@ def test_start_implement_job_uses_ollama_rescue_when_qa_regex_parser_finds_nothi
     claude_dir.mkdir(parents=True, exist_ok=True)
     (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
 
-    malformed_qa_text = _QA_BLOCK + "\n\nQA session for PRD 7: this is malformed, no quoted title at all\n"
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_qa_text, session_id="qa-session-id")]))
-
-    rescued = {
-        "prd": {"number": 7, "title": "Tracked PRD"},
-        "issues": [
-            {"number": 8, "title": "Child", "questions": [{"id": "issue8-q1", "text": "Rescued question", "recommended_text": None}]}
-        ],
-    }
-    seen = {}
-
-    def fake_rescue(raw_text):
-        seen["raw_text"] = raw_text
-        return rescued
-
-    monkeypatch.setattr(session_runner, "rescue_qa_response", fake_rescue)
-
-    conn = db.get_connection()
-    row_id = db.create_session(
-        conn, project_id,
-        session_type="implement", phase="implementing",
-        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+    qa_turn_text = (
+        _QA_BLOCK + "\n\n"
+        'QA session for PRD 7: "Tracked PRD"\n\n'
+        'Issue 8: "Child"\n'
+        'Question 1: "Does it work?"\n'
     )
-
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
-
-    assert seen["raw_text"] == malformed_qa_text
-
-    sessions = db.list_sessions_for_project(conn, project_id)
-    qa_row = next(s for s in sessions if s["session_type"] == "qa")
-    qa_events = live_stream._buffers.get(qa_row["id"], [])
-    qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
-    assert qa_turn_events[0]["issues"] == rescued["issues"]
-
-
-def test_start_implement_job_skips_ollama_rescue_when_declined(client, tmp_path, monkeypatch):
-    """Issue #119: with `ollama_declined` true, a QA handoff turn whose free
-    text looks like it was trying to be a QA session but doesn't match the
-    strict regex format must NOT invoke the Ollama rescue function.
-
-    Issue #159's corrective CLI retry is a separate mechanism from the
-    Ollama rescue and is never gated by `ollama_declined` -- it still fires
-    here (the malformed round is "suspicious"), and once that retry turn
-    produces a well-formed round, that becomes the final result instead of
-    the empty issues this scenario used to silently fall back to."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    tracker = {
-        "prd": {"number": 7, "title": "Tracked PRD"},
-        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
-        "qa_changes": [],
-        "status": "implemented",
-    }
-    claude_dir = Path(cwd) / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
-
-    malformed_qa_text = _QA_BLOCK + "\n\nQA session for PRD 7: this is malformed, no quoted title at all\n"
-    well_formed_retry_text = 'QA session for PRD 7: "Tracked PRD"\n\nIssue 8: "Child"\nQuestion 1: "Does it work now?"\n'
-    calls = {"n": 0}
-
-    def handler(prompt, **kw):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return iter([_result_event(malformed_qa_text, session_id="qa-session-id")])
-        return iter([_result_event(well_formed_retry_text, session_id="qa-session-id-retry")])
-
-    _mock_engine(monkeypatch, handler)
-
-    def fake_rescue(raw_text):
-        raise AssertionError("rescue must not be called when ollama_declined is true")
-
-    monkeypatch.setattr(session_runner, "rescue_qa_response", fake_rescue)
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(qa_turn_text, session_id="qa-session-id")]))
 
     conn = db.get_connection()
     db.set_ollama_declined(conn, True)
@@ -2104,59 +2478,12 @@ def test_start_implement_job_skips_ollama_rescue_when_declined(client, tmp_path,
 
     asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
 
-    # Exactly one corrective retry turn -- not more.
-    assert calls["n"] == 2
-
     sessions = db.list_sessions_for_project(conn, project_id)
     qa_row = next(s for s in sessions if s["session_type"] == "qa")
-    assert qa_row["claude_session_id"] == "qa-session-id-retry"
+    assert qa_row["claude_session_id"] == "qa-session-id"
     qa_events = live_stream._buffers.get(qa_row["id"], [])
     qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
-    assert qa_turn_events[0]["issues"][0]["questions"][0]["text"] == "Does it work now?"
-
-
-def test_start_implement_job_uses_ollama_rescue_when_not_declined(client, tmp_path, monkeypatch):
-    """Issue #119: with `ollama_declined` explicitly false, the QA rescue
-    call still fires, unchanged from current behavior."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    tracker = {
-        "prd": {"number": 7, "title": "Tracked PRD"},
-        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
-        "qa_changes": [],
-        "status": "implemented",
-    }
-    claude_dir = Path(cwd) / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
-
-    malformed_qa_text = _QA_BLOCK + "\n\nQA session for PRD 7: this is malformed, no quoted title at all\n"
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_qa_text, session_id="qa-session-id")]))
-
-    rescued = {
-        "prd": {"number": 7, "title": "Tracked PRD"},
-        "issues": [
-            {"number": 8, "title": "Child", "questions": [{"id": "issue8-q1", "text": "Rescued question", "recommended_text": None}]}
-        ],
-    }
-    monkeypatch.setattr(session_runner, "rescue_qa_response", lambda raw_text: rescued)
-
-    conn = db.get_connection()
-    db.set_ollama_declined(conn, False)
-    row_id = db.create_session(
-        conn, project_id,
-        session_type="implement", phase="implementing",
-        details={"prd": {"number": 7, "title": "Tracked PRD"}},
-    )
-
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
-
-    sessions = db.list_sessions_for_project(conn, project_id)
-    qa_row = next(s for s in sessions if s["session_type"] == "qa")
-    qa_events = live_stream._buffers.get(qa_row["id"], [])
-    qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
-    assert qa_turn_events[0]["issues"] == rescued["issues"]
+    assert qa_turn_events[0]["issues"][0]["questions"][0]["text"] == "Does it work?"
 
 
 # ---------------------------------------------------------------------------
@@ -2167,13 +2494,13 @@ def test_start_implement_job_uses_ollama_rescue_when_not_declined(client, tmp_pa
 
 def test_qa_corrective_retry_fires_once_and_uses_reformatted_result(client, tmp_path, monkeypatch):
     """A QA handoff turn whose result contains recognizable QA-question-
-    attempt content (the "QA session for PRD" trigger) but doesn't parse,
-    and whose Ollama rescue attempt also comes back empty, must trigger
-    exactly one corrective follow-up turn -- handing the model its own
-    unparseable output back -- rather than silently handing off a QA
-    session with zero issues."""
+    attempt content (the "QA session for PRD" trigger) but doesn't extract
+    into any issues must trigger exactly one corrective follow-up turn --
+    handing the model its own unparseable output back -- rather than
+    silently handing off a QA session with zero issues."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     tracker = {
         "prd": {"number": 7, "title": "Tracked PRD"},
@@ -2200,9 +2527,6 @@ def test_qa_corrective_retry_fires_once_and_uses_reformatted_result(client, tmp_
         return iter([_result_event(well_formed_retry_text, session_id="qa-session-id-retry")])
 
     _mock_engine(monkeypatch, handler)
-    # Ollama rescue is attempted (not declined) but comes back unavailable --
-    # the corrective retry is what actually rescues this round.
-    monkeypatch.setattr(session_runner, "rescue_qa_response", lambda raw_text: None)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -2255,11 +2579,6 @@ def test_qa_no_retry_when_result_has_no_recognizable_qa_content(client, tmp_path
         return iter([_result_event(_QA_BLOCK, session_id="qa-session-id")])
 
     _mock_engine(monkeypatch, handler)
-
-    def fake_rescue(raw_text):
-        raise AssertionError("rescue must not be called when there is nothing to rescue")
-
-    monkeypatch.setattr(session_runner, "rescue_qa_response", fake_rescue)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -2315,7 +2634,6 @@ def test_qa_corrective_retry_publishes_explicit_error_when_still_unparseable(cli
         return iter([_result_event(still_malformed_retry_text, session_id="qa-session-id-retry")])
 
     _mock_engine(monkeypatch, handler)
-    monkeypatch.setattr(session_runner, "rescue_qa_response", lambda raw_text: None)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -2375,9 +2693,9 @@ def test_qa_needs_input_classification_renders_rich_ui_on_genuine_wrapup(client,
     never even attempts a corrective retry) must still be handed to the
     Ollama needs-input classifier before the QA session is created with an
     empty issues list. When it says a human's input is still needed, and a
-    second Ollama extraction attempt on the same text actually produces
-    issue/question content, that rich content is what the new QA session is
-    started with instead."""
+    second parser-session extraction attempt on the same text actually
+    produces issue/question content, that rich content is what the new QA
+    session is started with instead."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     _qa_tracker(cwd)
@@ -2396,17 +2714,27 @@ def test_qa_needs_input_classification_renders_rich_ui_on_genuine_wrapup(client,
         ],
     }
     seen = {}
+    extract_calls = {"n": 0}
 
     async def fake_classify(card_id, conn, text, phase, **kw):
         seen["phase"] = phase
         return {"needs_input": True, "reason": "Still worth a follow-up check."}
 
-    def fake_rescue(raw_text):
+    async def fake_extract(project_id, raw_text):
+        # First call is the primary extraction attempt in `_finish_implement_
+        # turn` itself (finds nothing, matching this genuine wrap-up text);
+        # the second is `_maybe_extract_needs_input_qa`'s own last-resort
+        # attempt, once the classifier has said a human's input is still
+        # needed -- that second call is the one this test actually cares
+        # about.
+        extract_calls["n"] += 1
+        if extract_calls["n"] == 1:
+            return None
         seen["rescue_raw_text"] = raw_text
         return rescued
 
     monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
-    monkeypatch.setattr(session_runner, "rescue_qa_response", fake_rescue)
+    monkeypatch.setattr(session_runner, "_extract_qa_issues_via_skill", fake_extract)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -2430,7 +2758,9 @@ def test_qa_needs_input_classification_renders_rich_ui_on_genuine_wrapup(client,
 def test_qa_needs_input_classification_false_falls_through_to_wrapup(client, tmp_path, monkeypatch):
     """A negative classification must fall through to today's unchanged QA
     handoff -- a QA session still created, but with an empty issues list --
-    and must never even attempt the extraction rescue call."""
+    and must never trigger `_maybe_extract_needs_input_qa`'s own last-resort
+    extraction attempt (a SECOND `_extract_qa_issues_via_skill`
+    call, beyond `_finish_implement_turn`'s own unconditional primary one)."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     _qa_tracker(cwd)
@@ -2443,11 +2773,14 @@ def test_qa_needs_input_classification_false_falls_through_to_wrapup(client, tmp
     async def fake_classify(card_id, conn, text, phase, **kw):
         return {"needs_input": False, "reason": "Genuinely done."}
 
-    def fake_rescue(raw_text):
-        raise AssertionError("extraction must not be attempted when needs_input is false")
+    extract_calls = {"n": 0}
+
+    async def fake_extract(project_id, raw_text):
+        extract_calls["n"] += 1
+        return None
 
     monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
-    monkeypatch.setattr(session_runner, "rescue_qa_response", fake_rescue)
+    monkeypatch.setattr(session_runner, "_extract_qa_issues_via_skill", fake_extract)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -2457,6 +2790,11 @@ def test_qa_needs_input_classification_false_falls_through_to_wrapup(client, tmp
     )
 
     asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+
+    # Exactly one extraction attempt -- the primary one in
+    # `_finish_implement_turn` itself; the classifier's own last-resort
+    # extraction must never fire when `needs_input` is false.
+    assert extract_calls["n"] == 1
 
     sessions = db.list_sessions_for_project(conn, project_id)
     qa_row = next(s for s in sessions if s["session_type"] == "qa")
@@ -2480,8 +2818,11 @@ def test_qa_needs_input_true_but_extraction_fails_falls_through_to_wrapup(client
     async def fake_classify(card_id, conn, text, phase, **kw):
         return {"needs_input": True, "reason": "Looks unfinished."}
 
+    async def fake_extract(project_id, raw_text):
+        return None
+
     monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
-    monkeypatch.setattr(session_runner, "rescue_qa_response", lambda raw_text: None)
+    monkeypatch.setattr(session_runner, "_extract_qa_issues_via_skill", fake_extract)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -2501,11 +2842,17 @@ def test_qa_needs_input_true_but_extraction_fails_falls_through_to_wrapup(client
 
 def test_qa_needs_input_classification_rescues_after_corrective_retry_also_failed(client, tmp_path, monkeypatch):
     """Once the QA-grilling corrective retry (issue #159) has already run
-    and its own result *also* failed to parse, the needs-input classifier
-    gets one last look at that retry's own text before the session gives up
-    with an explicit error. A positive classification with successfully
-    extracted issue/question content must create the QA session with that
-    content instead of publishing that explicit error."""
+    and its own extraction attempt *also* came up empty, the needs-input
+    classifier gets one last look at that retry's own text before the
+    session gives up with an explicit error. A positive classification whose
+    OWN follow-up extraction attempt actually succeeds must create the QA
+    session with that content instead of publishing that explicit error --
+    modeled here as the retry's own `_extract_qa_issues_via_skill`
+    call coming up empty the first time it's tried against the retry's text,
+    then recovering on the classifier's own follow-up call against that same
+    text (issue #230: both stages now share the exact same extraction
+    mechanism, unlike the old regex-then-Ollama-rescue chain where they were
+    two genuinely different attempts)."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     _qa_tracker(cwd)
@@ -2532,18 +2879,22 @@ def test_qa_needs_input_classification_rescues_after_corrective_retry_also_faile
             }
         ],
     }
+    retry_text_extract_calls = {"n": 0}
 
-    def fake_rescue(raw_text):
-        if raw_text == still_malformed_retry_text:
-            return rescued
-        return None
+    async def fake_extract(project_id, raw_text):
+        if raw_text != still_malformed_retry_text:
+            return None
+        retry_text_extract_calls["n"] += 1
+        if retry_text_extract_calls["n"] == 1:
+            return None  # the retry turn's own extraction attempt still fails
+        return rescued  # the needs-input classifier's own follow-up attempt succeeds
 
     async def fake_classify(card_id, conn, text, phase, **kw):
         assert text == still_malformed_retry_text
         assert phase == "qa_grilling"
         return {"needs_input": True, "reason": "The retry still looks unfinished."}
 
-    monkeypatch.setattr(session_runner, "rescue_qa_response", fake_rescue)
+    monkeypatch.setattr(session_runner, "_extract_qa_issues_via_skill", fake_extract)
     monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
 
     conn = db.get_connection()
@@ -2598,7 +2949,7 @@ def test_start_implement_job_pools_session_normally_when_no_qa_block(client, tmp
     assert len(qa_sessions) == 0
 
     # Pooling closed this card's tab.
-    assert row_id not in session_runner._pty_engines
+    assert row_id not in session_runner._stream_json_engines
 
 
 def test_start_qa_job_publishes_qa_grilling_turn_without_done(client, tmp_path, monkeypatch):
@@ -2669,7 +3020,7 @@ def test_continue_qa_job_runs_phase3_and_fires_done(client, tmp_path, monkeypatc
     assert {"type": "phase", "phase": "qa_closing"} in events
     assert events[-1] == {"type": "done"}
     # This card's tab is done either way (recycled or not).
-    assert qa_row_id not in session_runner._pty_engines
+    assert qa_row_id not in session_runner._stream_json_engines
 
 
 def _usage_event(input_tokens, cache_creation, cache_read, context_window, model="claude-sonnet-4-6"):
@@ -2927,7 +3278,7 @@ def test_start_implement_job_suspends_as_blocked_when_result_contains_blocked_ma
     assert {"type": "done"} not in events
 
     # Suspended, not finished -- the tab stays open for continue_implement_job.
-    assert row_id in session_runner._pty_engines
+    assert row_id in session_runner._stream_json_engines
 
 
 def test_start_implement_job_prefers_rhubarb_blocked_file_over_terminal_text(client, tmp_path, monkeypatch):
@@ -3097,11 +3448,12 @@ def test_engine_is_constructed_once_and_reused_across_turns_in_the_same_phase(cl
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
-            return iter([_result_event("❓ **Q1** - **Scope**: First question?")])
-        return iter([_result_event("❓ **Q1** - **Scope**: Follow-up?")])
+        if prompt == "/rhubarb:grilling a feature":
+            return iter([_result_event('Question 1: "First question?"')])
+        return iter([_result_event('Question 1: "Follow-up?"')])
 
     fake_class = _mock_engine(monkeypatch, handler)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -3129,8 +3481,10 @@ def test_engine_reattaches_via_resume_when_continuing_an_existing_session_id(cli
     cwd = _cwd_for(project_id)
 
     fake_class = _mock_engine(
-        monkeypatch, lambda prompt, **kw: iter([_result_event("- Another question?", session_id="pooled-session")])
+        monkeypatch,
+        lambda prompt, **kw: iter([_result_event('Question 1: "Another question?"', session_id="pooled-session")]),
     )
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id, claude_session_id="pooled-session")
@@ -3158,220 +3512,123 @@ def test_implement_tab_closes_and_standby_is_kept_alive_when_pooled(client, tmp_
     asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
 
     assert db.get_session(conn, row_id)["available_for_reuse"] == 1
-    assert row_id not in session_runner._pty_engines
+    assert row_id not in session_runner._stream_json_engines
     # The turn's own engine is closed; the fresh one minted for pooling
     # (issue #136) is kept alive as this project's standby instead of also
     # being closed immediately -- it's what the next /do claims directly.
     assert fake_class.instances[0].closed is True
     assert fake_class.instances[1].closed is False
-    assert session_runner._standby_engines[project_id][0] is fake_class.instances[1]
+    assert session_runner._standby_stream_json_engines[project_id][0] is fake_class.instances[1]
 
 
 # ---------------------------------------------------------------------------
-# Pre-warmed standby PtyEngine (issue #136): a project keeps one unclaimed,
-# already-running engine ready so a new /do claims it directly instead of
-# paying spawn latency inline.
+# Pre-warmed standby StreamJsonEngine (issue #136): a project keeps one
+# unclaimed, already-running engine ready so a new /do claims it directly
+# instead of paying spawn latency inline. (Additional coverage --
+# spawn-when-none-exists, claim-on-match, claim-on-model-mismatch,
+# close-and-discard, register-then-reuse -- lives in the `_stream_json_engine`
+# suffixed tests further down this file.)
 # ---------------------------------------------------------------------------
 
 
-def test_ensure_standby_engine_spawns_when_none_exists(client, tmp_path, monkeypatch):
+def test_ensure_standby_stream_json_engine_is_a_no_op_when_a_live_matching_one_exists(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
 
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
-
-    assert len(fake_class.instances) == 1
-    engine, model, effort = session_runner._standby_engines[project_id]
-    assert engine is fake_class.instances[0]
-    assert (model, effort) == ("claude-sonnet-5", "auto")
-
-
-def test_ensure_standby_engine_is_a_no_op_when_a_live_matching_one_exists(client, tmp_path, monkeypatch):
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
-
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto")
+    )
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto")
+    )
 
     assert len(fake_class.instances) == 1  # no second spawn
 
 
-def test_ensure_standby_engine_replaces_a_dead_one(client, tmp_path, monkeypatch):
+def test_ensure_standby_stream_json_engine_replaces_a_dead_one(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
 
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto")
+    )
     fake_class.instances[0].closed = True  # simulate a crash while unclaimed
 
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto")
+    )
 
     assert len(fake_class.instances) == 2
-    assert session_runner._standby_engines[project_id][0] is fake_class.instances[1]
+    assert session_runner._standby_stream_json_engines[project_id][0] is fake_class.instances[1]
 
 
-def test_claim_standby_engine_returns_it_on_a_match_and_removes_it(client, tmp_path, monkeypatch):
+def test_claim_standby_stream_json_engine_returns_none_and_discards_on_effort_mismatch(
+    client, tmp_path, monkeypatch
+):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto")
+    )
 
-    claimed = session_runner.claim_standby_engine(project_id, model="claude-sonnet-5", effort="auto")
-
-    assert claimed is fake_class.instances[0]
-    assert claimed.closed is False
-    assert project_id not in session_runner._standby_engines
-
-
-def test_claim_standby_engine_returns_none_and_discards_on_model_mismatch(client, tmp_path, monkeypatch):
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
-
-    claimed = session_runner.claim_standby_engine(project_id, model="claude-opus-5", effort="auto")
-
-    assert claimed is None
-    assert fake_class.instances[0].closed is True  # discarded, not left dangling
-    assert project_id not in session_runner._standby_engines
-
-
-def test_claim_standby_engine_returns_none_and_discards_on_effort_mismatch(client, tmp_path, monkeypatch):
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
-
-    claimed = session_runner.claim_standby_engine(project_id, model="claude-sonnet-5", effort="high")
+    claimed = session_runner.claim_standby_stream_json_engine(project_id, model="claude-sonnet-5", effort="high")
 
     assert claimed is None
     assert fake_class.instances[0].closed is True
 
 
-def test_claim_standby_engine_returns_none_when_dead(client, tmp_path, monkeypatch):
+def test_claim_standby_stream_json_engine_returns_none_when_dead(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto")
+    )
     fake_class.instances[0].closed = True
 
-    claimed = session_runner.claim_standby_engine(project_id, model="claude-sonnet-5", effort="auto")
+    claimed = session_runner.claim_standby_stream_json_engine(project_id, model="claude-sonnet-5", effort="auto")
 
     assert claimed is None
-    assert project_id not in session_runner._standby_engines
+    assert project_id not in session_runner._standby_stream_json_engines
 
 
-def test_claim_standby_engine_returns_none_when_none_exists(client, tmp_path):
+def test_claim_standby_stream_json_engine_returns_none_when_none_exists(client, tmp_path):
     project_id = _open_project(client, tmp_path, "proj")
-    assert session_runner.claim_standby_engine(project_id, model="claude-sonnet-5", effort="auto") is None
+    assert session_runner.claim_standby_stream_json_engine(project_id, model="claude-sonnet-5", effort="auto") is None
 
 
-def test_close_standby_engine_closes_and_discards_it(client, tmp_path, monkeypatch):
+def test_close_standby_stream_json_engine_does_not_raise_when_none_exists(client, tmp_path):
     project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
-
-    session_runner.close_standby_engine(project_id)
-
-    assert fake_class.instances[0].closed is True
-    assert project_id not in session_runner._standby_engines
+    session_runner.close_standby_stream_json_engine(project_id)  # no-op, must not raise
 
 
-def test_close_standby_engine_does_not_raise_when_none_exists(client, tmp_path):
-    project_id = _open_project(client, tmp_path, "proj")
-    session_runner.close_standby_engine(project_id)  # no-op, must not raise
-
-
-def test_open_pty_tab_count_includes_standby_engines(client, tmp_path, monkeypatch):
+def test_count_resident_engines_includes_standby_engines(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
 
-    assert session_runner.open_pty_tab_count() == 0
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
-    assert session_runner.open_pty_tab_count() == 1
-
-
-def test_register_engine_makes_get_or_create_engine_reuse_it_without_spawning(client, tmp_path, monkeypatch):
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("hi")]))
-
-    asyncio.run(session_runner.ensure_standby_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto"))
-    claimed = session_runner.claim_standby_engine(project_id, model="claude-sonnet-5", effort="auto")
-    session_runner.register_engine(999, claimed)
-
-    engine = session_runner._get_or_create_engine(
-        999, cwd=cwd, model="claude-sonnet-5", effort="auto", resume_session_id=None
+    assert session_runner.count_resident_engines() == 0
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto")
     )
-
-    assert engine is claimed
-    assert len(fake_class.instances) == 1  # no second spawn triggered by _get_or_create_engine
+    assert session_runner.count_resident_engines() == 1
 
 
 # ---------------------------------------------------------------------------
 # Argv-level end-to-end coverage (issue #138): every test above (and every
-# other test in this file) mocks `session_runner.PtyEngine` wholesale with a
-# fake that never runs `_build_args()` at all -- it only ever proves the
-# right Python kwarg (`model=`/`effort=`) reached the constructor. These
-# tests instead leave the REAL `PtyEngine` class in place and fake out only
-# the OS-level pty spawn (`pty_engine._default_pty_factory`, the same
-# injection seam `tests/test_pty_engine.py` uses directly), so the actual
-# argv handed to "the subprocess" is captured and can be asserted on -- all
-# the way through `/api/session/start`'s real endpoint logic (app.py) and
-# `start_session_job` (session_runner.py). This is what catches a
-# discrepancy the Python-kwarg-level mock structurally cannot.
+# other test in this file) mocks `session_runner.StreamJsonEngine` wholesale
+# with a fake that never runs `_build_args()` at all -- it only ever proves
+# the right Python kwarg (`model=`/`effort=`) reached the constructor. These
+# tests instead leave the REAL `StreamJsonEngine` class in place and fake out
+# only the OS-level subprocess spawn, so the actual argv handed to "the
+# subprocess" is captured and can be asserted on -- all the way through
+# `/api/session/start`'s real endpoint logic (app.py) and `start_session_job`
+# (session_runner.py). This is what catches a discrepancy the Python-kwarg-
+# level mock structurally cannot.
 # ---------------------------------------------------------------------------
-
-
-class _ArgvCapturingBackend:
-    """Minimal real-shaped `PtyBackend`: `read()` hands back a canned
-    turn-complete response on its first call (ending `stream_turn` in one
-    round trip) and never needs to be read again."""
-
-    def __init__(self, result_text="- Only question?"):
-        from rhubarb.pty_engine import TURN_COMPLETE_MARKER
-
-        self._text = f"{result_text}\n{TURN_COMPLETE_MARKER}\n"
-        self._served = False
-
-    def write(self, data):
-        return len(data)
-
-    def read(self, size=4096):
-        if not self._served:
-            self._served = True
-            return self._text
-        raise EOFError
-
-    def isalive(self):
-        return not self._served
-
-    def terminate(self, force=False):
-        pass
-
-
-def _capture_real_pty_spawns(monkeypatch):
-    """Replace `pty_engine._default_pty_factory` (the seam every real,
-    non-test `PtyEngine()` construction resolves its `pty_factory` through)
-    with one that records every spawn's argv and hands back a
-    `_ArgvCapturingBackend` instead of a real OS process. Returns the list of
-    captured argvs, appended to in spawn order."""
-    spawns = []
-
-    def fake_factory(argv, *, cwd, env, **kwargs):
-        # `**kwargs` absorbs the `rows`/`cols` PtyEngine passes through to
-        # the real default-selected factory (issue #166, see
-        # `PtyEngine.start`) -- these tests only care about the argv a
-        # spawn was called with.
-        spawns.append(argv)
-        return _ArgvCapturingBackend()
-
-    monkeypatch.setattr(pty_engine, "_default_pty_factory", lambda: fake_factory)
-    return spawns
 
 
 class _ArgvCapturingStreamJsonBackend:
@@ -3380,7 +3637,7 @@ class _ArgvCapturingStreamJsonBackend:
     `read_line()` hands back one canned `result` NDJSON line on its first
     call (ending `stream_turn` in one round trip), then raises `EOFError`."""
 
-    def __init__(self, result_text="- Only question?", session_id="s1"):
+    def __init__(self, result_text='Question 1: "Only question?"', session_id="s1"):
         self._line = json.dumps(
             {
                 "type": "result",
@@ -3444,6 +3701,7 @@ def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_st
     cwd = _cwd_for(project_id)
     conn = db.get_connection()
     spawns = _capture_real_stream_json_spawns(monkeypatch)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     # A standby was pre-warmed (e.g. by `open_project`) under the model that
     # was configured at the time.
@@ -3488,6 +3746,7 @@ def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_st
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     spawns = _capture_real_stream_json_spawns(monkeypatch)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     asyncio.run(
         session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-opus-4-8", effort="auto")
@@ -3523,6 +3782,7 @@ def test_brand_new_session_after_changing_model_spawns_with_the_new_model_via_po
     cwd = _cwd_for(project_id)
     conn = db.get_connection()
     spawns = _capture_real_stream_json_spawns(monkeypatch)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     pooled_row_id = db.create_session(
         conn, project_id, claude_session_id="pooled-conversation-1", model="claude-sonnet-4-6", effort="auto"
@@ -3560,6 +3820,7 @@ def test_standby_is_still_claimed_when_the_request_omits_effort_entirely(client,
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     spawns = _capture_real_stream_json_spawns(monkeypatch)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     asyncio.run(
         session_runner.ensure_standby_stream_json_engine(
@@ -3580,8 +3841,9 @@ def test_standby_is_still_claimed_when_the_request_omits_effort_entirely(client,
 
 
 # ---------------------------------------------------------------------------
-# Crash routing (issue #87): PtyEngineUnrecoverableError -> the same
-# blocked-card flow a genuine implement_blocked marker already uses.
+# Crash routing (issue #87, migrated to StreamJsonEngineUnrecoverableError by
+# issue #225): the exception -> the same blocked-card flow a genuine
+# implement_blocked marker already uses.
 # ---------------------------------------------------------------------------
 
 
@@ -3590,7 +3852,7 @@ def test_implement_turn_crash_routes_into_the_blocked_flow(client, tmp_path, mon
     cwd = _cwd_for(project_id)
 
     def crashing(prompt, **kw):
-        raise PtyEngineUnrecoverableError("claude PTY process died twice in a row", claude_session_id="crashed-1")
+        raise StreamJsonEngineUnrecoverableError("claude process died twice in a row", session_id="crashed-1")
 
     _mock_engine(monkeypatch, crashing)
 
@@ -3613,7 +3875,7 @@ def test_implement_turn_crash_routes_into_the_blocked_flow(client, tmp_path, mon
     # Suspended, not finished -- no done, no error/needs_github_login path.
     assert {"type": "done"} not in events
     # The dead tab was dropped so a reply reattaches a fresh one via --resume.
-    assert row_id not in session_runner._pty_engines
+    assert row_id not in session_runner._stream_json_engines
 
 
 def test_implement_crash_recovers_via_the_same_reply_endpoint_as_a_real_block(client, tmp_path, monkeypatch):
@@ -3624,7 +3886,7 @@ def test_implement_crash_recovers_via_the_same_reply_endpoint_as_a_real_block(cl
     cwd = _cwd_for(project_id)
 
     def crashing(prompt, **kw):
-        raise PtyEngineUnrecoverableError("died twice", claude_session_id="crashed-1")
+        raise StreamJsonEngineUnrecoverableError("died twice", session_id="crashed-1")
 
     _mock_engine(monkeypatch, crashing)
 
@@ -3651,21 +3913,14 @@ def test_implement_crash_recovers_via_the_same_reply_endpoint_as_a_real_block(cl
     assert fake_class.instances[0].resume_session_id == "crashed-1"
 
 
-def test_grilling_turn_under_new_engine_crash_surfaces_as_a_plain_error(client, tmp_path, monkeypatch):
-    """Issue #184: the crash-routing mechanism exercised just above
-    (`test_implement_turn_crash_routes_into_the_blocked_flow`,
-    `_route_crash_to_blocked`, `phase: blocked`) is `PtyEngine`-specific and
-    untouched -- still fully exercised for implement and every other phase
-    still on that engine. A grilling card's `StreamJsonEngineUnrecoverableError`
-    (this engine's own internal crash-retry-once already gave up -- see
-    `stream_json_engine.py`) does NOT route into that generic `blocked`
-    suspend-and-reply flow -- `StreamJsonEngine` exposes no raw keystroke
-    passthrough for a human to nudge a dead subprocess back to life, so
-    there's nothing a 'blocked' UI could usefully resume into. Instead it
-    surfaces as a plain persisted/published error, exactly like an ordinary
-    `ClaudeCLIError` would (`test_grilling_claude_cli_error_never_sets_needs_github_login`'s
-    same shape) -- the card's dead tab is still dropped either way, so a
-    retry attempt starts a fresh engine rather than reusing a dead one."""
+def test_grilling_turn_crash_routes_into_the_blocked_flow_too(client, tmp_path, monkeypatch):
+    """Issue #225: once every phase (including grilling) drives its turns
+    through `StreamJsonEngine`, a `StreamJsonEngineUnrecoverableError` (this
+    engine's own internal crash-retry-once already gave up) routes into the
+    same generic blocked-card flow every other phase uses
+    (`_route_crash_to_blocked`, `phase: blocked`) -- removing the asymmetry
+    that used to exist only because grilling folded this into a plain error
+    (there was no blocked-recovery UI for it before this migration)."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -3679,17 +3934,16 @@ def test_grilling_turn_under_new_engine_crash_surfaces_as_a_plain_error(client, 
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     row = db.get_session(conn, row_id)
-    assert row["phase"] == "grilling"
-    assert row["error_text"] is not None
-    assert "died twice" in row["error_text"]
-    assert bool(row["needs_github_login"]) is False
+    assert row["phase"] == "blocked"
+    assert row["claude_session_id"] == "crashed-grilling"
+    blocked = json.loads(row["blocked_json"])
+    assert blocked["phase"] == "implement_blocked"
+    assert "died twice" in blocked["context"]
     assert row_id not in session_runner._stream_json_engines
 
     events = live_stream._buffers.get(row_id, [])
-    error_turns = [e for e in events if e.get("type") == "turn" and e.get("phase") == "grilling"]
-    assert error_turns
-    assert error_turns[-1]["error"] is not None
-    assert error_turns[-1]["needs_github_login"] is False
+    assert any(e.get("type") == "turn" and e.get("phase") == "blocked" for e in events)
+    assert {"type": "done"} not in events
 
 
 def test_implement_error_in_background_raises_a_notification(client, tmp_path, monkeypatch):
@@ -3879,7 +4133,7 @@ def test_maybe_clear_for_next_phase_clears_when_over_cutoff(client, tmp_path, mo
     # it's now this card's resident tab going forward.
     assert len(fake_class.instances) == 1
     assert fake_class.instances[0].resume_session_id is None
-    assert session_runner._pty_engines[row_id] is fake_class.instances[0]
+    assert session_runner._stream_json_engines[row_id] is fake_class.instances[0]
 
 
 def test_finish_chain_pauses_at_details_instead_of_starting_implementing(client, tmp_path, monkeypatch):
@@ -3892,20 +4146,20 @@ def test_finish_chain_pauses_at_details_instead_of_starting_implementing(client,
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("PRD #1: p")])
+            return iter([_result_event("PRD Draft: p")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Issue #2: i")])
+            return iter([_result_event("Issue Draft S1: i")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #1: p\nIssue #2: i")])
         raise AssertionError(f"unexpected prompt {prompt!r} -- must not auto-implement")
 
     _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "details"
@@ -3929,20 +4183,20 @@ def test_finish_chain_pauses_at_details_even_when_no_prd_was_parsed(client, tmp_
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("no PRD numbers in here")])
+            return iter([_result_event("PRD Draft: p")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("no issue numbers in here at all")])
+            return iter([_result_event("Issue Draft S1: i")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("no PRD or issue numbers in here at all")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
-
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "details"
@@ -3983,11 +4237,12 @@ def test_start_do_continue_job_reuses_existing_engine_under_cutoff(client, tmp_p
 
     def handler(prompt, **kw):
         do_prompts.append(prompt)
-        if "/rhubarb:do" in prompt:
-            return iter([_result_event("❓ **Q1** - **Scope**: a question?", session_id="sess-1")])
+        if "/rhubarb:grilling" in prompt:
+            return iter([_result_event('Question 1: "a question?"', session_id="sess-1")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
-    _mock_stream_json_engine(monkeypatch, handler, fresh_ids=["sess-1"])
+    _mock_engine(monkeypatch, handler, fresh_ids=["sess-1"])
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
 
@@ -4002,7 +4257,7 @@ def test_start_do_continue_job_reuses_existing_engine_under_cutoff(client, tmp_p
     assert row["claude_session_id"] == "sess-1"
 
     # The grilling prompt was sent.
-    assert any("/rhubarb:do next idea" in p for p in do_prompts)
+    assert any("/rhubarb:grilling next idea" in p for p in do_prompts)
 
 
 def test_start_do_continue_job_spawns_fresh_engine_over_cutoff(client, tmp_path, monkeypatch):
@@ -4013,11 +4268,12 @@ def test_start_do_continue_job_spawns_fresh_engine_over_cutoff(client, tmp_path,
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if "/rhubarb:do" in prompt:
-            return iter([_result_event("❓ **Q1** - **Scope**: a question?", session_id="fresh-id")])
+        if "/rhubarb:grilling" in prompt:
+            return iter([_result_event('Question 1: "a question?"', session_id="fresh-id")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
-    _mock_stream_json_engine(monkeypatch, handler, fresh_ids=["old-id", "fresh-id"])
+    _mock_engine(monkeypatch, handler, fresh_ids=["old-id", "fresh-id"])
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
 
@@ -4046,9 +4302,13 @@ def test_start_do_continue_job_keeps_model_and_effort_from_row(client, tmp_path,
     def handler(prompt, *, session_id=None, cwd=None, model=None, effort=None):
         seen_models.append(model)
         seen_efforts.append(effort)
-        return iter([_result_event("❓ **Q1** - **Scope**: a question?")])
+        # Issue #223: a real regex-parseable question, so the turn's frontier
+        # stays non-empty and this test doesn't trigger an auto-advance into
+        # the chain (which would record more than one model/effort call).
+        return iter([_result_event('Question 1: "a question?"')])
 
-    _mock_stream_json_engine(monkeypatch, handler)
+    _mock_engine(monkeypatch, handler)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
     row_id = db.create_session(conn, project_id)
     db.update_session(conn, row_id, phase="details", session_type="do", model="claude-haiku-4-5-20251001", effort="low", context_pct=0.10)
 
@@ -4062,7 +4322,7 @@ def test_start_do_continue_job_keeps_model_and_effort_from_row(client, tmp_path,
 # ---------------------------------------------------------------------------
 # Per-card_id turn lock (issue #144): a race condition where two overlapping
 # calls for the same card_id could both write to and read from the same
-# resident PtyEngine's stream_turn at once. `_run_turn` now checks a
+# resident engine's stream_turn at once. `_run_stream_json_turn` now checks a
 # per-card_id `asyncio.Lock` before doing anything else; a call made while
 # the lock is already held returns `None` immediately, touching neither the
 # engine nor anything else.
@@ -4070,13 +4330,13 @@ def test_start_do_continue_job_keeps_model_and_effort_from_row(client, tmp_path,
 
 
 def test_run_turn_lock_rejects_a_concurrent_call_for_the_same_card_id(client, tmp_path, monkeypatch):
-    """The core invariant: of two overlapping `_run_turn` calls for the same
-    card_id, only the first ever reaches the engine's `stream_turn` -- the
-    second, made while the first is still mid-turn (blocked inside
-    `stream_turn` via a controlled `asyncio.Event`), returns `None`
-    immediately without constructing or touching the engine at all. Issue
-    #149: that second, rejected call must also publish an explicit error
-    `turn` event on this card's stream, tagged with the caller's own
+    """The core invariant: of two overlapping `_run_stream_json_turn` calls
+    for the same card_id, only the first ever reaches the engine's
+    `stream_turn` -- the second, made while the first is still mid-turn
+    (blocked inside `stream_turn` via a controlled `asyncio.Event`), returns
+    `None` immediately without constructing or touching the engine at all.
+    Issue #149: that second, rejected call must also publish an explicit
+    error `turn` event on this card's stream, tagged with the caller's own
     `phase`, instead of leaving no trace at all."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
@@ -4087,14 +4347,14 @@ def test_run_turn_lock_rejects_a_concurrent_call_for_the_same_card_id(client, tm
     fake_class = _make_blocking_fake_engine_class(
         entered, release, enter_count, result_text="❓ **Q1** - **Scope**: Only question?"
     )
-    monkeypatch.setattr(session_runner, "PtyEngine", fake_class)
+    monkeypatch.setattr(session_runner, "StreamJsonEngine", fake_class)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
 
     async def scenario():
         first_task = asyncio.create_task(
-            session_runner._run_turn(
+            session_runner._run_stream_json_turn(
                 row_id, "first prompt", session_id=None, cwd=cwd, model=None, effort=None, phase="grilling"
             )
         )
@@ -4102,7 +4362,7 @@ def test_run_turn_lock_rejects_a_concurrent_call_for_the_same_card_id(client, tm
 
         # A second, overlapping call for the SAME card_id while the first
         # is still in flight -- must be rejected outright.
-        second_result = await session_runner._run_turn(
+        second_result = await session_runner._run_stream_json_turn(
             row_id, "second prompt", session_id=None, cwd=cwd, model=None, effort=None, phase="grilling"
         )
         assert second_result is None
@@ -4146,7 +4406,7 @@ def test_concurrent_start_implement_job_calls_only_one_reaches_the_engine(client
     release = asyncio.Event()
     enter_count = {"n": 0}
     fake_class = _make_blocking_fake_engine_class(entered, release, enter_count, result_text="Implemented PRD #5")
-    monkeypatch.setattr(session_runner, "PtyEngine", fake_class)
+    monkeypatch.setattr(session_runner, "StreamJsonEngine", fake_class)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -4195,7 +4455,7 @@ def test_concurrent_start_implement_job_calls_only_one_reaches_the_engine(client
     # duplicate.
     turn_engine = fake_class.instances[0]
     assert turn_engine.closed is True
-    assert row_id not in session_runner._pty_engines
+    assert row_id not in session_runner._stream_json_engines
 
 
 def test_turn_lock_is_released_after_the_turn_completes(client, tmp_path, monkeypatch):
@@ -4211,10 +4471,10 @@ def test_turn_lock_is_released_after_the_turn_completes(client, tmp_path, monkey
     row_id = db.create_session(conn, project_id)
 
     async def scenario():
-        first = await session_runner._run_turn(
+        first = await session_runner._run_stream_json_turn(
             row_id, "first", session_id=None, cwd=cwd, model=None, effort=None, phase="grilling"
         )
-        second = await session_runner._run_turn(
+        second = await session_runner._run_stream_json_turn(
             row_id, "second", session_id="s1", cwd=cwd, model=None, effort=None, phase="grilling"
         )
         return first, second
@@ -4226,121 +4486,14 @@ def test_turn_lock_is_released_after_the_turn_completes(client, tmp_path, monkey
     assert not session_runner._get_turn_lock(row_id).locked()
 
 
-def test_progress_event_keeps_the_turn_lock_held_and_does_not_end_run_turn(client, tmp_path, monkeypatch):
-    """Issue #173 (child of PRD #172 "Remove the stall-detection timer;
-    always show turn progress plus a reply box instead"): `PtyEngine` now
-    yields a `stall`-shaped progress event after every chunk it reads,
-    unconditionally, for the whole duration of any turn -- not just when a
-    quiet period elapses (the old, now-removed issue #169/PRD #168 timer
-    design). `_run_turn`'s translation loop must still treat each of these
-    as first-class and repeatable: published on the card's stream (as the
-    existing `turn` event shape, extended with `stalled`/`stalled_context`)
-    and persisted onto the row (mirroring `blocked_json`), all WITHOUT
-    releasing the turn lock or letting the in-flight `_run_turn` call
-    return -- the underlying turn is still genuinely in progress. This test
-    simulates an entirely ordinary, un-stalled multi-chunk turn (no quiet
-    period, no timer, nothing "wrong" at all) to prove the plumbing holds up
-    for the normal case, since every turn now takes this path. Once the turn
-    genuinely resolves, the lock is released normally and the persisted
-    progress context is cleared."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    release = asyncio.Event()
-
-    class ProgressStreamingFakeEngine:
-        instances: list["ProgressStreamingFakeEngine"] = []
-
-        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, pty_factory=None):
-            self.claude_session_id = resume_session_id or "fresh-1"
-            self.started = False
-            self.closed = False
-            ProgressStreamingFakeEngine.instances.append(self)
-
-        def start(self):
-            self.started = True
-            return self
-
-        def close(self):
-            self.closed = True
-
-        def isalive(self):
-            return self.started and not self.closed
-
-        async def stream_turn(self, prompt):
-            # Two ordinary progress events -- one per chunk a real
-            # `PtyEngine` would have read off the PTY -- before the turn
-            # actually resolves. Nothing here simulates a stall/quiet
-            # period; this is just what every turn's event stream looks
-            # like now.
-            yield {"type": "system", "subtype": "init", "session_id": self.claude_session_id}
-            yield {"type": "stall", "data": "Working on it...\n"}
-            yield {"type": "stall", "data": "Working on it...\nStill going...\n"}
-            await release.wait()
-            yield _result_event("done at last", session_id=self.claude_session_id)
-
-    monkeypatch.setattr(session_runner, "PtyEngine", ProgressStreamingFakeEngine)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-
-    async def scenario():
-        task = asyncio.create_task(
-            session_runner._run_turn(
-                row_id, "prompt", session_id=None, cwd=cwd, model=None, effort=None, phase="grilling"
-            )
-        )
-        # Let the translation loop actually process both progress events
-        # (nothing past them yet -- `release` isn't set) before asserting.
-        for _ in range(10):
-            await asyncio.sleep(0)
-
-        # A progress event must not end the call or release the lock -- the
-        # turn is still genuinely in flight.
-        assert not task.done()
-        assert session_runner._get_turn_lock(row_id).locked()
-
-        # Persisted on the row -- same precedent as `blocked_json` -- so a
-        # reconnect/page-refresh could recover and re-show it.
-        row = db.get_session(conn, row_id)
-        assert row["stalled_json"] is not None
-        stalled = json.loads(row["stalled_json"])
-        assert stalled == {"phase": "grilling", "context": "Working on it...\nStill going...\n"}
-
-        release.set()
-        return await task
-
-    result = asyncio.run(scenario())
-
-    assert result is not None
-    assert result["result"] == "done at last"
-    # The lock is released like any normal completed turn once it actually
-    # resolves.
-    assert not session_runner._get_turn_lock(row_id).locked()
-
-    # And the persisted progress context is cleared once the turn resolves.
-    row = db.get_session(conn, row_id)
-    assert row["stalled_json"] is None
-
-    events = live_stream._buffers.get(row_id, [])
-    progress_turn_events = [e for e in events if e["type"] == "turn" and e.get("stalled")]
-    assert len(progress_turn_events) == 2
-    assert progress_turn_events[0]["phase"] == "grilling"
-    assert progress_turn_events[0]["stalled_context"] == "Working on it...\n"
-    assert progress_turn_events[1]["phase"] == "grilling"
-    assert progress_turn_events[1]["stalled_context"] == "Working on it...\nStill going...\n"
-    # No error was ever published just because ordinary progress events fired.
-    assert not any(e.get("error") for e in events if e["type"] == "turn")
-
-
 def test_close_engine_removes_the_turn_lock(client, tmp_path, monkeypatch):
-    """`_close_engine` must pop the card's entry out of `_turn_locks` too,
-    alongside `_pty_engines` -- otherwise the lock registry grows
-    unboundedly over a long-running instance."""
+    """`_close_stream_json_engine` must pop the card's entry out of
+    `_turn_locks` too, alongside `_stream_json_engines` -- otherwise the
+    lock registry grows unboundedly over a long-running instance."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("❓ **Q1** - **Scope**: Only question?")]))
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event('Question 1: "Only question?"')]))
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -4348,7 +4501,7 @@ def test_close_engine_removes_the_turn_lock(client, tmp_path, monkeypatch):
 
     assert row_id in session_runner._turn_locks
 
-    session_runner._close_engine(row_id)
+    session_runner._close_stream_json_engine(row_id)
 
     assert row_id not in session_runner._turn_locks
 
@@ -4451,13 +4604,15 @@ def test_creating_prd_turn_is_classified_before_creating_issues_starts(client, t
     seen_prompts = []
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         seen_prompts.append(prompt)
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("PRD #5: My PRD")])
+            return iter([_result_event("PRD Draft: My PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Issue #6: Child one")])
+            return iter([_result_event("Issue Draft S1: Child one")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #5: My PRD\nIssue #6: Child one")])
         if prompt == "/rhubarb:implement prd: 5":
             return iter([_result_event("Implemented.")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
@@ -4465,7 +4620,6 @@ def test_creating_prd_turn_is_classified_before_creating_issues_starts(client, t
     _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     # Opt back into (fake) Ollama assistance for this test -- the module's
     # own autouse fixture defaults every other test here to declined so
@@ -4484,14 +4638,21 @@ def test_creating_prd_turn_is_classified_before_creating_issues_starts(client, t
 
     monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
 
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+    # Issue #223: the first grilling turn's empty frontier auto-advances
+    # straight through the chain within this single call -- classify_needs_input
+    # is already mocked above so this exercises the exact same ordering the
+    # old explicit confirm_advance call used to.
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
-    assert calls[0] == (row_id, "creating_prd", "PRD #5: My PRD")
+    assert calls[0] == (row_id, "creating_prd", "PRD Draft: My PRD")
     # /rhubarb:to-issues had NOT been sent yet at the moment creating_prd's
     # turn was classified -- classification runs before the automatic
     # continuation, not after.
     assert seen_prompts_at_creating_prd_call == ["/rhubarb:to-prd"]
-    assert calls[1] == (row_id, "creating_issues", "Issue #6: Child one")
+    assert calls[1] == (row_id, "creating_issues", "Issue Draft S1: Child one")
+    # Issue #225 (child of PRD #222): the new publishing step is classified
+    # too, via the exact same `_run_chain_step` hook.
+    assert calls[2] == (row_id, "publishing", "PRD #5: My PRD\nIssue #6: Child one")
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "details"
@@ -4506,43 +4667,53 @@ def test_creating_prd_positive_classification_shows_generic_stall_panel_not_rich
     `stalled=True` and `stalled_context` set to the turn's own rendered
     text) -- never the rich `interview`/`blocked` question UI grilling and
     implementing use for their own positive results (sibling issues
-    #178/#179)."""
+    #178/#179).
+
+    Issue #225 (child of PRD #222): the pause is a real return, not an
+    inline await -- `start_session_job` returns with the row parked at
+    `phase="creating_prd"`/`stalled_json` set, and no `done` published. The
+    human's reply resumes via `continue_stalled_chain_step_job`, sent as a
+    genuinely new turn (reattached via the row's existing
+    `claude_session_id`), which then cascades through the rest of the chain
+    exactly like a fresh run would."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/rhubarb:to-prd":
             return iter([_result_event("Wrote PRD draft, but scope is unclear.")])
+        if prompt == "Understood, using Postgres for scope.":
+            return iter([_result_event("PRD Draft: My PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Issue #6: Child one")])
-        if prompt == "/rhubarb:implement prd: 5":
-            return iter([_result_event("Implemented.")])
+            return iter([_result_event("Issue Draft S1: Child one")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #5: My PRD\nIssue #6: Child one")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
-    def reply_handler():
-        # Stands in for the live process's response once a human has
-        # replied through the generic panel (forwarded unchanged by the
-        # existing `/api/sessions/{card_id}/stall-reply` endpoint straight
-        # into this same engine's stdin) -- see `_await_stalled_reply`.
-        return [_result_event("PRD #5: My PRD")]
-
-    _mock_engine(monkeypatch, handler, reply_handler=reply_handler)
+    _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     db.set_ollama_declined(conn, False)
 
+    classify_calls = {"n": 0}
+
     async def fake_classify(card_id, conn_arg, text, phase, *, http_post=None):
-        if phase == "creating_prd":
+        # Only the FIRST creating_prd turn ("Wrote PRD draft, but scope is
+        # unclear.") needs input -- the resumed turn's own draft resolves
+        # cleanly, letting the chain cascade forward instead of re-stalling.
+        if phase == "creating_prd" and classify_calls["n"] == 0:
+            classify_calls["n"] += 1
             return {"needs_input": True, "reason": "Scope is ambiguous."}
         return None
 
     monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
 
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+    # Issue #223: the first grilling turn's empty frontier auto-advances into
+    # the chain within this single call.
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     events = live_stream._buffers.get(row_id, [])
     stalled_events = [e for e in events if e.get("type") == "turn" and e.get("stalled")]
@@ -4556,9 +4727,16 @@ def test_creating_prd_positive_classification_shows_generic_stall_panel_not_rich
     assert stalled["blocked"] is None
 
     row = db.get_session(conn, row_id)
-    # The reply (simulated by `reply_handler`) resolved successfully, so the
-    # chain's normal continuation resumed afterward exactly like any other
-    # completed turn.
+    # Genuinely paused -- not resolved inline -- and no `done` published.
+    assert row["phase"] == "creating_prd"
+    assert row["stalled_json"] is not None
+    assert not any(e.get("type") == "done" for e in events)
+
+    asyncio.run(session_runner.continue_stalled_chain_step_job(row_id, "Understood, using Postgres for scope.", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    # The reply resolved successfully, so the chain's normal continuation
+    # cascaded forward exactly like any other completed turn.
     assert row["phase"] == "details"
     assert row["stalled_json"] is None
 
@@ -4571,12 +4749,14 @@ def test_creating_prd_negative_classification_does_not_pause_the_chain(client, t
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/rhubarb:to-prd":
-            return iter([_result_event("PRD #5: My PRD")])
+            return iter([_result_event("PRD Draft: My PRD")])
         if prompt == "/rhubarb:to-issues":
-            return iter([_result_event("Issue #6: Child one")])
+            return iter([_result_event("Issue Draft S1: Child one")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #5: My PRD\nIssue #6: Child one")])
         if prompt == "/rhubarb:implement prd: 5":
             return iter([_result_event("Implemented.")])
         raise AssertionError(f"unexpected prompt {prompt!r}")
@@ -4584,7 +4764,6 @@ def test_creating_prd_negative_classification_does_not_pause_the_chain(client, t
     _mock_engine(monkeypatch, handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     db.set_ollama_declined(conn, False)
 
@@ -4593,7 +4772,9 @@ def test_creating_prd_negative_classification_does_not_pause_the_chain(client, t
 
     monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
 
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+    # Issue #223: the first grilling turn's empty frontier auto-advances into
+    # the chain within this single call.
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     events = live_stream._buffers.get(row_id, [])
     assert not any(e.get("type") == "turn" and e.get("stalled") for e in events)
@@ -4642,6 +4823,7 @@ def test_start_implement_job_renders_rich_question_ui_when_classification_finds_
         'Question 1: "Python or Node?"\nOptions:\nOption 1: "Python"\nOption 2: "Node"\nRecommended: [1]\n'
     )
     _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(question_text, session_id="impl-q1")]))
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
     monkeypatch.setattr(
         session_runner,
         "classify_needs_input",
@@ -4668,7 +4850,7 @@ def test_start_implement_job_renders_rich_question_ui_when_classification_finds_
     assert turn_events[-1]["interview"]["questions"][0]["text"] == "Python or Node?"
     # Suspended, not finished -- no `done` yet, same shape as implement_blocked.
     assert {"type": "done"} not in events
-    assert row_id in session_runner._pty_engines
+    assert row_id in session_runner._stream_json_engines
 
 
 def test_start_implement_job_falls_back_to_generic_panel_when_no_question_can_be_extracted(
@@ -4684,9 +4866,11 @@ def test_start_implement_job_falls_back_to_generic_panel_when_no_question_can_be
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    # No "Question " trigger and no recognizable structured content at all --
-    # parse_grilling_response finds nothing, and should_attempt_grilling_rescue
-    # doesn't even fire, so no Ollama rescue call is attempted either.
+    # No parser session mocked for this project -- `_extract_implementing_
+    # question`'s parser-session extraction pass fails closed (the default
+    # no-op fake engine's `stream_turn` raises, caught as "nothing
+    # extracted"), matching a real turn with no recognizable structured
+    # content at all and no live session to try.
     prose = "I went ahead with the OAuth approach, but I'd like you to confirm before I touch the schema."
     _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(prose, session_id="impl-stall1")]))
     monkeypatch.setattr(
@@ -4715,7 +4899,7 @@ def test_start_implement_job_falls_back_to_generic_panel_when_no_question_can_be
     assert turn_events[-1]["stalled_context"] == "Asked for confirmation before a schema change."
     # Suspended, not finished -- no `done` yet, same shape as implement_blocked.
     assert {"type": "done"} not in events
-    assert row_id in session_runner._pty_engines
+    assert row_id in session_runner._stream_json_engines
 
 
 def test_start_implement_job_continues_automatically_when_classification_says_no_input_needed(
@@ -4830,24 +5014,15 @@ def test_start_implement_job_blocked_marker_takes_priority_over_classification(c
 # ---------------------------------------------------------------------------
 
 
-def test_grilling_turn_dispatches_to_stream_json_engine_not_pty_engine(client, tmp_path, monkeypatch):
-    """A grilling card's turn must be driven by `StreamJsonEngine`, never
-    `PtyEngine`: `PtyEngine` is patched with a stand-in that fails loudly if
-    ever constructed, `StreamJsonEngine` with a working fake, and the turn's
-    translated events (`action`/`text`/`turn`) must reach this card's live
-    SSE-visible buffer (`live_stream._buffers`) via the exact same
-    `publish()`/`stream_translate.translate_event()` pipeline a
-    `PtyEngine`-backed phase's turn already uses (acceptance criterion:
-    "Turn/text/tool-use events ... appear on the existing ... SSE endpoint,
-    translated via stream_translate.translate_event()")."""
+def test_grilling_turn_dispatches_to_stream_json_engine(client, tmp_path, monkeypatch):
+    """A grilling card's turn must be driven by `StreamJsonEngine`, and the
+    turn's translated events (`action`/`text`/`turn`) must reach this card's
+    live SSE-visible buffer (`live_stream._buffers`) via the
+    `publish()`/`stream_translate.translate_event()` pipeline (acceptance
+    criterion: "Turn/text/tool-use events ... appear on the existing ... SSE
+    endpoint, translated via stream_translate.translate_event()")."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
-
-    class _ExplodingPtyEngine:
-        def __init__(self, *a, **kw):
-            raise AssertionError("PtyEngine must never be constructed for a grilling-phase turn")
-
-    monkeypatch.setattr(session_runner, "PtyEngine", _ExplodingPtyEngine)
 
     def handler(prompt, **kw):
         return iter(
@@ -4864,12 +5039,28 @@ def test_grilling_turn_dispatches_to_stream_json_engine_not_pty_engine(client, t
                     "type": "stream_event",
                     "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "Hello"}},
                 },
+                {
+                    "type": "stream_event",
+                    "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "\n\n"}},
+                },
+                # Mirrors real streaming: the CLI's final `result` text was
+                # already streamed as its own delta(s) before the boundary
+                # `result` event arrives -- see the `full_text` accumulation
+                # fix in `_run_stream_json_turn`.
+                {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": 'Question 1: "What should it do?"'},
+                    },
+                },
                 _result_event('Question 1: "What should it do?"'),
             ]
         )
 
     fake_class = _make_fake_engine_class(handler)
     monkeypatch.setattr(session_runner, "StreamJsonEngine", fake_class)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -4886,85 +5077,95 @@ def test_grilling_turn_dispatches_to_stream_json_engine_not_pty_engine(client, t
     assert turn_events[-1]["interview"]["questions"][0]["text"] == "What should it do?"
 
 
-def test_grilling_questions_parsed_directly_via_qa_parser_match_existing_parser_output(client, tmp_path, monkeypatch):
-    """Issue #184 acceptance criterion: "Grilling questions parsed from a
-    turn under this engine match what qa_parser.parse_grilling_response
-    would produce from the same text today." Persisted/published interview
-    must be byte-for-byte what calling the parser directly on the turn's own
-    text produces -- no file-preference/Ollama-rescue detour changing it."""
+def test_grilling_turn_recovers_questions_dropped_from_the_terse_result_text(client, tmp_path, monkeypatch):
+    """Live-testing regression (PRD #222): the CLI's own `result` event text
+    is only the LAST assistant text block of the turn -- if the model prints
+    a full question round, then calls a tool (e.g. writing
+    `.claude/rhubarb_question.md`), then closes with a short remark, `result`
+    captures only that closing remark and silently drops the actual
+    questions the Live Terminal panel already streamed to the user. Before
+    the `full_text` accumulation fix, this made a grilling turn with real
+    outstanding questions parse as empty and auto-advance straight into
+    `creating_prd` (issue #223), discarding a whole round of unanswered
+    questions with no way to recover."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    text = 'Question 1: "Python or Node?"\nOptions:\nOption 1: "Python"\nOption 2: "Node"\nRecommended: [1]\n'
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(text)]))
+    def handler(prompt, **kw):
+        return iter(
+            [
+                # The real round of questions, streamed as text deltas --
+                # exactly what the Live Terminal panel shows the user.
+                {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": 'Question 1: "First question?"\n\n'},
+                    },
+                },
+                {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "delta": {"type": "text_delta", "text": 'Question 2: "Second question?"\n\n'},
+                    },
+                },
+                # A tool call in between (writing the question file) --
+                # doesn't itself carry any `text`, but its presence is why
+                # the CLI's own `result` field ends up being only the
+                # trailing remark below, not the questions above.
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "t1",
+                                "name": "Write",
+                                "input": {"file_path": ".claude/rhubarb_question.md"},
+                            }
+                        ]
+                    },
+                },
+                # The turn's terse closing remark -- this is ALL the CLI's
+                # own `result` event carries, per the bug this test guards
+                # against.
+                _result_event("Waiting on your answers to Q1-Q2 before the next round."),
+            ]
+        )
+
+    _mock_engine(monkeypatch, handler)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     row = db.get_session(conn, row_id)
+    # Must still be waiting in grilling, with the real questions recovered
+    # from the accumulated stream -- NOT auto-advanced into creating_prd off
+    # the terse `result` sentence alone.
+    assert row["phase"] == "grilling"
     interview = json.loads(row["interview_json"])
-    assert interview == parse_grilling_response(text)
+    assert [q["text"] for q in interview["questions"]] == ["First question?", "Second question?"]
 
     events = live_stream._buffers.get(row_id, [])
-    turn_events = [e for e in events if e["type"] == "turn"]
-    assert turn_events[-1]["interview"] == parse_grilling_response(text)
+    assert not any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
 
 
-def test_grilling_turn_lock_rejects_a_concurrent_write_with_the_same_error_as_pty_engine(client, tmp_path, monkeypatch):
-    """Issue #184: reuses the EXACT SAME `_get_turn_lock` mechanism
-    `_run_turn` itself uses -- a second write for the same `card_id` while a
-    grilling turn under the new engine is still in flight must produce the
-    identical "Another turn for this session is already in progress" error
-    a `PtyEngine`-backed card's `_run_turn` produces for the identical
-    scenario (see `test_run_turn_lock_rejects_a_concurrent_call_for_the_same_card_id`
-    above -- this is its stream-json-engine mirror)."""
-    project_id = _open_project(client, tmp_path, "proj")
-    cwd = _cwd_for(project_id)
-
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    enter_count = {"n": 0}
-    fake_class = _make_blocking_fake_engine_class(
-        entered, release, enter_count, result_text="❓ **Q1** - **Scope**: Only question?"
-    )
-    monkeypatch.setattr(session_runner, "StreamJsonEngine", fake_class)
-
-    conn = db.get_connection()
-    row_id = db.create_session(conn, project_id)
-
-    async def scenario():
-        first_task = asyncio.create_task(
-            session_runner._run_grilling_stream_json_turn(
-                row_id, "first prompt", session_id=None, cwd=cwd, model=None, effort=None
-            )
-        )
-        await entered.wait()  # first call is now mid-turn, blocked inside stream_turn
-
-        second_result = await session_runner._run_grilling_stream_json_turn(
-            row_id, "second prompt", session_id=None, cwd=cwd, model=None, effort=None
-        )
-        assert second_result is None
-
-        release.set()
-        return await first_task
-
-    first_result = asyncio.run(scenario())
-
-    # Only the first call's turn ever actually reached the engine.
-    assert enter_count["n"] == 1
-    assert len(fake_class.instances) == 1
-    assert first_result["session_id"] == fake_class.instances[0].claude_session_id
-
-    events = live_stream._buffers.get(row_id, [])
-    error_turn_events = [e for e in events if e["type"] == "turn" and e.get("error")]
-    assert len(error_turn_events) == 1
-    assert error_turn_events[0]["phase"] == "grilling"
-    assert error_turn_events[0]["needs_github_login"] is False
-    assert (
-        error_turn_events[0]["error"]
-        == "Another turn for this session is already in progress -- please wait for it to finish."
-    )
+# Issue #230 removed `test_grilling_questions_parsed_directly_via_qa_parser_
+# match_existing_parser_output`, which covered issue #184's original
+# acceptance criterion that a grilling turn's persisted/published interview
+# must be byte-for-byte what `qa_parser.parse_grilling_response` produces
+# from the same text -- true back when that regex was `_run_grilling_turn_
+# stream_json`'s first-attempt fast path. Issue #230 confirmed that regex
+# format is dead for the grilling skill's real output and removed the
+# regex-first attempt entirely (see that function's docstring): a grilling
+# turn's interview now always comes from the parser-session extraction pass
+# instead, covered by `test_stream_json_grilling_turn_uses_parser_session_
+# for_emoji_question_format` above. Removed rather than kept red: the
+# byte-for-byte-matches-the-regex-parser behavior no longer exists for this
+# call site by design, not by regression.
 
 
 def test_ensure_standby_stream_json_engine_spawns_when_none_exists(client, tmp_path, monkeypatch):
@@ -5064,7 +5265,13 @@ def test_a_grilling_sessions_first_turn_claims_the_pre_warmed_standby_via_the_st
     cwd = _cwd_for(project_id)
     conn = db.get_connection()
 
-    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event("- Only question?")]))
+    # A real, regex-parseable question -- the frontier must stay non-empty
+    # so this test's single grilling turn doesn't auto-advance into
+    # creating_prd (issue #223), which would spawn a second, unrelated
+    # engine for that phase and defeat this test's own "no second spawn"
+    # assertion below.
+    fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event('Question 1: "Only question?"')]))
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
     asyncio.run(
         session_runner.ensure_standby_stream_json_engine(
             project_id, cwd=cwd, model=db.get_model(conn), effort=db.DEFAULT_EFFORT
@@ -5096,6 +5303,7 @@ def test_grilling_turn_under_new_engine_never_touches_the_question_file(client, 
     _write_question_file(cwd, "rhubarb_question.md", original_file_content)
 
     _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event('Question 1: "From the turn text"')]))
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -5138,22 +5346,24 @@ def test_continue_session_job_under_new_engine_does_not_delete_the_question_file
 
 def test_grilling_turn_under_new_engine_skips_ollama_rescue_entirely(client, tmp_path, monkeypatch):
     """Issue #184 acceptance criterion: "... does not invoke the Ollama
-    rescue classifier." Text here is deliberately shaped to trigger the OLD
-    PtyEngine path's rescue call (`should_attempt_grilling_rescue` -- looks
-    like it was trying to contain a question, but doesn't match the strict
-    regex format) -- `rescue_grilling_response` must never be called for a
-    grilling card under the new engine, even with Ollama assistance NOT
-    declined."""
+    rescue classifier." Issue #230 deleted `rescue_grilling_response`
+    entirely (it's no longer importable, let alone callable) -- there is no
+    code path left in `_run_grilling_turn_stream_json` that could ever call
+    it (the old regex-first attempt this test originally targeted is gone;
+    extraction now goes straight to the parser session, with no Ollama
+    rescue fallback at this call site at all). This test now just confirms
+    a malformed-for-extraction turn under the new engine still resolves
+    cleanly (empty questions, chain auto-advances) with Ollama assistance
+    NOT declined -- proving there's nothing left that WOULD have called a
+    rescue function even if one still existed."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
-    malformed_text = 'Question 1: The quote never closes, so the regex parser finds nothing here.\n'
+    malformed_text = "Some prose that doesn't fit any structured question format at all.\n"
     _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_text)]))
-
-    def must_not_be_called(raw_text):
-        raise AssertionError("rescue_grilling_response must not be called for a grilling card under the new engine")
-
-    monkeypatch.setattr(session_runner, "rescue_grilling_response", must_not_be_called)
+    # No parser session mocked -- `_extract_grilling_questions_via_parser_
+    # session` fails closed (`LookupError`, no live session registered) and
+    # this turn's frontier comes back genuinely empty.
 
     conn = db.get_connection()
     db.set_ollama_declined(conn, False)
@@ -5162,9 +5372,9 @@ def test_grilling_turn_under_new_engine_skips_ollama_rescue_entirely(client, tmp
 
     row = db.get_session(conn, row_id)
     interview = json.loads(row["interview_json"])
-    # No rescue was attempted -- the plain regex parse (which finds nothing
-    # for this malformed text) is exactly what gets persisted, unmodified.
-    assert interview == parse_grilling_response(malformed_text)
+    # No rescue was attempted, and no questions survived -- this turn's
+    # wrap-up auto-advanced the chain (issue #223), which "grilling" here
+    # completes with nothing left to build a PRD/issues from.
     assert interview["questions"] == []
 
 
@@ -5184,11 +5394,20 @@ def test_grilling_multiline_composed_reply_under_new_engine_completes_as_a_singl
 
     def handler(prompt, **kw):
         seen_prompts.append(prompt)
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event('Question 1: "Language?"\n\nQuestion 2: "Who is it for?"')])
-        return iter([_result_event("Thanks, that's everything I need.")])
+        if prompt == composed_reply:
+            return iter([_result_event("Thanks, that's everything I need.")])
+        if prompt == "/rhubarb:to-prd":
+            return iter([_result_event("PRD Draft: My PRD")])
+        if prompt == "/rhubarb:to-issues":
+            return iter([_result_event("Issue Draft S1: Child one")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #5: My PRD\nIssue #6: Child one")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -5196,14 +5415,24 @@ def test_grilling_multiline_composed_reply_under_new_engine_completes_as_a_singl
     asyncio.run(session_runner.continue_session_job(row_id, composed_reply, cwd=cwd))
 
     # Exactly one write per turn -- the composed multi-line reply was sent
-    # whole, as a single prompt, on the first (and only) attempt.
-    assert seen_prompts == ["/rhubarb:do a feature", composed_reply]
+    # whole, as a single prompt, on the first (and only) attempt -- before
+    # the chain auto-advances into to-prd/to-issues/publish-to-github (issue
+    # #223, since this reply's wrap-up leaves zero remaining questions).
+    assert seen_prompts == [
+        "/rhubarb:grilling a feature",
+        composed_reply,
+        "/rhubarb:to-prd",
+        "/rhubarb:to-issues",
+        "/rhubarb:publish-to-github",
+    ]
 
     row = db.get_session(conn, row_id)
     assert row["error_text"] is None
-    assert row["phase"] == "grilling"
-    interview = json.loads(row["interview_json"])
-    assert interview["questions"] == []
+    assert row["phase"] == "details"
+
+    events = live_stream._buffers.get(row_id, [])
+    grilling_turns = [e for e in events if e["type"] == "turn" and e["phase"] == "grilling"]
+    assert grilling_turns[-1]["interview"]["questions"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -5387,7 +5616,14 @@ def test_grilling_turn_no_longer_enqueues_onto_needs_input_queue(client, tmp_pat
     _mock_parser_session_extraction(monkeypatch, project_id, cwd, header=prose)
 
     async def fake_classify(card_id, conn_arg, text, phase, *, http_post=None):
-        raise AssertionError("classify_needs_input must not be called for a grilling turn (issue #221)")
+        # Issue #223 (child of PRD #222): this same empty-frontier turn now
+        # auto-advances straight into creating_prd within this call, whose
+        # own `_run_chain_step` legitimately calls `classify_needs_input`
+        # (issue #177, unrelated to this test) -- only a `phase == "grilling"`
+        # call would mean the removed mechanism came back.
+        if phase == "grilling":
+            raise AssertionError("classify_needs_input must not be called for a grilling turn (issue #221)")
+        return None
 
     monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
 
@@ -5417,7 +5653,6 @@ def test_qa_grilling_last_resort_needs_input_classification_enqueues_onto_projec
         return {"needs_input": True, "reason": "Still worth a follow-up check."}
 
     monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
-    monkeypatch.setattr(session_runner, "rescue_qa_response", lambda raw_text: None)
 
     conn = db.get_connection()
     row_id = db.create_session(
@@ -5468,7 +5703,7 @@ def test_creating_prd_needs_input_classification_enqueues_onto_project_queue(cli
     cwd = _cwd_for(project_id)
 
     def handler(prompt, **kw):
-        if prompt == "/rhubarb:do a feature":
+        if prompt == "/rhubarb:grilling a feature":
             return iter([_result_event("❓ **Q1** - **Scope**: Only question?")])
         if prompt == "/rhubarb:to-prd":
             return iter([_result_event("Wrote PRD draft, but scope is unclear.")])
@@ -5484,7 +5719,6 @@ def test_creating_prd_needs_input_classification_enqueues_onto_project_queue(cli
     _mock_engine(monkeypatch, handler, reply_handler=reply_handler)
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
-    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     async def fake_classify(card_id, conn_arg, text, phase, *, http_post=None):
         if phase == "creating_prd":
@@ -5493,7 +5727,9 @@ def test_creating_prd_needs_input_classification_enqueues_onto_project_queue(cli
 
     monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
 
-    asyncio.run(session_runner.continue_session_job(row_id, "", cwd=cwd, confirm_advance=True))
+    # Issue #223: the first grilling turn's empty frontier auto-advances into
+    # the chain within this single call.
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     queue = parser_session.get_needs_input_queue(project_id)
     assert queue == [

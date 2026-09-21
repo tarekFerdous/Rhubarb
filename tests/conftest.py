@@ -37,37 +37,22 @@ def _isolated_implement_queues(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolated_pty_engines(monkeypatch):
-    """Same story again, but for the resident PtyEngine-per-card_id registry
-    (issue #87) -- card_id values restart at 1 in every test's fresh tmp db
-    too, so a leftover (fake) engine from one test must never be handed to
-    an unrelated test's identically-numbered card_id."""
-    monkeypatch.setattr(session_runner, "_pty_engines", {})
-
-
-@pytest.fixture(autouse=True)
-def _isolated_standby_engines(monkeypatch):
-    """Same story again, but for the pre-warmed standby-PtyEngine-per-project
-    registry (issue #136) -- project ids also restart at 1 in every test's
-    fresh tmp db, so a leftover (fake) standby from one test must never be
-    handed to an unrelated test's identically-numbered project."""
-    monkeypatch.setattr(session_runner, "_standby_engines", {})
-
-
-@pytest.fixture(autouse=True)
 def _isolated_stream_json_engines(monkeypatch):
     """Same story again, but for the resident StreamJsonEngine-per-card_id
-    registry a grilling card now uses (issue #184) -- mirrors
-    `_isolated_pty_engines` above exactly, for the same reason."""
+    registry (issue #87/#184; the only engine transport since issue #225
+    removed `PtyEngine`) -- card_id values restart at 1 in every test's
+    fresh tmp db too, so a leftover (fake) engine from one test must never
+    be handed to an unrelated test's identically-numbered card_id."""
     monkeypatch.setattr(session_runner, "_stream_json_engines", {})
 
 
 @pytest.fixture(autouse=True)
 def _isolated_standby_stream_json_engines(monkeypatch):
     """Same story again, but for the pre-warmed standby-StreamJsonEngine-
-    per-project registry a brand-new (grilling-phase) session now claims
-    from (issue #184) -- mirrors `_isolated_standby_engines` above exactly,
-    for the same reason."""
+    per-project registry a brand-new session claims from (issue #136/#184)
+    -- project ids also restart at 1 in every test's fresh tmp db, so a
+    leftover (fake) standby from one test must never be handed to an
+    unrelated test's identically-numbered project."""
     monkeypatch.setattr(session_runner, "_standby_stream_json_engines", {})
 
 
@@ -118,8 +103,8 @@ def _parser_session_engine_is_a_fake_by_default(monkeypatch):
     """`rhubarb.web.app.open_project` fire-and-forgets a per-project
     parser-session warm on every project open
     (`parser_session.ensure_parser_session`, issue #189). Unlike
-    `session_runner.py`'s own `PtyEngine`/`StreamJsonEngine` names (which
-    plenty of existing tests already monkeypatch via `_mock_engine`),
+    `session_runner.py`'s own `StreamJsonEngine` name (which plenty of
+    existing tests already monkeypatch via `_mock_engine`),
     `parser_session.py` imports the real `StreamJsonEngine` directly under
     its own name -- so left unpatched, EVERY existing test that opens a
     project (the overwhelming majority of tests/test_sessions.py and
@@ -169,10 +154,9 @@ def _no_real_stream_json_subprocess_spawns_by_default(monkeypatch):
     """`rhubarb.web.app.open_project` ALSO fire-and-forgets a pre-warmed
     STANDBY `StreamJsonEngine` on every open (`ensure_standby_stream_json_
     engine`, pre-existing since issue #184, unrelated to issue #189's own
-    parser-session addition above) -- and, unlike `PtyEngine`/
-    `StreamJsonEngine`-level mocking via `_mock_engine`, a handful of
-    existing tests never mock that class at all (e.g.
-    `test_pty_tab_count_lists_resident_and_standby_engines_with_model_
+    parser-session addition above) -- and, unlike `StreamJsonEngine`-level
+    mocking via `_mock_engine`, a handful of existing tests never mock that
+    class at all (e.g. `test_pty_tab_count_lists_resident_and_standby_engines_with_model_
     effort`, and the argv-capturing tests that intentionally leave the real
     class in place -- `_capture_real_stream_json_spawns`). On a machine
     where `claude` is genuinely installed on PATH (true for a real dev

@@ -22,21 +22,25 @@ triggers), asks the parser session to extract a structured question/options
 payload, and tags the (normalized, validated) result with the originating
 item's `card_id` as `source_session_id` so a consumer (issue #193's frontend
 routing) can route it back to the right card. It also owns issue #194's
-regex/Ollama-rescue fallback (see "Legacy fallback on parse failure" below):
-when the primary parser-session extraction fails for one queued item, that
-one item -- and only that item -- falls back to the pre-existing extraction
-pipeline instead of just returning an untagged failure. Routing itself
-(focused-card update vs. toast, including the failure-variant toast issue
-#194 also needs) is frontend work, out of scope for this module -- see
+fallback-on-parse-failure tagging (see "Legacy fallback on parse failure"
+below): when the primary parser-session extraction fails for one queued
+item, that failure is tagged distinctly (`"source": "fallback"`) instead of
+just returning an untagged failure -- issue #230 retired the regex/Ollama-
+rescue extraction chain that tag used to actually attempt as a second try,
+so a primary failure is now simply a tagged failure, with the
+parser-session pipeline as the one and only extraction mechanism. Routing
+itself (focused-card update vs. toast, including the failure-variant toast
+issue #194 also needs) is frontend work, out of scope for this module -- see
 `rhubarb/web/templates/prompt.html`'s `routeParsedResult`.
 
 ## Why a new module, not `session_runner._stream_json_engines`
 
-`session_runner.py` already holds two engine registries
-(`_pty_engines`/`_stream_json_engines`), but both are keyed by `card_id` --
-one resident engine per SESSION CARD, claimed/closed alongside that card's
-own lifecycle (`register_engine`/`_close_engine`, `ensure_standby_engine`/
-`claim_standby_engine`/`close_standby_engine`). A parser session is a
+`session_runner.py` already holds an engine registry (`_stream_json_engines`),
+keyed by `card_id` -- one resident engine per SESSION CARD, claimed/closed
+alongside that card's own lifecycle (`register_stream_json_engine`/
+`_close_stream_json_engine`, `ensure_standby_stream_json_engine`/
+`claim_standby_stream_json_engine`/`close_standby_stream_json_engine`). A
+parser session is a
 different kind of thing entirely: it belongs to a PROJECT, not a session
 card, has no "claim" step (it's never handed off/reassigned the way a
 standby engine is), and is never closed just because a project is closed or
@@ -61,8 +65,7 @@ import re
 from collections import deque
 from collections.abc import AsyncIterator
 
-from rhubarb.ollama_rescue import _is_valid_grilling_shape, rescue_grilling_response, should_attempt_grilling_rescue
-from rhubarb.qa_parser import parse_grilling_response
+from rhubarb.ollama_rescue import _is_valid_grilling_shape
 from rhubarb.stream_json_engine import StreamJsonEngine
 
 # One live `StreamJsonEngine` per project id -- in-memory only, exactly like
@@ -182,16 +185,16 @@ def close_all_parser_sessions() -> None:
 #
 # A parser session's whole point is to stay resident for a project's entire
 # lifetime (issue #189 above) rather than being respawned per turn the way
-# `session_runner._spawn_fresh_engine` replaces a card's PtyEngine to
+# `session_runner._spawn_fresh_stream_json_engine` replaces a card's engine to
 # "clear" it. That means its own conversation history only ever grows, so
 # left unchecked it would eventually fill its 1M-token context window and
 # start failing turns. PRD #187's fix: once its tracked usage crosses 60% of
 # that window, let whatever parse is already running finish untouched, then
 # send one `/clear` turn into the SAME still-open subprocess (same
 # `session_id`, only its conversation history resets -- NOT the
-# `_spawn_fresh_engine`-style respawn `PtyEngine` clearing uses, which this
-# module deliberately does not follow here; see #187's PRD body for why a
-# parser session's identity must survive a clear).
+# `_spawn_fresh_stream_json_engine`-style respawn-clearing `session_runner`
+# uses, which this module deliberately does not follow here; see #187's PRD
+# body for why a parser session's identity must survive a clear).
 # ---------------------------------------------------------------------------
 
 # Claude Code's own interactive statusline threshold this mirrors is a UI
@@ -381,16 +384,18 @@ def get_needs_input_queue(project_id: int) -> list[dict]:
 # needs-input queue (populated above by `enqueue_needs_input_turn`, fed by
 # `session_runner.handle_turn_completed`) one item at a time, in FIFO order,
 # sending each queued item's raw turn text through this project's parser
-# session (`stream_turn` above) with a prompt asking it to extract the
-# question(s)/options it contains as JSON. The parser session is a real
-# `claude` subprocess turn, not Ollama's schema-constrained generation, so
-# there is no way to force valid JSON out of it structurally -- instead this
-# asks for JSON in the prompt, then validates whatever text comes back
-# (`_extract_json_object` + `_is_valid_grilling_shape`, reused unmodified
-# from `ollama_rescue.py`'s own rescue-parsing pattern) and rejects anything
-# that doesn't match, exactly like `ollama_rescue.rescue_grilling_response`
-# already does for its own (schema-constrained, but still separately
-# validated) Ollama responses.
+# session (`stream_turn` above), invoking the `rhubarb` plugin's
+# `/rhubarb:parse-interview` skill (issue #228, `gh issue view 228`) to
+# extract the question(s)/options it contains as JSON -- see
+# `_build_extraction_prompt` below. The parser session is a real `claude`
+# subprocess turn, not Ollama's schema-constrained generation, so there is
+# no way to force valid JSON out of it structurally -- instead this asks
+# for JSON via the skill's own instructions, then validates whatever text
+# comes back (`_extract_json_object` + `_is_valid_grilling_shape`, reused
+# unmodified from `ollama_rescue.py`'s own rescue-parsing pattern) and
+# rejects anything that doesn't match, exactly like `ollama_rescue.
+# rescue_grilling_response` already does for its own (schema-constrained,
+# but still separately validated) Ollama responses.
 #
 # Output schema: reuses the existing grilling-rescue shape (`header`,
 # `questions: [{id, text, kind, options, recommended, recommended_text}]`,
@@ -420,47 +425,25 @@ def get_needs_input_queue(project_id: int) -> list[dict]:
 # `_process_one_queued_item` call per item.
 # ---------------------------------------------------------------------------
 
-_EXTRACTION_PROMPT_TEMPLATE = (
-    "The following text is the complete, final reply a Claude Code assistant "
-    'just gave for one turn during Rhubarb\'s "{phase}" phase. It has '
-    "already been flagged as needing a human's input before that session "
-    "can usefully continue. Extract the question(s) it is actually asking "
-    "(or the choice(s) it is waiting on) as JSON matching exactly this "
-    "shape, and respond with ONLY that JSON object -- no other prose, no "
-    "code fences, no markdown:\n\n"
-    '{{"header": <free text before the first question, or the whole text '
-    'if there is no clear question in it>, "questions": [{{"id": <a short '
-    'stable string id, e.g. "q1">, "text": <the question itself, verbatim '
-    'or lightly cleaned up>, "kind": "single" | "multi" | "open", '
-    '"options": <array of option strings verbatim, or null if this '
-    'question is open-ended>, "recommended": <array of 1-based indexes '
-    'into "options" that were recommended, or null>, "recommended_text": '
-    "<free-text recommendation for an open-ended question, or null>}}, "
-    '...], "footer": <free text after the last question, or "" if '
-    "none>}}\n\n"
-    'Use "single" for a pick-one choice, "multi" for a pick-several '
-    'choice, and "open" (with "options" and "recommended" both null) for '
-    "anything without discrete options -- free-text questions still go in "
-    '"questions" with "kind": "open". If the text genuinely contains no '
-    "question at all (this should be rare, since it was already flagged "
-    'as needing input), return "questions": [] with the whole text as '
-    '"header" and "" as "footer".\n\n'
-    "CRITICAL SPLITTING RULE: if the text contains multiple distinct "
-    "questions, each question MUST be a separate object in the "
-    '"questions" array -- never combine two or more questions into a '
-    "single entry. A question is distinct if it asks about a different "
-    "topic, offers a different set of options, or calls for a separate "
-    'recommendation. Use these signals to find question boundaries: '
-    '(1) explicit "Question N:" markers (e.g. "Question 1:", '
-    '"Question 2:") -- each N is a separate entry; '
-    "(2) numbered question lists (e.g. lines starting with "
-    '"1.", "2.", "3.") -- each number starts a new separate entry; '
-    "(3) structural separation such as blank lines or horizontal rules "
-    "between self-contained question blocks. When in doubt, split rather "
-    "than merge -- a Rhubarb UI card is rendered per entry, so merging "
-    "collapses distinct questions into one unreadable block.\n\n"
-    "Text:\n{text}"
-)
+def _build_extraction_prompt(*, phase: str, text: str) -> str:
+    """Build the turn-extraction prompt sent to this project's parser
+    session -- invokes the `rhubarb` plugin's `/rhubarb:parse-interview`
+    skill (`rhubarb/claude_plugin/skills/parse-interview/SKILL.md`) rather
+    than inlining the extraction rules here (issue #228, `gh issue view
+    228`/`gh issue view 227`). The skill is discoverable by every
+    `claude` subprocess Rhubarb spawns via `--plugin-dir`
+    (`stream_json_engine.py`'s `_build_args`/`cli_client._plugin_args`),
+    regardless of the target project's own `cwd`, exactly like the
+    existing `/rhubarb:grilling`/`/rhubarb:implement` invocations
+    `session_runner.py` already sends.
+
+    `phase`/`text` are passed the same way for every phase that routes
+    through this extraction path (grilling, QA, QA-grilling, implement) --
+    no phase-specific branching -- as a labeled `phase:` line followed by
+    a `Text:` block carrying the turn's raw text verbatim, mirroring the
+    `prd: <N>` labeled-argument convention `/rhubarb:implement` already
+    uses for its own structured argument."""
+    return f"/rhubarb:parse-interview phase: {phase}\n\nText:\n{text}"
 
 
 def _extract_json_object(text: str) -> dict | None:
@@ -497,6 +480,381 @@ def _extract_json_object(text: str) -> dict | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Post-extraction validation + single corrective retry (issue #229, `gh
+# issue view 229` for full context; parent PRD #227, `gh issue view 227`).
+#
+# The `/rhubarb:parse-interview` skill invocation above (issue #228) still
+# runs as an ordinary free-form `claude` turn -- there is no structural way
+# to force it to preserve every `Recommended:` line or bulleted options
+# list, only prose instructions asking it to. This section adds a cheap,
+# local (no extra LLM call) sanity check comparing the skill's returned JSON
+# against simple textual signals in the turn's own raw reply, so a silent
+# drop (the root cause PRD #227 describes) gets caught and given one chance
+# to self-correct before being accepted as-is.
+#
+# Two independent signals, both heuristic/approximate by design (PRD #227's
+# explicit call: "this doesn't need to be perfectly precise, just catch the
+# 'options went from present to null/empty' case"):
+#   1. How many `Recommended:`/`Recommended text:` lines the raw text
+#      contains vs. how many questions in the JSON actually ended up with a
+#      populated `recommended`/`recommended_text` field.
+#   2. Per question, how many bulleted option-looking lines appear near that
+#      question's own text vs. the length of its returned `options` array.
+#
+# On a mismatch, exactly one retry (`_retry_extraction_once`) is sent to the
+# SAME parser session, naming the specific mismatch(es) found, asking for a
+# corrected full JSON object. If the retry's own result still fails the same
+# check, the affected question(s) -- and only those -- are tagged
+# `"extraction_incomplete": True` (additive; absent, never `False`, on
+# questions that don't need it) and the result is returned as-is. Nothing
+# in this section ever raises -- a retry-turn failure (dead session,
+# unparseable/invalid-shape response) is treated exactly like "the retry
+# didn't fix it", never a hard error, per PRD #227's "never error, never
+# loop further" requirement.
+# ---------------------------------------------------------------------------
+
+_RECOMMENDED_TEXT_LINE_RE = re.compile(r"recommended\s+text\s*:", re.IGNORECASE)
+_RECOMMENDED_PLAIN_LINE_RE = re.compile(r"recommended\s*:", re.IGNORECASE)
+_BULLET_LINE_RE = re.compile(r"(?m)^[ \t]*[-*•][ \t]+\S")
+_QUESTION_MARKER_RE = re.compile(r"❓")  # the "❓" emoji marking a `❓ **Qn**` question header
+
+
+def _count_recommended_signals(text: str) -> int:
+    """How many `Recommended:`/`Recommended text:` lines appear anywhere in
+    `text`, case-insensitively. The two patterns never double-count the same
+    occurrence -- `Recommended text:` has ` text` between `Recommended` and
+    the colon, so it never also matches the plain `Recommended:` pattern
+    (which requires the colon immediately after `Recommended`, only
+    whitespace allowed in between)."""
+    return len(_RECOMMENDED_TEXT_LINE_RE.findall(text)) + len(_RECOMMENDED_PLAIN_LINE_RE.findall(text))
+
+
+def _question_has_populated_recommendation(question: dict) -> bool:
+    """True if `question`'s `recommended` (a non-empty list) or
+    `recommended_text` (a non-empty/non-whitespace string) is actually
+    populated -- `None`, `[]`, and `""`/whitespace-only all count as "not
+    populated", matching what a real dropped recommendation looks like."""
+    recommended = question.get("recommended")
+    recommended_text = question.get("recommended_text")
+    return bool(recommended) or bool(recommended_text and recommended_text.strip())
+
+
+def _count_bullet_lines(block: str) -> int:
+    """How many lines in `block` look like a bulleted option (`- `, `* `, or
+    `• ` at the start of a line, ignoring leading whitespace)."""
+    return len(_BULLET_LINE_RE.findall(block))
+
+
+def _split_into_question_blocks(raw_text: str, n_questions: int) -> list[str]:
+    """Best-effort split of `raw_text` into one substring per question, in
+    order, so each question's own nearby-bullets/recommended-line check
+    looks at roughly the right slice of text rather than the whole turn.
+
+    Splits on `❓ **Qn**`-style question markers (the format the
+    grilling/QA/implement skills actually emit -- see `parse-interview`'s
+    own `SKILL.md`) when there are at least as many markers as questions,
+    each block running from one marker up to the next (or end of text).
+    When there aren't enough markers to reliably attribute one to each
+    question (a turn with no markers at all, or fewer markers than
+    questions -- e.g. plain prose, or a format this heuristic doesn't
+    recognize), falls back to handing every question the ENTIRE raw text --
+    a strictly more permissive (never false-negative-inducing on a truly
+    missing signal) fallback than guessing wrong boundaries; `n_questions`
+    of 0 returns an empty list."""
+    if n_questions <= 0:
+        return []
+
+    marker_starts = [m.start() for m in _QUESTION_MARKER_RE.finditer(raw_text)]
+    if len(marker_starts) < n_questions:
+        return [raw_text] * n_questions
+
+    bounds = marker_starts[:n_questions] + [len(raw_text)]
+    return [raw_text[bounds[i] : bounds[i + 1]] for i in range(n_questions)]
+
+
+def _detect_extraction_mismatches(raw_text: str, data: dict) -> list[dict]:
+    """Compare `data` (an already schema-valid grilling-shape payload)
+    against `raw_text` and return a list of `{"index", "id", "reasons"}`
+    dicts, one per question that looks like it lost something -- empty when
+    nothing looks wrong. `index` is the question's position in
+    `data["questions"]`, `id` is its own `"id"` field (for a human-readable
+    retry prompt), and `reasons` is a list of short strings naming exactly
+    what looked off.
+
+    Per-question checks (against that question's own slice from
+    `_split_into_question_blocks`): a `Recommended:`/`Recommended text:`
+    line present in the slice but no populated `recommended`/
+    `recommended_text` on the question, and/or bulleted lines present in
+    the slice but an empty/null `"options"` array.
+
+    Falls back to one aggregate, turn-wide check -- attributed to question 0
+    as a best-effort target -- only when the per-question checks above found
+    nothing AND the raw text's total `Recommended:`/`Recommended text:`
+    count still doesn't match the number of questions with a populated
+    recommendation; this catches a real drop in a turn whose format the
+    per-question splitter couldn't reliably attribute (e.g. no `❓`
+    markers at all)."""
+    questions = data.get("questions") or []
+    blocks = _split_into_question_blocks(raw_text, len(questions))
+
+    mismatches = []
+    for index, question in enumerate(questions):
+        block = blocks[index] if index < len(blocks) else raw_text
+        reasons = []
+
+        if _count_recommended_signals(block) > 0 and not _question_has_populated_recommendation(question):
+            reasons.append(
+                "raw text has a Recommended:/Recommended text: line for this question, but its "
+                "'recommended'/'recommended_text' field came back empty"
+            )
+
+        bullet_count = _count_bullet_lines(block)
+        options = question.get("options") or []
+        if bullet_count > 0 and not options:
+            reasons.append(
+                f"raw text appears to list {bullet_count} bulleted option line(s) near this question, "
+                "but its 'options' array came back empty/null"
+            )
+
+        if reasons:
+            mismatches.append({"index": index, "id": question.get("id"), "reasons": reasons})
+
+    if not mismatches and questions:
+        raw_count = _count_recommended_signals(raw_text)
+        populated_count = sum(1 for q in questions if _question_has_populated_recommendation(q))
+        # One-directional deliberately: only `raw_count > populated_count`
+        # (the raw text names more recommendations than the JSON reflects)
+        # is "something was dropped." `populated_count > raw_count` is NOT
+        # flagged -- it means the JSON reflects a recommendation this cheap
+        # substring count didn't literally see (e.g. paraphrased text, or a
+        # test/caller-supplied `text` that's shorter than a real turn's raw
+        # reply), which is not the drop this check exists to catch and would
+        # otherwise misfire a retry on perfectly good extractions.
+        if raw_count > populated_count:
+            mismatches.append(
+                {
+                    "index": 0,
+                    "id": questions[0].get("id"),
+                    "reasons": [
+                        f"raw text has {raw_count} Recommended:/Recommended text: occurrence(s) overall, "
+                        f"but only {populated_count} question(s) in the returned JSON have a populated "
+                        "recommendation"
+                    ],
+                }
+            )
+
+    return mismatches
+
+
+def _build_retry_prompt(*, phase: str, text: str, mismatches: list[dict]) -> str:
+    """Build the corrective follow-up prompt sent for issue #229's single
+    retry -- re-invokes the same `/rhubarb:parse-interview` skill (so the
+    parser session re-reads its own extraction rules) but leads with exactly
+    what `_detect_extraction_mismatches` found, naming each affected
+    question's index/id and reason, so the second attempt has a concrete
+    signal to act on instead of a blind "try again."""
+    mismatch_lines = []
+    for mismatch in mismatches:
+        id_suffix = f' (id "{mismatch["id"]}")' if mismatch.get("id") else ""
+        for reason in mismatch["reasons"]:
+            mismatch_lines.append(f"- question index {mismatch['index']}{id_suffix}: {reason}")
+
+    return (
+        f"/rhubarb:parse-interview phase: {phase}\n\n"
+        "Your previous JSON extraction of the text below appears to have dropped information. "
+        "Specifically:\n" + "\n".join(mismatch_lines) + "\n\n"
+        "Please re-extract the SAME text and reply with a corrected, complete JSON object -- fixing "
+        "only the issue(s) named above; every other question/field should stay exactly as it should "
+        "already be. Reply with ONLY the JSON object, no other prose.\n\n"
+        f"Text:\n{text}"
+    )
+
+
+def _tag_extraction_incomplete(data: dict, mismatches: list[dict]) -> dict:
+    """Return a copy of `data` with `"extraction_incomplete": True` added to
+    every question at an index named in `mismatches` -- every other
+    question, and every other field on the affected ones, is left exactly
+    as `data` already had it. Additive/backward-compatible: a question with
+    no mismatch never gets the field at all (never explicitly `False`), and
+    `data` itself is never mutated in place. A `mismatches` of `[]` (the
+    retry actually fixed everything) returns `data` completely unchanged."""
+    if not mismatches:
+        return data
+
+    affected_indices = {mismatch["index"] for mismatch in mismatches}
+    questions = data.get("questions") or []
+    tagged_questions = []
+    for index, question in enumerate(questions):
+        if index in affected_indices:
+            question = dict(question)
+            question["extraction_incomplete"] = True
+        tagged_questions.append(question)
+
+    tagged_data = dict(data)
+    tagged_data["questions"] = tagged_questions
+    return tagged_data
+
+
+async def _retry_extraction_once(
+    project_id: int,
+    item: dict,
+    first_data: dict,
+    first_mismatches: list[dict],
+    *,
+    validator=_is_valid_grilling_shape,
+) -> dict:
+    """Send exactly one corrective retry turn to `project_id`'s parser
+    session for `item`, naming `first_mismatches` (already found in
+    `first_data`), and return whichever data should be treated final:
+
+    - The retry's own response, re-validated the same way as a primary
+      extraction (`_extract_json_object` + `validator`) and re-checked with
+      `_detect_extraction_mismatches` against the SAME raw text -- if that
+      response is usable, it wins even if it's still imperfect (tagged with
+      `_tag_extraction_incomplete` for whatever the retry itself still got
+      wrong, which may differ from `first_mismatches`), since it's "whatever
+      the last attempt produced."
+    - `first_data` itself, tagged with `first_mismatches`, if the retry
+      turn fails outright (dead/missing session, or any other exception) or
+      comes back unparseable/schema-invalid -- there is nothing better to
+      prefer, and this function must never raise or attempt a second retry.
+
+    `validator` defaults to `_is_valid_grilling_shape` (the flat
+    grilling/QA/implement shape) -- the only shape `extract_with_validation`
+    below ever actually calls this with a retry for today (its nested
+    QA-grilling shape opts out of mismatch-detection/retry entirely, see that
+    function's own docstring), but this stays parameterized rather than
+    hardcoded so a future caller for a different shape isn't structurally
+    blocked from reusing it.
+
+    Exactly one `stream_turn` call happens here, no matter which branch is
+    taken -- this function is only ever invoked once per queued item, from
+    `_process_one_queued_item`/`extract_with_validation`, and never calls
+    itself or loops."""
+    retry_prompt = _build_retry_prompt(phase=item["phase"], text=item["text"], mismatches=first_mismatches)
+
+    try:
+        retry_result_text = None
+        async for event in stream_turn(project_id, retry_prompt):
+            if event.get("type") == "result":
+                retry_result_text = event.get("result")
+    except Exception:  # noqa: BLE001 -- a failed retry falls back to the first attempt, never raises
+        return _tag_extraction_incomplete(first_data, first_mismatches)
+
+    if retry_result_text is None:
+        return _tag_extraction_incomplete(first_data, first_mismatches)
+
+    retry_data = _extract_json_object(retry_result_text)
+    if retry_data is None or not validator(retry_data):
+        return _tag_extraction_incomplete(first_data, first_mismatches)
+
+    retry_mismatches = _detect_extraction_mismatches(item["text"], retry_data)
+    return _tag_extraction_incomplete(retry_data, retry_mismatches)
+
+
+# ---------------------------------------------------------------------------
+# Shared extraction entry point (PRD #227 follow-up, gap 1 -- discovered
+# during manual testing/design review after #228/#229/#230 were already
+# closed out in code: `gh issue view 227` for the parent PRD; #229's own
+# validation/retry/flagging logic above was wired into `_process_one_queued_
+# item` below (the async needs-input-queue consumer) but NOT into
+# `session_runner._extract_questions_via_parser_session` -- the function that
+# drives a turn completing LIVE in the open UI card, which is exactly the
+# path PRD #227's original bug (a dropped Recommended:/options list) was
+# reported on. `extract_with_validation` is the fix: the one implementation
+# of "call the skill, validate, retry once on mismatch, tag
+# extraction_incomplete", composed from the pieces above, that BOTH
+# `_process_one_queued_item` and `session_runner._extract_questions_via_
+# parser_session` now call, so there is never a second, divergent copy of
+# this behavior.
+# ---------------------------------------------------------------------------
+
+
+async def extract_with_validation(
+    project_id: int,
+    text: str,
+    *,
+    phase: str,
+    validator=_is_valid_grilling_shape,
+    detect_mismatches: bool = True,
+) -> dict | None:
+    """Drive `project_id`'s already-running parser session to extract
+    structured question/issue data out of `text` via the `/rhubarb:parse-
+    interview` skill (`_build_extraction_prompt`), validate the result
+    against `validator`, and -- when `detect_mismatches` is true -- run issue
+    #229's local Recommended:/bulleted-options mismatch check with its single
+    corrective retry before returning. This is the ONE shared implementation
+    both `_process_one_queued_item` (the async needs-input queue) and
+    `session_runner._extract_questions_via_parser_session` (a live turn's
+    synchronous extraction) call -- see the section header above for why this
+    exists as its own function.
+
+    `phase`/`text` pass straight through to `_build_extraction_prompt`, the
+    same uniform (no Python-side phase branching) invocation every phase
+    already used -- the skill's OWN instructions are what may branch on
+    `phase` now (see `SKILL.md`'s `qa_grilling_issues` section, PRD #227's
+    gap 2).
+
+    `validator` picks which schema the skill's response must match:
+    `_is_valid_grilling_shape` (default) for the flat `{header, questions,
+    footer}` shape grilling/QA/implement all use, or `ollama_rescue.
+    _is_valid_qa_shape` for the nested `{prd, issues: [{questions}]}` shape
+    QA-grilling's own issue-grouped display needs (see
+    `session_runner._extract_qa_issues_via_skill`).
+
+    `detect_mismatches` (default `True`) is issue #229's own validation/
+    retry/flagging step, which is built entirely around the flat shape's
+    single `"questions"` list (nearby-bullet/Recommended:-line counting
+    keyed to individual questions in that one list -- see
+    `_detect_extraction_mismatches`'s own docstring). It has deliberately NOT
+    been generalized to the nested QA-grilling `issues[].questions`
+    structure as part of this change: a caller using the nested shape
+    (`validator=_is_valid_qa_shape`) passes `detect_mismatches=False`,
+    skipping straight from a valid parse to a returned result with no
+    mismatch-retry safety net for that shape yet. This narrower scope (vs.
+    generalizing the mismatch detector itself) is a deliberate judgment call
+    given the size of that generalization -- a known follow-up gap, not
+    something silently dropped.
+
+    Returns, on a schema-valid response: for the flat shape,
+    `{header, questions, footer, source: "parser_session"}` (now possibly
+    carrying `extraction_incomplete: true` on individual questions); for the
+    nested shape (`detect_mismatches=False`), the skill's own parsed `{prd,
+    issues}` dict with `source: "parser_session"` added, unchanged otherwise.
+    Returns `None` on any failure -- a dead/missing parser session, a turn
+    that produced no `result` event, or a response that isn't valid JSON
+    matching `validator` -- the same failure contract `_extract_questions_
+    via_parser_session` already had before this refactor."""
+    prompt = _build_extraction_prompt(phase=phase, text=text)
+
+    try:
+        result_text = None
+        async for event in stream_turn(project_id, prompt):
+            if event.get("type") == "result":
+                result_text = event.get("result")
+    except Exception:  # noqa: BLE001 -- a dead/failed parser session is just "extraction failed"
+        return None
+
+    if result_text is None:
+        return None
+
+    data = _extract_json_object(result_text)
+    if data is None or not validator(data):
+        return None
+
+    if not detect_mismatches:
+        return {**data, "source": "parser_session"}
+
+    mismatches = _detect_extraction_mismatches(text, data)
+    if mismatches:
+        data = await _retry_extraction_once(
+            project_id, {"phase": phase, "text": text}, data, mismatches, validator=validator
+        )
+
+    return {"header": data["header"], "questions": data["questions"], "footer": data["footer"], "source": "parser_session"}
+
+
 def _tagged_success(item: dict, data: dict) -> dict:
     return {
         "source_session_id": item["card_id"],
@@ -509,57 +867,39 @@ def _tagged_success(item: dict, data: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Legacy fallback on parse failure (issue #194, `gh issue view 194` for full
-# context).
+# Legacy fallback on parse failure (issue #194, `gh issue view 194` for
+# original context; retired by issue #230, `gh issue view 230`).
 #
 # When a queued item's primary extraction (via this project's parser
 # session, above) errors, times out, or comes back not matching the
-# expected schema, that one turn -- and ONLY that turn -- falls back to the
-# pre-existing regex-parser + Ollama-rescue extraction pipeline
-# (`qa_parser.parse_grilling_response` / `ollama_rescue.
-# rescue_grilling_response`) instead of just giving up. This is the exact
-# same chain `session_runner.py`'s own grilling-turn handling already uses
-# (see e.g. `session_runner._run_grilling_turn`): the free, deterministic
-# regex parser first, and only if THAT comes back with no questions AND the
-# raw text still looks like it was trying to contain one
-# (`should_attempt_grilling_rescue`'s trigger check) does this spend an
-# Ollama call on it.
+# expected schema, that one turn used to fall back to a regex-parser +
+# Ollama-rescue extraction pipeline (`qa_parser.parse_grilling_response` /
+# `ollama_rescue.rescue_grilling_response`) instead of just giving up.
+# Issue #230 confirmed that chain fully dead/retired across every phase that
+# uses this pipeline (grilling, QA, QA-grilling, implement all now go
+# through the parser-session/`/rhubarb:parse-interview` skill uniformly, with
+# no per-phase fallback machinery) and removed it -- `_legacy_fallback_
+# extract` below is kept only as the named call site `_fallback_or_failure`
+# already has, now always returning `None` (there is nothing left to fall
+# back TO), so a primary extraction failure is just a tagged failure.
 #
 # Retry-per-turn, not a permanent downgrade (PRD #187's explicit
 # requirement): nothing here reads or writes any project-level or
 # session-level state. Every call to `_process_one_queued_item` decides
-# primary-vs-fallback fresh, purely from whether THIS item's own primary
+# primary-vs-failure fresh, purely from whether THIS item's own primary
 # attempt succeeded -- so a project that just had a failure is attempted via
 # the parser session completely normally on its very next queued item, and
 # a string of failures never accumulates into any kind of sticky "this
 # project is on the fallback pipeline now" state.
 #
-# Tagging: a successful fallback extraction is returned as an `ok: True`
-# result (`_tagged_fallback_success`) shaped exactly like a primary success
-# (see `_tagged_success` above) so it flows through issue #193's existing
-# routing (focused-card update or a held-result toast) completely
-# unmodified -- the only difference is `"source": "fallback"` instead of
-# `"source": "parser_session"`, which is what `prompt.html`'s routing keys
-# off of to ALSO raise a distinct failure-variant toast alongside that
-# routing, telling the user parsing degraded for this turn (issue #188's
-# toast component). If the fallback extraction ALSO fails to produce a
-# usable question (the regex parser and, if attempted, Ollama rescue both
-# come up empty), there is genuinely nothing to route -- this returns an
-# `ok: False` result, still tagged `"source": "fallback"` so the frontend
-# still raises the failure-variant toast (visibility over silence is the
-# whole point of this issue) even though there is no question to show.
+# Tagging: every result from a failed primary extraction is tagged
+# `"source": "fallback"` (`_tagged_fallback_failure`) -- distinct from a
+# clean primary success's `"source": "parser_session"` -- so `prompt.html`'s
+# routing can still raise its failure-variant toast (issue #188's toast
+# component) telling the user parsing failed for this turn, even though
+# there is no longer any second extraction attempt that might recover a
+# usable question from it.
 # ---------------------------------------------------------------------------
-
-
-def _tagged_fallback_success(item: dict, data: dict) -> dict:
-    return {
-        "source_session_id": item["card_id"],
-        "ok": True,
-        "header": data["header"],
-        "questions": data["questions"],
-        "footer": data["footer"],
-        "source": "fallback",
-    }
 
 
 def _tagged_fallback_failure(item: dict, *, error: str) -> dict:
@@ -567,40 +907,31 @@ def _tagged_fallback_failure(item: dict, *, error: str) -> dict:
 
 
 async def _legacy_fallback_extract(text: str) -> dict | None:
-    """The pre-existing regex-parser + Ollama-rescue extraction chain, run
-    on one failed item's raw turn `text` -- mirrors `session_runner.py`'s
-    own grilling-turn extraction order exactly (regex first, Ollama rescue
-    only if the regex came back empty AND the text still looks like it was
-    trying to contain a question). `rescue_grilling_response` is a blocking
-    HTTP call, so it's run via `asyncio.to_thread`, same as every other
-    call site of it in `session_runner.py`.
-
-    Returns the parsed `{header, questions, footer, source}` dict only when
-    it actually carries at least one question, `None` otherwise (a genuine
-    "nothing extractable" outcome -- the regex parser found nothing and
-    either the trigger check said not to bother with Ollama, or Ollama
-    rescue was tried and also came back empty/unavailable)."""
-    parsed = parse_grilling_response(text)
-    if not parsed["questions"] and should_attempt_grilling_rescue(parsed, text):
-        rescued = await asyncio.to_thread(rescue_grilling_response, text)
-        if rescued is not None:
-            parsed = rescued
-    return parsed if parsed["questions"] else None
+    """Issue #230: the pre-existing regex-parser + Ollama-rescue extraction
+    chain (`qa_parser.parse_grilling_response` / `ollama_rescue.
+    rescue_grilling_response`) that used to run here on one failed item's raw
+    turn `text` is fully retired -- the parser-session/`/rhubarb:parse-
+    interview` skill pipeline is the ONLY extraction mechanism now, uniformly
+    across every phase, so there is nothing left to fall back to. Always
+    returns `None` (a genuine "nothing extractable" outcome, matching how
+    `session_runner._extract_questions_via_parser_session` already reports
+    its own failures) -- kept as a named function only so `_fallback_or_
+    failure` below has a stable call site documenting where a future
+    fallback mechanism, if any is ever added, would plug back in."""
+    return None
 
 
 async def _fallback_or_failure(item: dict, *, primary_error: str) -> dict:
     """Called from every failure branch of `_process_one_queued_item` below
-    once the primary parser-session extraction has failed -- attempts issue
-    #194's legacy fallback extraction on `item`'s own raw text, and returns
-    whichever tagged result that produces (`_tagged_fallback_success` if it
-    found a usable question, `_tagged_fallback_failure` -- still carrying
-    `primary_error` -- if it didn't). Always tagged `"source": "fallback"`
-    one way or the other, so the frontend can always tell a primary failure
-    happened and raise its failure-variant toast, whether or not the
-    fallback itself managed to recover a question."""
+    once the primary parser-session extraction has failed. Issue #230
+    retired the legacy regex/Ollama-rescue fallback `_legacy_fallback_extract`
+    used to attempt here -- it now always returns `None`, so this always
+    returns `_tagged_fallback_failure` (still carrying `primary_error`),
+    tagged `"source": "fallback"` so the frontend can always tell a primary
+    failure happened and raise its failure-variant toast."""
     fallback = await _legacy_fallback_extract(item["text"])
     if fallback is not None:
-        return _tagged_fallback_success(item, fallback)
+        raise AssertionError("unreachable: _legacy_fallback_extract always returns None (issue #230)")
     return _tagged_fallback_failure(item, error=primary_error)
 
 
@@ -613,35 +944,37 @@ async def _process_one_queued_item(project_id: int, item: dict) -> dict:
     can branch on `ok` without needing to know anything about why a failure
     happened.
 
-    Never raises: a dead/missing parser session (`stream_turn`'s
-    `LookupError`), a subprocess crash that exhausts `stream_turn`'s own
-    retry (`StreamJsonEngineUnrecoverableError`), a turn that ends without
-    ever producing a `result` event, unparseable JSON, or JSON that parses
-    but doesn't match the expected shape are all just different reasons the
-    primary path is considered failed -- each one hands off to
-    `_fallback_or_failure` rather than raising, so one bad turn (even one
-    whose fallback also comes up empty) can never take down
-    `drain_needs_input_queue`'s processing of the rest of the queue."""
-    prompt = _EXTRACTION_PROMPT_TEMPLATE.format(phase=item["phase"], text=item["text"])
+    The actual extraction (build the skill prompt, send the turn, validate,
+    retry once on a detected mismatch, tag `extraction_incomplete`) is
+    `extract_with_validation` above -- the shared implementation this
+    function no longer duplicates (PRD #227 follow-up, gap 1: this used to
+    inline all of that here, which is exactly why `session_runner.
+    _extract_questions_via_parser_session`'s own copy of the live-turn path
+    could silently drift out of sync with it). This function's only jobs now
+    are queue-specific: turning a `None` (any failure -- dead/missing parser
+    session, no `result` event, unparseable JSON, or a response that doesn't
+    match the expected schema; `extract_with_validation` itself never raises)
+    into `_fallback_or_failure`'s tagged-failure shape, and wrapping a
+    successful extraction in `_tagged_success`'s `source_session_id`/`ok`
+    envelope.
 
+    Never raises: `extract_with_validation` swallows every failure mode
+    itself and returns `None` rather than propagating, and the defensive
+    `try`/`except` here exists only so a bug in that contract still can't
+    take down `drain_needs_input_queue`'s processing of the rest of the
+    queue."""
     try:
-        result_text = None
-        async for event in stream_turn(project_id, prompt):
-            if event.get("type") == "result":
-                result_text = event.get("result")
+        data = await extract_with_validation(project_id, item["text"], phase=item["phase"])
     except Exception as exc:  # noqa: BLE001 -- any subprocess/engine failure is a per-item failure, not a crash
         return await _fallback_or_failure(item, primary_error=str(exc))
 
-    if result_text is None:
-        return await _fallback_or_failure(item, primary_error="parser session turn produced no result event")
-
-    data = _extract_json_object(result_text)
     if data is None:
-        return await _fallback_or_failure(item, primary_error="parser session response was not valid JSON")
-
-    if not _is_valid_grilling_shape(data):
         return await _fallback_or_failure(
-            item, primary_error="parser session response did not match the expected question schema"
+            item,
+            primary_error=(
+                "parser session extraction failed: no result event, unparseable JSON, or a response that "
+                "did not match the expected question schema"
+            ),
         )
 
     return _tagged_success(item, data)
@@ -660,7 +993,7 @@ async def drain_needs_input_queue(project_id: int) -> AsyncIterator[dict]:
     """Pop and process `project_id`'s needs-input queue (issue #191) one
     item at a time, oldest first, until it's empty -- the actual FIFO
     dispatch loop issue #192 adds. Yields each item's tagged result
-    (`_tagged_success`, or -- issue #194 -- `_tagged_fallback_success`/
+    (`_tagged_success`, or -- issue #194, retired by #230 --
     `_tagged_fallback_failure` once the primary path has failed) as soon as
     that item finishes, so a caller can react per-result rather than
     waiting for the whole queue.

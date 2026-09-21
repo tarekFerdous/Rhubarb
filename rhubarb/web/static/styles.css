@@ -733,6 +733,26 @@ textarea.prompt-box:focus {
   margin: 0 0 16px;
 }
 
+/* Issue #231 (PRD #227): per-question extraction_incomplete indicator --
+   same warning pill language as .rescue-source-badge above (amber pill,
+   small bold text) since both flag "extraction may be unreliable here,"
+   but inline/compact so it sits beside a single question's header text
+   instead of the block-level banner .rescue-source-badge is. Purely
+   informational -- never affects the option buttons/textarea/"Something
+   else?" controls rendered alongside it. */
+.extraction-incomplete-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(217, 119, 6, 0.15);
+  color: #b45309;
+  font-size: 0.68rem;
+  font-variation-settings: "MONO" 0, "CASL" 0, "wght" 700, "slnt" 0, "CRSV" 0;
+  margin-left: 8px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
 /* Headroom token-savings widget (issue #205, part of PRD #202) -- a
    two-line variant of the compact-badge pattern above (.rescue-source-badge
    /.session-card-badge: pill-ish shape, small muted text, no new visual
@@ -1054,42 +1074,6 @@ textarea.prompt-box:focus {
 
 .pty-tab-count {
   margin-left: 2px;
-}
-
-.terminal-view {
-  flex: 1;
-  min-height: 160px;
-  border-radius: 20px;
-  overflow: hidden;
-  padding: 8px;
-  background: #000;
-}
-
-/* Passthrough typing indicator (issue #167) -- same small-pill shape as
-   .rescue-source-badge, same warning color as .modal-warning-text, so it
-   reads as "notice" rather than "error". Toggled via the `hidden` attribute,
-   not a CSS class, matching every other transient indicator in this file. */
-.passthrough-indicator {
-  display: inline-block;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: rgba(217, 119, 6, 0.15);
-  color: #b45309;
-  font-size: 0.7rem;
-  margin-left: 8px;
-  vertical-align: middle;
-}
-
-/* xterm.js's own root element defaults to a content-driven height (tall
-   enough for all 50 fixed rows, easily taller than this panel's actual
-   flex-allotted space) unless explicitly bounded -- without this, that
-   excess height was being clipped by .terminal-view's own overflow:hidden
-   (kept above for the panel's rounded corners) instead of being handled by
-   xterm's own internal .xterm-viewport scrollbar, which is otherwise fully
-   functional. Constraining xterm's own element to the parent's actual
-   height lets that internal scrolling work as designed. */
-.terminal-view .terminal {
-  height: 100% !important;
 }
 
 .usage-indicator {

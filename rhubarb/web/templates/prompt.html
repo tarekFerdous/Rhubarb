@@ -5,18 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Rhubarb</title>
   <link rel="stylesheet" href="/static/styles.css" />
-  <!-- Live PTY terminal view (issue #88): xterm.js, pinned, MIT-licensed --
-       correctly renders the ANSI/control-character stream the interactive
-       `claude` PTY actually produces, instead of dumping raw text into a
-       <pre>. -->
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
-  <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
-  <!-- Fit addon (issue #166): recomputes cols/rows from the panel's actual
-       pixel size on resize, replacing the old fixed-200-column /
-       font-shrinking approach (see resizeTerminalToFit below). Same CDN,
-       version pinned to match xterm@5.3.0 (the last major xterm-addon-fit
-       line published under the unscoped package name). -->
-  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
   <!-- Markdown rendering (issue #212): marked.js converts free-form Claude
        prose in the left card (preamble, blocked-session question/context,
        interview header/footer) from raw text to formatted HTML so bold,
@@ -24,17 +12,14 @@
        breaks:true so single \n becomes <br>, matching Claude's output style. -->
   <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
   <script>marked.use({ breaks: true });</script>
-  <!-- Grilling structured block feed (issue #186, step 3 of PRD #182): for a
-       grilling card running under the new stream-json engine
-       (rhubarb/stream_json_engine.py, issue #184), the Live Terminal panel
-       shows this plain block feed -- full assistant text, one-line tool-call
-       summaries -- instead of the raw xterm.js terminal above. Deliberately
-       NOT styled to look like a terminal (no monospace, no dark console
-       chrome): the issue is explicit that this is a distinct feed, not a
-       fake terminal. Every other card type (any `PtyEngine`-backed session)
-       keeps the untouched `.terminal-view` xterm rendering -- see
-       setLiveTerminalFeedMode()/applyTerminalViewVisibility() in the script
-       below for how the two sibling panels are toggled. -->
+  <!-- Structured block feed (issue #186, step 3 of PRD #182; issue #225
+       made it the ONLY Live Terminal rendering, once every phase moved to
+       the stream-json engine, rhubarb/stream_json_engine.py): full
+       assistant text, one-line tool-call summaries. Deliberately NOT styled
+       to look like a raw terminal (no monospace, no dark console chrome) --
+       see applyTerminalViewVisibility() in the script below for the panel's
+       show/hide toggle (independent of the "hide Live Terminal" user
+       preference). -->
   <style>
     .grilling-feed-view {
       flex: 1;
@@ -147,23 +132,17 @@
     <div class="card middle">
       <p class="console-title">
         Live Terminal
-        <!-- Passthrough typing indicator (issue #167): flashed briefly by
-             flashPassthroughIndicator() whenever the user types straight into
-             the live CLI process while an automated turn is running, so the
-             accepted keystroke/turn interleaving risk (see PRD #162) is
-             visible rather than silent. -->
-        <span id="passthrough-indicator" class="passthrough-indicator" hidden>typing during automated turn</span>
       </p>
-      <div id="terminal-view" class="terminal-view"></div>
-      <!-- Structured block feed sibling for a grilling card under the new
-           stream-json engine (issue #186) -- toggled opposite `terminal-view`
-           via `setLiveTerminalFeedMode()`, never shown at the same time. -->
-      <div id="grilling-feed-view" class="grilling-feed-view" hidden></div>
+      <!-- Structured block feed (issue #186; issue #225 made this the only
+           Live Terminal rendering) -- shown/hidden by
+           applyTerminalViewVisibility() per the "hide Live Terminal" user
+           preference. -->
+      <div id="grilling-feed-view" class="grilling-feed-view"></div>
     </div>
     <div class="card right">
       <p class="console-title">
         Sessions <span id="session-count" class="session-count"></span>
-        <span id="pty-tab-count" class="session-count pty-tab-count" title="Open PTY tabs"></span>
+        <span id="pty-tab-count" class="session-count pty-tab-count" title="Resident engine tabs"></span>
       </p>
       <p id="usage-indicator" class="usage-indicator"></p>
       <div class="scroll-wrap"><div id="session-queue" class="session-queue"></div></div>
@@ -522,7 +501,7 @@
   </div>
 
   <!-- Confirmation for the session-queue close button (issue #122): a
-       closed session's PtyEngine is killed outright, so this warns before
+       closed session's engine is killed outright, so this warns before
        an irreversible action. -->
   <div id="close-session-modal" class="modal-overlay" hidden>
     <div class="modal">
@@ -557,15 +536,12 @@
     // already-closed card can never resurrect it in the queue.
     const closedCardIds = new Set();
     let closeSessionTargetCardId = null;
-    // Structured block feed for a grilling card under the new stream-json
-    // engine (issue #186) -- replaces the Live Terminal panel's raw xterm
-    // rendering for such a card only. `liveTerminalFeedMode` toggles which
-    // of the two sibling panels (#terminal-view / #grilling-feed-view) is
-    // shown; `grillingFeedCurrentTextEl` is the paragraph currently
-    // accumulating this turn's streamed `text` deltas (issue #184), reset to
-    // null at each new block (an `action` event, or a resolved `turn`) so
-    // the next text delta starts a fresh paragraph instead of running on.
-    let liveTerminalFeedMode = false;
+    // Structured block feed (issue #186; issue #225 made it the ONLY Live
+    // Terminal rendering, once every phase moved to the stream-json engine).
+    // `grillingFeedCurrentTextEl` is the paragraph currently accumulating
+    // the in-flight turn's streamed `text` deltas, reset to null at each new
+    // block (an `action` event, or a resolved `turn`) so the next text
+    // delta starts a fresh paragraph instead of running on.
     let grillingFeedCurrentTextEl = null;
 
     const startForm = document.getElementById("start-form");
@@ -590,9 +566,7 @@
     const parallelImplementationToggleEl = document.getElementById("parallel-implementation-toggle");
     const parallelImplementationWarningEl = document.getElementById("parallel-implementation-warning");
     const terminalViewHiddenToggleEl = document.getElementById("terminal-view-hidden-toggle");
-    const terminalViewEl = document.getElementById("terminal-view");
     const grillingFeedViewEl = document.getElementById("grilling-feed-view");
-    const passthroughIndicatorEl = document.getElementById("passthrough-indicator");
     const ollamaEnabledToggleEl = document.getElementById("ollama-enabled-toggle");
     const ollamaToggleErrorEl = document.getElementById("ollama-toggle-error");
     const ollamaGateModalEl = document.getElementById("ollama-gate-modal");
@@ -827,11 +801,14 @@
     function phaseLabelText(phase) {
       return (
         {
-          grilling: "Ongoing Grilling Session...",
-          creating_prd: "Creating PRD...",
-          creating_issues: "Creating Issues...",
-          publishing: "Publishing to GitHub...",
-          details: "Done",
+          // Issue #226 (child of PRD #222): "Phase N: " prefixes, scoped
+          // strictly to these five do-flow phases -- every other entry below
+          // is untouched.
+          grilling: "Phase 1: Ongoing Grilling Session...",
+          creating_prd: "Phase 2: Creating PRD...",
+          creating_issues: "Phase 3: Creating Issues...",
+          publishing: "Phase 4: Publishing to GitHub...",
+          details: "Phase 5: Done",
           implementing: "Implementing...",
           implemented: "Implemented",
           qa_grilling: "Verifying implementation...",
@@ -843,12 +820,6 @@
 
     function showOnly(el) {
       [emptyStateEl, projectPickerEl, mainFlowEl, sessionStatusEl].forEach((e) => (e.hidden = e !== el));
-      // Every state transition calls showOnly() -- disabling terminal reply
-      // input here by default means only renderInterview/renderBlockedSession/
-      // renderStalledSession (issue #171) (and the "keep discussing"
-      // manual-reply fallback), which each re-enable it at their own end,
-      // ever leave it on.
-      disableTerminalReplyInput();
     }
 
     function hueForCard(cardId) {
@@ -894,11 +865,9 @@
       leftCardId = null;
       currentLeftSession = null;
       resetGrillingFeed();
-      setLiveTerminalFeedMode(false);
       preQaLeftSession = null;
       refreshModelEffortCard();
       turnInFlight = false;
-      syncPtySocket();
       rightCards.clear();
       backgroundSources.forEach((es) => es.close());
       backgroundSources.clear();
@@ -1157,10 +1126,8 @@
       updatePolls();
       leftCardId = null;
       turnInFlight = false;
-      syncPtySocket();
       currentLeftSession = null;
       resetGrillingFeed();
-      setLiveTerminalFeedMode(false);
       rightCards.clear();
       doFinishedModalEl.hidden = true;
       resetPromptBox();
@@ -1206,7 +1173,7 @@
       showOnly(projectPickerEl);
     }
 
-    // Issue #139: show the currently-open card's live `PtyEngine`'s actual
+    // Issue #139: show the currently-open card's live engine's actual
     // (model, effort) in the Model/Effort card instead of always the global
     // setting, whenever `leftCardId` names a card with one. Passing
     // `card_id` here never changes `/api/app-state`'s `root_dir`/`projects`/
@@ -2165,16 +2132,13 @@
       parallelImplementationWarningEl.hidden = !knownParallelImplementation;
     }
 
-    // Applies the current terminal-view-hidden setting to the embedded live
-    // terminal view immediately -- called on load and right after the
-    // setting changes, so no page reload or Rhubarb restart is needed.
+    // Applies the current terminal-view-hidden setting to the block feed
+    // immediately -- called on load and right after the setting changes, so
+    // no page reload or Rhubarb restart is needed. Issue #225 made the
+    // block feed the only Live Terminal rendering for every phase, so this
+    // is now a single toggle rather than picking between two sibling panels.
     function applyTerminalViewVisibility() {
-      const userHidden = !!knownTerminalViewHidden;
-      // The two sibling panels are never shown together -- `liveTerminalFeedMode`
-      // (issue #186) picks which one, and the user's own "hide live terminal
-      // view" setting still wins over both when it's on.
-      terminalViewEl.hidden = userHidden || liveTerminalFeedMode;
-      grillingFeedViewEl.hidden = userHidden || !liveTerminalFeedMode;
+      grillingFeedViewEl.hidden = !!knownTerminalViewHidden;
     }
 
     // Clears the block feed's rendered content and running-paragraph state --
@@ -2183,19 +2147,6 @@
     function resetGrillingFeed() {
       grillingFeedViewEl.innerHTML = "";
       grillingFeedCurrentTextEl = null;
-    }
-
-    // Single choke point for switching the Live Terminal panel between the
-    // raw xterm terminal and the structured block feed (issue #186). A
-    // `PtyEngine`-backed card never emits the `text`/`action` events the
-    // feed is fed by in the first place (see stream_translate.translate_event --
-    // those only ever come from `stream_event`/`assistant` raw events, which
-    // only the new StreamJsonEngine's NDJSON stream produces), so leaving
-    // this at its default `false` for such a card is always correct even if
-    // some call site below fails to explicitly turn it off.
-    function setLiveTerminalFeedMode(active) {
-      liveTerminalFeedMode = active;
-      applyTerminalViewVisibility();
     }
 
     // Appends to (or starts) the current turn's running assistant-text
@@ -2263,12 +2214,7 @@
         // The respawned engine is now this card's ground truth -- refresh
         // right away so the card's selects (and a later re-render) show it.
         await refreshModelEffortCard();
-        // The old engine (and its passthrough socket's server-side end) is
-        // gone -- same card id, but a forced reconnect is needed since
-        // syncPtySocket's normal no-op check would otherwise leave the
-        // stale socket in place.
         turnInFlight = false;
-        syncPtySocket({ force: true });
       } else {
         modelChangeTextEl.textContent =
           "This change takes effect starting with your next new session. Any session already in progress keeps using the model it started with.";
@@ -2296,9 +2242,7 @@
         effortChangeTextEl.textContent =
           "Applied immediately -- your current session's Live Terminal was restarted with the new effort.";
         await refreshModelEffortCard();
-        // See the identical comment in updateModel above.
         turnInFlight = false;
-        syncPtySocket({ force: true });
       } else if (leftCardId !== null && !cardsWithTurn.has(leftCardId)) {
         // A left-card session that exists but hasn't received its first
         // turn yet (so has no live engine for the backend to have
@@ -2405,137 +2349,6 @@
       effortChangeModalEl.hidden = true;
     });
 
-    // Embedded live terminal view (issue #88): one xterm.js instance,
-    // reused across sessions -- reset (not recreated) whenever the focused
-    // card changes. Visible by default (no `hidden` toggling anywhere on
-    // it) -- it's the middle card's only content now that the separate
-    // plain-text Output panel has been removed (issue #131 QA follow-up).
-    // disableStdin is false from the start (issue #167) -- unlike before
-    // passthrough existed, stdin is no longer toggled on only for the two
-    // curated-reply-mode states (see enableTerminalReplyInput/
-    // disableTerminalReplyInput below). Passthrough mode needs typed input
-    // live at all times a card is focused, not just those two states, so
-    // the on/off gating now happens entirely inside term.onData's own
-    // terminalReplySendFn check instead of at the xterm level.
-    //
-    // No fixed `cols`/`rows` here (issue #166) -- the fit-addon below
-    // computes them from the panel's actual pixel size on open and on every
-    // resize, and signals the result to the backend PTY (see
-    // resizeTerminalToFit/sendPtyResize) so the two stay matched. This
-    // replaces the previous fixed-200-column buffer + font-shrinking
-    // approach (`rescaleTerminalToFit`, issue #131): that made the *real*
-    // PTY's width a fixed constant the frontend could only ever visually
-    // cram into whatever space was available (by shrinking `fontSize`,
-    // sometimes down to near-illegible sizes on a narrow panel) -- it never
-    // changed how many actual columns/rows either side believed the
-    // terminal had. `fit()` instead recomputes the true `cols`/`rows` for
-    // the current panel size at a fixed, legible font size, and the new
-    // resize-signaling endpoint (`POST /api/sessions/{card_id}/resize`)
-    // lets the backend's real PTY (and pyte's virtual re-render screen --
-    // see `pty_engine._render_terminal_text`'s `columns` parameter) track
-    // it exactly, instead of silently drifting out of sync with whatever
-    // the frontend buffer now shows.
-    const term = new Terminal({ convertEol: true, disableStdin: false, fontSize: 13 });
-    term.open(document.getElementById("terminal-view"));
-
-    const fitAddon = new FitAddon.FitAddon();
-    term.loadAddon(fitAddon);
-
-    // Debounced so a continuous panel drag-resize (many ResizeObserver
-    // callbacks in quick succession) doesn't fire one resize POST per
-    // frame -- only the settled final size is sent to the backend. `fit()`
-    // itself still runs on every callback (purely local/synchronous), so
-    // the on-screen buffer always tracks the panel live; only the
-    // network signal to the backend PTY is coalesced.
-    const TERMINAL_RESIZE_SIGNAL_DEBOUNCE_MS = 200;
-    let terminalResizeSignalTimer = null;
-
-    function sendPtyResize(rows, cols) {
-      if (leftCardId === null) return;
-      fetch(`/api/sessions/${leftCardId}/resize`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ rows, cols }),
-      }).catch(() => {
-        // Best-effort: on failure the backend PTY simply stays at its
-        // previous size until a later resize call succeeds. The frontend
-        // xterm.js buffer has already been resized locally either way.
-      });
-    }
-
-    function resizeTerminalToFit() {
-      fitAddon.fit();
-      clearTimeout(terminalResizeSignalTimer);
-      terminalResizeSignalTimer = setTimeout(() => {
-        sendPtyResize(term.rows, term.cols);
-      }, TERMINAL_RESIZE_SIGNAL_DEBOUNCE_MS);
-    }
-
-    // Fires once immediately (current panel size -- this is the "seeded
-    // from the panel's initial size" case) and again on every subsequent
-    // panel resize.
-    new ResizeObserver(resizeTerminalToFit).observe(document.getElementById("terminal-view"));
-
-    // Terminal-as-alternate-reply-input (issue #130): a local line editor
-    // layered on top of the terminal, NOT a raw PTY passthrough -- typed
-    // text is only ever submitted through the exact same reply functions the
-    // structured answer box already calls (sendReply / sendImplementReply).
-    // `terminalReplySendFn` is set only while the focused left card is in one
-    // of those two single-flat-text-reply states (see
-    // enableTerminalReplyInput's callers), and cleared at every other time
-    // via showOnly(), which every other state transition already calls.
-    //
-    // Issue #167: this used to also gate the xterm-level `disableStdin`
-    // option (on only during those two states) -- now that raw passthrough
-    // mode exists as the default owner of typed input the rest of the time
-    // (see term.onData below), stdin stays enabled always, and
-    // `terminalReplySendFn` being set/unset is purely which branch of
-    // term.onData a keystroke falls into, curated vs. passthrough.
-    let terminalReplySendFn = null;
-    let terminalReplyBuffer = "";
-
-    // Issue #164: enabling curated reply mode used to only flip the
-    // `terminalReplySendFn` gate and print the "> " prompt -- it never gave
-    // the terminal actual DOM focus. xterm.js captures keystrokes through a
-    // hidden `<textarea>` it manages internally (`.xterm-helper-textarea`),
-    // and that textarea only receives keystrokes while it holds real browser
-    // focus; nothing in this file ever called `term.focus()`, so unless the
-    // user happened to manually click inside the terminal panel first, every
-    // keystroke went to whatever (or nothing) already had focus and
-    // `term.onData` never fired at all -- the reply-mode branch inside it
-    // was correct but simply never reached. Calling `term.focus()` here
-    // (xterm's public API for focusing that helper textarea) is what
-    // actually routes typed input into `term.onData` the moment reply mode
-    // is entered, matching the on-screen "> " prompt this already writes.
-    // Issue #185: a grilling card runs under the new stream-json engine,
-    // whose Live Terminal panel shows the structured block feed instead of
-    // this xterm terminal (`#terminal-view` sits `hidden` for the whole
-    // time `liveTerminalFeedMode` is on -- see applyTerminalViewVisibility
-    // above). Writing the "> " prompt into it and calling `term.focus()`
-    // would target an element the user can't see; worse, a `hidden`
-    // (display:none) element can't actually receive focus in a browser, so
-    // `term.focus()` would silently no-op and no keystroke would ever reach
-    // `term.onData`'s curated branch below -- this convenience is already
-    // dead for such a card, just without any visible error. Every caller of
-    // this function already renders its own free-form textarea + Send/
-    // Submit button (renderManualReply, or renderInterview's own trailing-
-    // notes box) that submits through this exact same `sendFn` with zero
-    // terminal dependency, so skipping the curated-terminal-typing
-    // convenience here for a grilling card loses no capability.
-    function enableTerminalReplyInput(sendFn) {
-      if (liveTerminalFeedMode) return;
-      terminalReplySendFn = sendFn;
-      terminalReplyBuffer = "";
-      term.write("\r\n> ");
-      term.focus();
-    }
-
-    function disableTerminalReplyInput() {
-      if (!terminalReplySendFn) return;
-      terminalReplySendFn = null;
-      terminalReplyBuffer = "";
-    }
-
     // Issue #143: give button-driven reply submission immediate loading
     // feedback that stays until the interview area is actually replaced by
     // the next render, rather than re-enabling as soon as the fire-and-
@@ -2547,7 +2360,7 @@
     //
     // Issue #150: a pending button is normally cleared one of two ways --
     // (1) a `turn` SSE event triggers a full re-render of `interviewEl`
-    // (renderInterview/renderReadyToProceed/renderQaGrilling/etc all start
+    // (renderInterview/renderQaGrilling/etc all start
     // with `interviewEl.innerHTML = ""`), which discards the stale disabled
     // button along with the rest of the old DOM, or (2) showGrillingError()
     // explicitly sweeps `[data-pending-label]` buttons back to enabled on an
@@ -2617,218 +2430,19 @@
       showGrillingError("No response was received. Please try again.");
     }
 
-    // Issue #134: a reply submitted through the structured answer box (not
-    // typed directly into the terminal) must still echo into the terminal
-    // and close out its "awaiting your reply" state -- otherwise the
-    // terminal is left thinking a reply is still pending after one has, in
-    // fact, already been sent through the other channel. Every button click
-    // handler that submits a reply goes through this instead of calling
-    // sendReply/sendImplementReply directly.
-    //
-    // Issue #170: the echo (and closing out curated reply mode) used to
-    // happen synchronously, before `sendFn`'s network call had even started
-    // -- so a request that failed still left the terminal showing the reply
-    // as if it had gone through, with no visible sign anything went wrong.
-    // `sendFn` (sendReply/sendImplementReply) now resolves to `true` on a
-    // successful request and `false` on one that failed (in which case it
-    // has already called showGrillingError itself). Awaiting that result and
-    // only echoing/closing out curated mode when it's `true` means a failed
-    // submit shows nothing but the error path -- an honest reflection of
-    // what actually happened. `wasTerminalReply` is captured up front, before
-    // the await, so the echo decision reflects the state at submit time
-    // rather than whatever it happens to be once the request resolves.
+    // Issue #134/#170: every button click handler that submits a reply goes
+    // through this instead of calling sendReply/sendImplementReply directly,
+    // so loading state (markButtonPending) is applied uniformly.
     async function submitReplyFromButton(text, sendFn, triggerBtn) {
-      const wasTerminalReply = terminalReplySendFn;
       markButtonPending(triggerBtn);
-      const ok = await sendFn(text, triggerBtn);
-      if (ok && wasTerminalReply) {
-        term.write(text + "\r\n");
-        disableTerminalReplyInput();
-      }
+      await sendFn(text, triggerBtn);
     }
 
-    // Mode coexistence (issue #167): a single term.onData handler, gated on
-    // `terminalReplySendFn` -- when it's set (the two curated-reply states:
-    // awaiting a grilling answer, or an implement-blocked answer -- see
-    // enableTerminalReplyInput's callers), curated mode owns the keystroke
-    // and returns before reaching the passthrough branch below. The rest of
-    // the time (including while an automated turn is actively running --
-    // deliberately not gated on that, see PRD #162), passthrough is simply
-    // the default owner of onData. Only one branch ever runs per keystroke,
-    // so the two modes never fight over the same input.
-    term.onData((data) => {
-      if (terminalReplySendFn) {
-        if (data === "\r" || data === "\n") {
-          const text = terminalReplyBuffer;
-          const sendFn = terminalReplySendFn;
-          term.write("\r\n");
-          disableTerminalReplyInput();
-          if (text.trim()) sendFn(text, { disabled: false });
-          return;
-        }
-
-        if (data === "\x7f" || data === "\b") {
-          // Backspace/delete -- basic terminal actions only, no arrow-key or
-          // cursor-movement editing.
-          if (terminalReplyBuffer.length > 0) {
-            terminalReplyBuffer = terminalReplyBuffer.slice(0, -1);
-            term.write("\b \b");
-          }
-          return;
-        }
-
-        // Ignore other control characters and escape sequences (arrow keys,
-        // Ctrl+C, etc.) -- only printable characters are accepted by this
-        // hand-rolled line editor.
-        if (data.length === 0 || data.charCodeAt(0) < 0x20 || data.startsWith("\x1b")) return;
-
-        terminalReplyBuffer += data;
-        term.write(data);
-        return;
-      }
-
-      // Passthrough mode: forward the raw keystroke as-is over the
-      // WebSocket into the live CLI process (issue #165) -- unlike curated
-      // mode above, nothing is filtered here (arrow keys, Ctrl+C, etc. are
-      // all legitimate raw terminal input); the PTY itself, not this code,
-      // is responsible for interpreting and echoing it back over the
-      // existing SSE stream.
-      if (turnInFlight) flashPassthroughIndicator();
-      sendPassthroughData(data);
-    });
-
-    // --- Raw PTY passthrough WebSocket (issue #167) -----------------------
-    // Wires the terminal to the `/ws/sessions/{card_id}/pty` channel built in
-    // issue #165. Purely an input channel to whichever card is currently
-    // focused (`leftCardId`) -- all output still arrives the existing way,
-    // over the SSE stream's `terminal_output` events. Kept in sync with
-    // `leftCardId` at every place that variable changes (see the
-    // `syncPtySocket()` calls alongside `refreshModelEffortCard()` below,
-    // which already fires at exactly those same focus-change points).
-    let ptySocket = null;
-    let ptySocketCardId = null;
-    let ptyReconnectTimer = null;
-
-    function ptyWebSocketUrl(cardId) {
-      const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
-      return `${scheme}//${window.location.host}/ws/sessions/${cardId}/pty`;
-    }
-
-    function closePtySocket() {
-      clearTimeout(ptyReconnectTimer);
-      ptyReconnectTimer = null;
-      if (ptySocket) {
-        const socket = ptySocket;
-        ptySocket = null;
-        socket.onclose = null;
-        socket.onerror = null;
-        try {
-          socket.close();
-        } catch (err) {
-          // Already closing/closed -- nothing to do.
-        }
-      }
-      ptySocketCardId = null;
-    }
-
-    // `force: true` (used after a model/effort change respawns the focused
-    // card's engine -- see updateModel/updateEffort) always reconnects even
-    // though `leftCardId` itself didn't change, since the old engine (and
-    // therefore the old socket's server-side connection) is gone. Otherwise
-    // a no-op whenever the same card is already connected/connecting.
-    function syncPtySocket({ force = false } = {}) {
-      if (leftCardId === null) {
-        closePtySocket();
-        return;
-      }
-
-      // Issue #185: a grilling card runs under the new stream-json engine,
-      // which has no resident `PtyEngine` at all for this socket to forward
-      // keystrokes into -- the backend already closes such a connection
-      // immediately with code 1008 (see `pty_passthrough` in
-      // rhubarb/web/app.py, whose lookup only ever checks `_pty_engines`).
-      // But `onclose` below treats every 1008 close as "no engine YET" and
-      // reconnects again after 1.5s -- correct for e.g. implement's very
-      // first turn (before its PtyEngine spins up), wrong for grilling,
-      // which never gets a PtyEngine at all. Left unguarded this would
-      // connect-and-immediately-close in a loop for as long as a grilling
-      // card stays focused. `currentLeftSession` is reliable ground truth
-      // for this the same way connectStream's own `setLiveTerminalFeedMode`
-      // call above already relies on it (no feature flag -- session_runner
-      // routes `phase == "grilling"` unconditionally).
-      if (currentLeftSession && currentLeftSession.card_id === leftCardId && currentLeftSession.phase === "grilling") {
-        closePtySocket();
-        return;
-      }
-
-      if (
-        !force &&
-        ptySocketCardId === leftCardId &&
-        ptySocket &&
-        (ptySocket.readyState === WebSocket.OPEN || ptySocket.readyState === WebSocket.CONNECTING)
-      ) {
-        return;
-      }
-
-      closePtySocket();
-      const cardId = leftCardId;
-      ptySocketCardId = cardId;
-      const socket = new WebSocket(ptyWebSocketUrl(cardId));
-      ptySocket = socket;
-
-      // Issue #166: the panel itself may not have changed size at all (no
-      // ResizeObserver callback fires just because focus moved to a
-      // different card), but the newly-focused card's own resident
-      // PtyEngine could still be sitting at its construction-time default
-      // size (or whatever size it last had before this card lost focus) --
-      // re-send the frontend's CURRENT already-fitted size every time focus
-      // lands on a (possibly different) card, so a card that never
-      // triggered its own resize event still gets its backend PTY
-      // synced to what the terminal view is actually showing.
-      sendPtyResize(term.rows, term.cols);
-
-      socket.onclose = () => {
-        if (ptySocket !== socket) return;
-        ptySocket = null;
-        // The card may not have a resident PtyEngine yet (e.g. a brand new
-        // session still on its first grilling turn) -- the server closes
-        // with 1008 in that case (see pty_passthrough). Retry once after a
-        // short delay instead of leaving passthrough permanently dead for
-        // the rest of this card's life; harmless if the card genuinely has
-        // no engine, since it'll just close the same way again.
-        ptyReconnectTimer = setTimeout(() => {
-          if (leftCardId === cardId) syncPtySocket();
-        }, 1500);
-      };
-      // onerror is followed by onclose in every browser, so the retry above
-      // covers both -- nothing extra needed here.
-    }
-
-    function sendPassthroughData(data) {
-      if (ptySocket && ptySocket.readyState === WebSocket.OPEN) {
-        ptySocket.send(data);
-      }
-    }
-
-    // Lightweight visual indicator (issue #167 acceptance criteria): tracks
-    // whether an automated turn is currently running for the focused card --
-    // true from the moment a reply/prompt is sent (sendReply,
+    // True from the moment a reply/prompt is sent (sendReply,
     // sendImplementReply, the initial start-form submit) until the next
     // turn/phase/done event updates that same card (applyTurn and the
-    // phase/done handling in handleStreamEvent). Purely cosmetic: it only
-    // drives flashPassthroughIndicator() above and never gates or delays the
-    // passthrough write itself.
+    // phase/done handling in handleStreamEvent).
     let turnInFlight = false;
-    let passthroughIndicatorTimer = null;
-
-    function flashPassthroughIndicator() {
-      if (!passthroughIndicatorEl) return;
-      passthroughIndicatorEl.hidden = false;
-      clearTimeout(passthroughIndicatorTimer);
-      passthroughIndicatorTimer = setTimeout(() => {
-        passthroughIndicatorEl.hidden = true;
-      }, 1500);
-    }
 
     let eventSource = null;
     const cardSnapshots = new Map(); // card_id -> latest {phase, interview, details, error, needs_github_login}
@@ -2977,10 +2591,8 @@
       if (qaSnapshot) rightCards.set(qaCardId, qaSnapshot);
       leftCardId = null;
       turnInFlight = false;
-      syncPtySocket();
       currentLeftSession = null;
       resetGrillingFeed();
-      setLiveTerminalFeedMode(false);
       refreshModelEffortCard();
       resetPromptBox();
       startForm.style.display = "";
@@ -3002,22 +2614,7 @@
 
     function connectStream(cardId) {
       if (eventSource) eventSource.close();
-      term.reset();
       resetGrillingFeed();
-      // Every caller of connectStream has already set `currentLeftSession`
-      // for `cardId` before calling it (renderLeftSession/applyTurn/the
-      // start-form handler all do this) -- so its `.phase` is reliable
-      // ground truth here for whether this card is a grilling card under the
-      // new engine (see session_runner's unconditional `phase == "grilling"`
-      // dispatch -- no feature flag, so this check needs nothing from the
-      // backend beyond the `phase` field every session snapshot already has).
-      setLiveTerminalFeedMode(
-        !!currentLeftSession && currentLeftSession.card_id === cardId && currentLeftSession.phase === "grilling"
-      );
-      // Every caller here already set `leftCardId = cardId` first -- `force`
-      // makes this reconnect unconditionally (covers e.g. retryCard, where
-      // the previous engine may have just died and been replaced).
-      syncPtySocket({ force: true });
       const es = new EventSource(`/api/sessions/${cardId}/stream`);
       eventSource = es;
       es.onmessage = (e) => handleStreamEvent(cardId, es, JSON.parse(e.data));
@@ -3090,11 +2687,6 @@
       // session -- ignore stray events from a connection that's since been replaced.
       if (cardId !== leftCardId) return;
 
-      if (event.type === "terminal_output") {
-        term.write(event.data);
-        return;
-      }
-
       if (event.type === "phase") {
         turnInFlight = false;
         setHeading(headingForPhase(event.phase));
@@ -3116,23 +2708,17 @@
         return;
       }
 
-      // "text"/"action" events (issue #186): a grilling card under the new
-      // stream-json engine (issue #184) never emits `terminal_output` --
-      // these are the only content it streams, and they used to feed the
-      // removed plain-text Output panel (pure no-ops once that was removed).
-      // They now drive the Live Terminal panel's structured block feed
-      // instead, gated on `liveTerminalFeedMode` -- set by connectStream/
-      // applyTurn from `currentLeftSession.phase === "grilling"` -- so a
-      // stray event from a connection that's since moved off grilling (or
-      // any `PtyEngine`-backed card, which never emits these types at all)
-      // is simply dropped rather than appended.
+      // "text"/"action" events (issue #186; issue #225 made these the only
+      // content every phase streams, once everything moved to the
+      // stream-json engine) drive the Live Terminal panel's structured
+      // block feed.
       if (event.type === "text") {
-        if (liveTerminalFeedMode) appendGrillingText(event.text);
+        appendGrillingText(event.text);
         return;
       }
 
       if (event.type === "action") {
-        if (liveTerminalFeedMode) appendGrillingAction(event.summary);
+        appendGrillingAction(event.summary);
         return;
       }
     }
@@ -3175,8 +2761,7 @@
 
       cardsWithTurn.add(cardId);
       // This event is a turn's actual response arriving for `cardId` --
-      // if that's the focused card, its automated turn is no longer in
-      // flight (issue #167's passthrough-typing indicator signal).
+      // if that's the focused card, its automated turn is no longer in flight.
       if (cardId === leftCardId) turnInFlight = false;
       const snapshot = {
         card_id: cardId,
@@ -3238,14 +2823,6 @@
 
           leftCardId = cardId;
           turnInFlight = false;
-          syncPtySocket();
-          // This QA card is silently taking over the left slot without going
-          // through connectStream (its EventSource is being reused, not
-          // reopened) -- so unlike connectStream's own callers, mode isn't
-          // resynced for free here. A QA session is never grilling-phase, so
-          // explicitly turn the block feed off in case the session it's
-          // displacing had left it on (issue #186).
-          setLiveTerminalFeedMode(false);
           currentLeftSession = snapshot;
           refreshModelEffortCard();
           startForm.style.display = "none";
@@ -3279,10 +2856,6 @@
         blockedTakeoverCardId = cardId;
         leftCardId = cardId;
         turnInFlight = false;
-        syncPtySocket();
-        // See the identical comment in the QA takeover branch above -- this
-        // card is never grilling-phase either (issue #186).
-        setLiveTerminalFeedMode(false);
         currentLeftSession = snapshot;
         refreshModelEffortCard();
         startForm.style.display = "none";
@@ -3322,10 +2895,6 @@
         blockedTakeoverCardId = cardId;
         leftCardId = cardId;
         turnInFlight = false;
-        syncPtySocket();
-        // See the identical comment in the QA takeover branch above -- this
-        // card is never grilling-phase either (issue #186).
-        setLiveTerminalFeedMode(false);
         currentLeftSession = snapshot;
         refreshModelEffortCard();
         startForm.style.display = "none";
@@ -3339,33 +2908,25 @@
       if (leftCardId !== cardId) return;
 
       if (event.phase === "grilling") {
-        // Issue #186: a grilling card runs under the new stream-json engine
-        // from its very first turn (no feature flag -- session_runner routes
-        // `phase == "grilling"` unconditionally), so the Live Terminal
-        // panel's block-feed mode is (re)confirmed on every resolved
-        // grilling turn, not just at initial connect -- cheap and idempotent.
         // This turn is done streaming -- clear the running paragraph so the
         // next turn's first `text` delta starts a fresh block instead of
         // appending onto this turn's.
-        setLiveTerminalFeedMode(true);
         grillingFeedCurrentTextEl = null;
         if (event.error) {
           showGrillingError(event.error);
           return;
         }
         currentLeftSession = { card_id: cardId, phase: "grilling", interview: event.interview };
-        const questions = event.interview.questions;
-        if ((!questions || questions.length === 0) && event.interview.header) {
-          renderReadyToProceed(event.interview.header);
-        } else {
-          renderInterview(event.interview);
-        }
+        // Issue #223 (child of PRD #222): zero questions no longer means
+        // "wait for a Yes, proceed click" -- the backend auto-advances into
+        // creating_prd right after this same turn event, so this just
+        // renders the (possibly empty) interview like any other round; the
+        // very next event on this stream replaces it with the next phase.
+        renderInterview(event.interview);
         return;
       }
 
-      // This card just moved off the grilling phase (e.g. into creating_prd)
-      // -- back to the normal raw-terminal Live Terminal panel (issue #186).
-      setLiveTerminalFeedMode(false);
+      // This card just moved off the grilling phase (e.g. into creating_prd).
       currentLeftSession = snapshot;
       setHeading(headingForPhase(event.phase));
       showOnly(sessionStatusEl);
@@ -3380,6 +2941,11 @@
       // event, which /do no longer sends at this point.
       if (snapshot.session_type === "do" && event.phase === "details") {
         loadPrdList();
+        // Issue #225 (child of PRD #222): a defensive follow-up re-fetch 10s
+        // later, on top of (not instead of) the immediate one above -- a
+        // safety net against GitHub's list API being briefly stale right
+        // after /rhubarb:publish-to-github's `gh issue create` calls.
+        setTimeout(loadPrdList, 10000);
       }
     }
 
@@ -3410,10 +2976,8 @@
 
       leftCardId = null;
       turnInFlight = false;
-      syncPtySocket();
       currentLeftSession = null;
       resetGrillingFeed();
-      setLiveTerminalFeedMode(false);
       refreshModelEffortCard();
       resetPromptBox();
       startForm.style.display = "";
@@ -3437,10 +3001,8 @@
       if (leftCardId === cardId) {
         leftCardId = null;
         turnInFlight = false;
-        syncPtySocket();
         currentLeftSession = null;
         resetGrillingFeed();
-        setLiveTerminalFeedMode(false);
         refreshModelEffortCard();
         resetPromptBox();
         startForm.style.display = "";
@@ -3523,7 +3085,7 @@
       // interview area on an HTTP-level error, uniformly across every
       // reply/advance path, so the user can retry. Also doubles as the
       // second legitimate clear path for issue #150's fallback timer (both
-      // the direct-error call from sendReply/sendConfirmAdvance/etc and the
+      // the direct-error call from sendReply/etc and the
       // timeout fallback itself route through here) -- cancel the timer
       // before resetting the button so a button reset by an error never
       // also fires a stale "no response" timeout later.
@@ -3535,14 +3097,11 @@
       });
     }
 
-    // Issue #170: returns `true`/`false` for whether the request succeeded,
-    // so `submitReplyFromButton` (the structured-answer-box submit path) can
-    // decide whether it's honest to echo the reply into the terminal.
+    // Issue #170: returns `true`/`false` for whether the request succeeded.
     async function sendReply(replyText, triggerBtn) {
       if (!replyText.trim() || leftCardId === null) return false;
       // The automated grilling turn this reply kicks off is now in flight
-      // (issue #167's passthrough-typing indicator signal) until the next
-      // turn/phase/done event for this card clears it.
+      // until the next turn/phase/done event for this card clears it.
       turnInFlight = true;
       const res = await fetch("/api/session/continue", {
         method: "POST",
@@ -3583,7 +3142,6 @@
       }
 
       interviewEl.appendChild(renderManualReply(sendImplementReply));
-      enableTerminalReplyInput(sendImplementReply);
     }
 
     // Issue #170: returns `true`/`false` for whether the request succeeded,
@@ -3605,27 +3163,28 @@
       }
       // Otherwise, the reply's effect (re-blocked with a new question, or a
       // normal completion) arrives asynchronously over the already-open
-      // event stream, same as sendReply/sendConfirmAdvance -- and the
+      // event stream, same as sendReply -- and the
       // pending button is swept away with the rest of the stale interview
       // DOM when the next render replaces it (issue #143).
       return true;
     }
 
     // Issue #171 (child of PRD #168 "Recover from a stalled turn instead of
-    // hanging the turn lock forever"): rendered whenever the focused card's
-    // latest snapshot carries a `stalled` context -- either a live `turn`
-    // event with `stalled: true` (see applyTurn above) or a persisted one
-    // recovered on reconnect/reload (see renderLeftSession below, and
-    // `_session_to_dict`'s `stalled` field in rhubarb/web/app.py). Shows the
-    // rendered terminal output captured at the moment of the stall as
-    // context, plus the same manual-reply box/button widget the other two
-    // curated-reply states already use, wired to sendStallReply instead of
-    // sendReply/sendImplementReply. Mirrors renderBlockedSession's shape.
+    // hanging the turn lock forever"; issue #225 changed what "stalled"
+    // means from a mid-turn PTY hang to a completed turn that needs a
+    // human's input before its phase/session continues): rendered whenever
+    // the focused card's latest snapshot carries a `stalled` context --
+    // either a live `turn` event with `stalled: true` (see applyTurn above)
+    // or a persisted one recovered on reconnect/reload (see renderLeftSession
+    // below, and `_session_to_dict`'s `stalled` field in rhubarb/web/app.py).
+    // Shows the turn's own rendered text captured at pause time as context,
+    // plus the same manual-reply box/button widget the blocked-session state
+    // already uses, wired to sendStallReply instead of sendReply/
+    // sendImplementReply. Mirrors renderBlockedSession's shape.
     //
-    // This can recur indefinitely for the same card/turn with no cap: every
-    // subsequent stall event is just another call to this same function
-    // with a fresh snapshot (applyTurn replaces cardSnapshots wholesale each
-    // time), and every call re-claims curated reply mode the same way.
+    // This can recur for the same card with no cap: every subsequent stall
+    // event is just another call to this same function with a fresh
+    // snapshot (applyTurn replaces cardSnapshots wholesale each time).
     function renderStalledSession(snapshot) {
       interviewEl.innerHTML = "";
       interviewEl.scrollTop = 0;
@@ -3635,7 +3194,7 @@
 
       const q = document.createElement("p");
       q.className = "question-text";
-      q.textContent = "The live process has gone quiet mid-turn. Send a reply to nudge it along.";
+      q.textContent = "This session needs your input before it can continue. Send a reply to proceed.";
       interviewEl.appendChild(q);
 
       if (stalled.context) {
@@ -3646,7 +3205,6 @@
       }
 
       interviewEl.appendChild(renderManualReply(sendStallReply));
-      enableTerminalReplyInput(sendStallReply);
     }
 
     // Issue #173's client-side `showTurnProgressPanel()` (which used to show
@@ -3661,103 +3219,37 @@
     // reconnect, never proactively from the client the moment a reply is
     // sent.
 
-    // Issue #171: submits a reply while the focused card's turn is stalled.
-    // Unlike sendReply/sendImplementReply, this does NOT start a new turn
-    // and does NOT touch the turn lock -- it posts straight to the issue
-    // #169 stall-reply endpoint, which forwards the text directly into the
-    // live process's stdin via `PtyEngine.write()`, exactly as raw
-    // passthrough typing already does (issue #165). That endpoint forwards
-    // `text` byte-for-byte with no marker/newline handling of its own (see
-    // `reply_to_stalled_session`'s docstring in rhubarb/web/app.py) -- a
-    // trailing "\r" is appended here so the live process actually treats
-    // the line as submitted, the same as an Enter keystroke would through
-    // raw passthrough, rather than leaving it sitting unsubmitted in the
-    // process's input buffer.
+    // Issue #171: submits a reply while the focused card's session is
+    // paused waiting on a generic stall-reply. Posts to the issue #169
+    // stall-reply endpoint, which (issue #225) resumes the paused phase as
+    // a genuinely new turn -- reattached via the session's existing
+    // `claude_session_id` -- rather than writing into a live process's
+    // stdin (no such live-process passthrough exists under the headless
+    // `StreamJsonEngine` transport).
     //
     // Returns `true`/`false`, same contract as sendReply/sendImplementReply,
-    // so submitReplyFromButton's success-gated echo (issue #170) works
+    // so submitReplyFromButton's success-gated handling (issue #170) works
     // identically here.
     async function sendStallReply(replyText, triggerBtn) {
       if (!replyText.trim() || leftCardId === null) return false;
       const res = await fetch(`/api/sessions/${leftCardId}/stall-reply`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: replyText + "\r" }),
+        body: JSON.stringify({ text: replyText }),
       });
       const data = await res.json();
 
       if (!data.replied) {
         showGrillingError(
-          "Could not deliver your reply -- this session's live process is no longer running."
+          "Could not deliver your reply -- this session is no longer paused for one."
         );
         return false;
       }
-      // Otherwise, the process's own response (if any) streams in over the
-      // existing `terminal_output` SSE events, and either resolves the turn
-      // normally or stalls again -- both arrive as further `turn` events
+      // Otherwise, the reply's effect streams in over the existing SSE
+      // stream as a new turn resolves -- either the phase/chain continues
+      // normally or it stalls again -- both arrive as further `turn` events
       // handled by applyTurn above.
       return true;
-    }
-
-    async function sendConfirmAdvance(triggerBtn) {
-      if (leftCardId === null) return;
-      markButtonPending(triggerBtn);
-      // Disable sibling buttons (i.e. "No, keep discussing") so a conflicting
-      // reply cannot be sent while advance_past_grilling is already running.
-      triggerBtn.closest(".ready-to-proceed-actions")?.querySelectorAll("button").forEach(b => {
-        if (b !== triggerBtn) b.disabled = true;
-      });
-      turnInFlight = true;
-      const res = await fetch("/api/session/continue", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ card_id: leftCardId, confirm_advance: true }),
-      });
-      const data = await res.json();
-
-      if (data.error) {
-        turnInFlight = false;
-        showGrillingError(data.error);
-      }
-      // Otherwise, the chain's effect (creating_prd, creating_issues, details)
-      // arrives asynchronously over the already-open event stream, same as
-      // every other phase transition -- and the pending button is swept
-      // away with the rest of the stale interview DOM (issue #143).
-    }
-
-    function renderReadyToProceed(preamble) {
-      interviewEl.innerHTML = "";
-      interviewEl.scrollTop = 0;
-
-      if (preamble) {
-        const p = document.createElement("p");
-        p.className = "preamble md-prose";
-        p.innerHTML = marked.parse(preamble);
-        interviewEl.appendChild(p);
-      }
-
-      const actions = document.createElement("div");
-      actions.className = "ready-to-proceed-actions";
-
-      const yesBtn = document.createElement("button");
-      yesBtn.type = "button";
-      yesBtn.className = "glass-btn";
-      yesBtn.textContent = "Yes, proceed";
-      yesBtn.addEventListener("click", () => sendConfirmAdvance(yesBtn));
-      actions.appendChild(yesBtn);
-
-      const noBtn = document.createElement("button");
-      noBtn.type = "button";
-      noBtn.className = "glass-btn";
-      noBtn.textContent = "No, keep discussing";
-      noBtn.addEventListener("click", () => {
-        actions.remove();
-        interviewEl.appendChild(renderManualReply(sendReply));
-        enableTerminalReplyInput(sendReply);
-      });
-      actions.appendChild(noBtn);
-
-      interviewEl.appendChild(actions);
     }
 
     function renderTrailingNotesBox(labelText) {
@@ -3804,6 +3296,18 @@
         const label = document.createElement("p");
         label.className = "question-text";
         label.textContent = q.text;
+        if (q.extraction_incomplete) {
+          // Issue #231: extraction (parser session + one retry, #229)
+          // still couldn't confidently recover this question's
+          // options/recommendation from the raw reply -- a purely
+          // informational badge near the header, never disabling or
+          // replacing the normal controls rendered below.
+          const badge = document.createElement("span");
+          badge.className = "extraction-incomplete-badge";
+          badge.textContent = "Incomplete extraction";
+          badge.title = "Rhubarb couldn't fully confirm this question's options/recommendation from the raw reply -- double-check against the Live Terminal transcript if something looks off.";
+          label.appendChild(badge);
+        }
         block.appendChild(label);
 
         if (q.kind === "single" || q.kind === "multi") {
@@ -3951,7 +3455,15 @@
         // scrollHeight is only measurable once the textarea is attached to
         // the document, so a programmatic pre-fill can only be sized here,
         // after the append -- not at the point the value was assigned above.
-        if (prefillTextarea) autoGrow(prefillTextarea);
+        // Issue #231: for the same reason, .select() on a pre-filled
+        // recommended_text textarea is a no-op if called before the element
+        // is attached/visible, so it's deferred to right here too -- this
+        // pre-selects the text so typing immediately overwrites it instead
+        // of requiring a manual clear first.
+        if (prefillTextarea) {
+          autoGrow(prefillTextarea);
+          prefillTextarea.select();
+        }
       });
 
       if (data.footer) {
@@ -3985,8 +3497,6 @@
         sendBtn.addEventListener("click", () => submitReplyFromButton(trailingBox.value, submitFn, sendBtn));
         interviewEl.appendChild(sendBtn);
       }
-
-      enableTerminalReplyInput(submitFn);
     }
 
     function renderDetailsList(details) {
@@ -4096,10 +3606,6 @@
       currentLeftSession = session;
       leftCardId = session.card_id;
       turnInFlight = false;
-      // Not `syncPtySocket()` here -- every caller of renderLeftSession
-      // follows it with a connectStream(session.card_id) call, which force-
-      // reconnects the passthrough socket; doing it here too would just be
-      // an immediately-superseded connect/disconnect.
       refreshModelEffortCard();
 
       // Issue #171: a stall can happen mid-turn during ANY phase, so this
@@ -4262,10 +3768,8 @@
         if (eventSource) { eventSource.close(); eventSource = null; }
         leftCardId = null;
         turnInFlight = false;
-        syncPtySocket();
         currentLeftSession = null;
         resetGrillingFeed();
-        setLiveTerminalFeedMode(false);
         refreshModelEffortCard();
         resetPromptBox();
         startForm.style.display = "";
@@ -4299,10 +3803,8 @@
       if (eventSource) { eventSource.close(); eventSource = null; }
       leftCardId = null;
       turnInFlight = false;
-      syncPtySocket();
       currentLeftSession = null;
       resetGrillingFeed();
-      setLiveTerminalFeedMode(false);
       refreshModelEffortCard();
       resetPromptBox();
       startForm.style.display = "";
@@ -4446,9 +3948,7 @@
       }
       leftCardId = data.card_id;
       // The prompt just submitted is already this brand-new session's first
-      // grilling turn, in flight on the backend from this point on. (Not
-      // `syncPtySocket()` here -- the connectStream() call below force-
-      // reconnects the passthrough socket already.)
+      // grilling turn, in flight on the backend from this point on.
       turnInFlight = true;
       currentLeftSession = { card_id: data.card_id, phase: "grilling", interview: { header: "", questions: [], footer: "" } };
       refreshModelEffortCard();
@@ -4493,7 +3993,7 @@
               return `${label}: ${e.model || "default"} / ${e.effort || "auto"}`;
             })
             .join("\n")
-        : "Open PTY tabs";
+        : "Resident engine tabs";
     }
 
     let usageIntervalId = null;
@@ -4511,13 +4011,15 @@
     let lastRenderedQuestionFileContent = null;
 
     async function pollQuestionFileTick() {
-      // PRD #123 follow-up: a live grilling turn's own file-priority check
-      // only runs once that turn's PTY marker is detected as complete --
-      // exactly the slow/fragile step this file was meant to route around.
-      // Polling the file directly, independent of turn completion, shows a
-      // round the moment the skill writes it, regardless of what the PTY
-      // stream is doing. Only active while the focused left card is actually
-      // in the grilling phase -- a no-op otherwise.
+      // PRD #123 follow-up: polls the question file directly, independent
+      // of turn completion, so a round shows the moment the skill writes it
+      // rather than waiting for the turn to fully resolve. Only active
+      // while the focused left card is actually in the grilling phase -- a
+      // no-op otherwise. (Grilling has run exclusively on `StreamJsonEngine`
+      // since issue #184, which never writes this file -- see
+      // `session_runner._run_grilling_turn_stream_json`'s docstring -- so
+      // this poll is currently always a no-op; left as a harmless dead
+      // fallback rather than removed outright.)
       if (!activeProject || leftCardId === null || !currentLeftSession || currentLeftSession.phase !== "grilling") {
         return;
       }

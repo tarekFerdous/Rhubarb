@@ -7,10 +7,14 @@ start of each step, `text`/`action`/`usage` as a turn streams, a richer
 and `done` once the session has reached a terminal state (details or an
 unrecoverable error).
 
-Every phase (`do`, `to-prd`, `to-issues`, `implement`, `qa`) drives its turns
-through a single resident `PtyEngine` "tab" per `card_id` -- see
-`_pty_engines` below -- instead of the old subprocess-per-turn
-`cli_client.run_prompt`/`stream_prompt` model (issue #87).
+Every phase (`grilling`, `to-prd`, `to-issues`, `publish-to-github`,
+`implement`, `qa`) drives its turns through a single resident
+`StreamJsonEngine` "tab" per `card_id` -- see `_stream_json_engines` below
+-- one persistent headless `claude -p --input-format stream-json
+--output-format stream-json` subprocess per session, reused across every
+turn (issue #87's original "resident tab" model, issue #184's migration off
+`PtyEngine`'s interactive-PTY transport once `--resume` reattachment from a
+headless-originated session proved unreliable under full interactive mode).
 """
 
 import asyncio
@@ -23,9 +27,10 @@ _FENCED_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```")
 
 def _rejoin_wrapped_json_strings(candidate: str) -> str:
     """Undo terminal word-wrap inside a fenced JSON block's string literals
-    before handing `candidate` to `json.loads` -- the JSON-block analogue of
-    `qa_parser._reflow`'s "undo word-wrap before parsing" step for the
-    question-format parsers.
+    before handing `candidate` to `json.loads` -- an analogous "undo
+    word-wrap before parsing" step to the one the now-retired `qa_parser.py`
+    regex parsers used to apply via their own `_reflow` (issue #230 removed
+    that module entirely; this function is unrelated to it and untouched).
 
     A real PTY-spawned terminal can word-wrap Claude's rendered text to fit
     whatever width it's reporting (see `pty_engine.PtyEngine`'s own notes on
@@ -95,25 +100,14 @@ def _rejoin_wrapped_json_strings(candidate: str) -> str:
 from rhubarb import db, error_log, parser_session
 from rhubarb.cli_client import ClaudeCLIError
 from rhubarb.live_stream import publish
-from rhubarb.ollama_rescue import (
-    _is_valid_grilling_shape,
-    classify_turn_needs_input,
-    rescue_grilling_response,
-    rescue_qa_response,
-    should_attempt_grilling_rescue,
-    should_attempt_qa_rescue,
-)
-from rhubarb.pty_engine import PtyEngine, PtyEngineError, PtyEngineUnrecoverableError
-from rhubarb.qa_parser import parse_grilling_response, parse_qa_response
+from rhubarb.ollama_rescue import _is_valid_qa_shape, classify_turn_needs_input
 from rhubarb.question_files import delete_question_file, read_question_file
 from rhubarb.stream_json_engine import StreamJsonEngine, StreamJsonEngineUnrecoverableError
 from rhubarb.stream_translate import translate_event
 
 # Filenames under `.claude/` a skill writes its structured question/blocked
 # output to (PRD #123) -- read here in preference to scraping the turn's
-# rendered terminal text, which is exposed to PTY capture-timing/terminal-
-# rendering risk the file write is not. See `rhubarb/question_files.py`.
-_GRILLING_QUESTION_FILE = "rhubarb_question.md"
+# rendered terminal text. See `rhubarb/question_files.py`.
 _QA_QUESTION_FILE = "rhubarb_qa.md"
 _IMPLEMENT_BLOCKED_FILE = "rhubarb_blocked.json"
 
@@ -136,23 +130,19 @@ _DETAIL_RE = re.compile(r"\b(PRD|Issue)\s*#(\d+)\s*[:\-]\s*(.+)", re.IGNORECASE)
 
 # Context-window budget: before starting the next phase in a session chain,
 # `_maybe_clear_for_next_phase` checks the row's last-recorded `context_pct`
-# against the relevant cutoff below and starts a fresh PtyEngine first if
-# it's over. The gate is a pre-phase check only -- a phase already running is
-# never interrupted even if it crosses its cutoff while in flight.
-# Placeholder pending real /rhubarb:implement and /rhubarb:qa context-growth
-# telemetry -- expect this to move.
+# against the relevant cutoff below and starts a fresh `StreamJsonEngine`
+# first if it's over. The gate is a pre-phase check only -- a phase already
+# running is never interrupted even if it crosses its cutoff while in
+# flight. Placeholder pending real /rhubarb:implement and /rhubarb:qa
+# context-growth telemetry -- expect this to move.
 #
-# NOTE (issue #87): `PtyEngine`'s turn-complete-marker protocol carries no
-# usage/token-count data (interactive mode has no `--output-format
-# stream-json`-style `usage`/`modelUsage` fields the way headless `-p` did),
-# so `_context_window_pct` now always returns `None` for a turn driven
-# through `PtyEngine`, and every check below always falls into its
-# treat-as-safe/has-headroom branch. This is an inherent consequence of the
-# marker-based interactive protocol, not something this issue changes the
-# shape of -- the gate and the recycle cutoff are left in place exactly as
-# they already handle an unknown `context_pct` (safe-by-default), so a
-# future engine enhancement that recovers usage data would make them live
-# again with no further changes needed here.
+# Every turn now runs through `StreamJsonEngine`'s headless `-p
+# --output-format stream-json` transport, which carries real
+# `usage`/`modelUsage` fields on its `result` event -- `_context_window_pct`
+# computes a real percentage for every phase, not just grilling (issue #225
+# removed `PtyEngine`, whose interactive marker-based protocol carried no
+# such data). An unknown `context_pct` (e.g. no turn has completed yet) is
+# still treated as safe-to-continue by every caller, unchanged.
 _IMPLEMENT_TO_QA_CONTEXT_CUTOFF = 0.68
 
 # Context-window gate for the do-finished Continue button (issue #198, child
@@ -178,9 +168,8 @@ def _context_window_pct(raw_result_event: dict) -> float | None:
     cache_creation_input_tokens + cache_read_input_tokens) / contextWindow`.
 
     Returns `None` when the event doesn't carry enough to compute this (no
-    `usage`/`modelUsage` block, or a zero/missing `contextWindow` -- always
-    true of a `PtyEngine`-driven turn, see the module-level note above)
-    rather than raising -- a session with an unknown context usage is
+    `usage`/`modelUsage` block, or a zero/missing `contextWindow`) rather
+    than raising -- a session with an unknown context usage is
     treated as safe-to-continue by every caller (see
     `_maybe_clear_for_next_phase`), since erring toward "don't gate" only
     risks the growth this budget is meant to catch, not silent data loss.
@@ -200,33 +189,23 @@ def _context_window_pct(raw_result_event: dict) -> float | None:
     return used / context_window
 
 
-# One resident PtyEngine ("tab") per card_id, kept alive across every turn
-# for that card's session -- across grilling -> to-prd -> to-issues ->
-# implement, since those all continue the same claude conversation on the
-# same card_id. Replaces
-# cli_client's old `_persistent_processes` pool: that pool was also
-# card_id-keyed, but only ever used by the /do chain, and only kept a
-# `-p`-style subprocess open (not a true interactive PTY) with its own
-# ad hoc fallback/respawn-with-`--resume` logic on death. Every phase now
-# shares this one mechanism instead -- see `_get_or_create_engine`.
-_pty_engines: dict[int, PtyEngine] = {}
-
-# Per-card_id lock guarding `_run_turn`'s actual PTY write/read against a
-# duplicate overlapping call for the same card_id (issue #144) -- a
-# confirmed race where two turn-initiating requests for the same session
-# (e.g. a double-clicked button, a retried request) could both reach the
-# same resident `PtyEngine`'s `stream_turn` at once, interleaving writes and
-# reads on a connection that only ever expects one turn in flight. Mirrors
-# `_pty_engines`'s own per-card_id lifecycle: created on first use by
-# `_get_turn_lock`, popped (and discarded) by `_close_engine` alongside the
-# engine itself so the registry never grows unboundedly over a long-running
-# instance.
+# Per-card_id lock guarding a turn's actual write/read against a duplicate
+# overlapping call for the same card_id (issue #144) -- a confirmed race
+# where two turn-initiating requests for the same session (e.g. a
+# double-clicked button, a retried request) could both reach the same
+# resident engine's `stream_turn` at once, interleaving writes and reads on
+# a connection that only ever expects one turn in flight. Mirrors
+# `_stream_json_engines`'s own per-card_id lifecycle: created on first use
+# by `_get_turn_lock`, popped (and discarded) by `_close_stream_json_engine`
+# alongside the engine itself so the registry never grows unboundedly over a
+# long-running instance.
 _turn_locks: dict[int, asyncio.Lock] = {}
 
 
 def _get_turn_lock(card_id: int) -> asyncio.Lock:
     """Return this card's turn lock, creating one on first use -- mirrors
-    `_get_or_create_engine`'s "construct on first call, reuse after" shape."""
+    `_get_or_create_stream_json_engine`'s "construct on first call, reuse
+    after" shape."""
     lock = _turn_locks.get(card_id)
     if lock is None:
         lock = asyncio.Lock()
@@ -234,93 +213,33 @@ def _get_turn_lock(card_id: int) -> asyncio.Lock:
     return lock
 
 
-def _get_or_create_engine(
-    card_id: int, *, cwd: str | None, model: str | None, effort: str | None, resume_session_id: str | None
-) -> PtyEngine:
-    """Return this card's resident tab, constructing and starting one (fresh,
-    or reattached via `--resume resume_session_id` -- e.g. a reused pooled
-    session, or a session picked back up after a Rhubarb restart) if this is
-    the first turn for this `card_id`. Every later turn for the same
-    `card_id` reuses the exact same `PtyEngine` instance -- never recreated
-    per turn."""
-    engine = _pty_engines.get(card_id)
-    if engine is not None:
-        return engine
-    engine = PtyEngine(cwd=cwd, model=model, effort=effort, resume_session_id=resume_session_id)
-    engine.start()
-    _pty_engines[card_id] = engine
-    return engine
-
-
-def register_engine(card_id: int, engine: PtyEngine) -> None:
-    """Register an already-running engine as `card_id`'s resident tab
-    (issue #136) -- used when a brand-new session claims a pre-warmed
-    standby (`claim_standby_engine`) so `_get_or_create_engine`'s own
-    "already resident, don't spawn" check picks it up on the first turn,
-    exactly as if it had been spawned for this card_id from the start."""
-    _pty_engines[card_id] = engine
-
-
-def _close_engine(card_id: int) -> None:
-    """Close and forget this card's resident tab, if any -- called whenever
-    a card's tab finishes: pooled for reuse, fully done, handed off to a
-    different card_id (the /implement -> /qa auto-handoff), or errored out
-    (a later retry reattaches a fresh tab via `--resume` instead of
-    continuing to drive a process that just raised)."""
-    engine = _pty_engines.pop(card_id, None)
-    if engine is not None:
-        engine.close()
-    _turn_locks.pop(card_id, None)
-
-
 def close_session(conn, card_id: int) -> None:
     """User-initiated permanent close of a session card (issue #121): tears
-    down this card's resident `PtyEngine` tab exactly like any other
-    engine-death path (`_close_engine` -- pop and terminate, safe no-op if
-    there isn't one), marks the row `phase="closed"` so
-    `db.list_sessions_for_project` excludes it from now on, and publishes a
-    terminal `closed` event so any live SSE stream for this card (foreground
-    or background) ends the same way a naturally-finished session's `done`
-    event does (see `stream_session` in `rhubarb/web/app.py`).
+    down this card's resident `StreamJsonEngine` tab (`_close_stream_json_engine`
+    -- pop and terminate, safe no-op if there isn't one), marks the row
+    `phase="closed"` so `db.list_sessions_for_project` excludes it from now
+    on, and publishes a terminal `closed` event so any live SSE stream for
+    this card (foreground or background) ends the same way a
+    naturally-finished session's `done` event does (see `stream_session` in
+    `rhubarb/web/app.py`).
 
-    No literal `/clear` turn is sent into the PTY first -- the process is
-    destroyed directly, same rationale as `_spawn_fresh_engine`'s docstring:
-    the point is to end this conversation for good, not to round-trip a
-    slash command into a process that may itself be mid-turn.
-
-    Issue #184: a grilling card's resident tab is a `StreamJsonEngine`, not
-    a `PtyEngine` -- `_close_stream_json_engine` is called alongside
-    `_close_engine` unconditionally so this one function still closes
-    whichever this card actually has resident, without needing to know
-    which phase/engine it was. Each is a no-op when this card has nothing
-    in that particular registry, so this is exactly as safe as the
-    single-registry version was for every other phase."""
-    _close_engine(card_id)
+    No literal `/clear` turn is sent first -- the process is destroyed
+    directly, same rationale as `_spawn_fresh_stream_json_engine`'s
+    docstring: the point is to end this conversation for good, not to
+    round-trip a slash command into a process that may itself be mid-turn."""
     _close_stream_json_engine(card_id)
     db.update_session(conn, card_id, phase="closed")
     publish(card_id, {"type": "closed", "card_id": card_id})
 
 
-def get_engine(card_id: int) -> PtyEngine | None:
-    """Return `card_id`'s resident `PtyEngine` tab, or `None` if there isn't
-    a live one -- the accessor the raw passthrough WebSocket endpoint
-    (`/ws/sessions/{card_id}/pty` in `rhubarb/web/app.py`, issue #165) uses
-    to find the engine to forward received bytes into, via its public
-    `write()` method. Read-only -- never creates, respawns, or otherwise
-    mutates `_pty_engines`, mirroring `get_engine_model_effort`'s own
-    "just look it up" shape."""
-    return _pty_engines.get(card_id)
-
-
 def get_engine_model_effort(card_id: int) -> tuple[str | None, str | None] | None:
-    """Return the `(model, effort)` this card's resident `PtyEngine` was
-    actually constructed with (issue #139) -- ground truth for the live
-    process's own argv (see `PtyEngine._build_args`), as opposed to
-    `db.get_model`/`db.get_effort`'s global "what the next new session will
-    use" setting. Returns `None` if there's no live resident engine for
-    `card_id` (mirrors `open_pty_tab_count`'s style of small accessor) --
-    callers fall back to the global settings in that case."""
-    engine = _pty_engines.get(card_id)
+    """Return the `(model, effort)` this card's resident `StreamJsonEngine`
+    was actually constructed with (issue #139) -- ground truth for the live
+    process's own argv, as opposed to `db.get_model`/`db.get_effort`'s
+    global "what the next new session will use" setting. Returns `None` if
+    there's no live resident engine for `card_id` -- callers fall back to
+    the global settings in that case."""
+    engine = _stream_json_engines.get(card_id)
     if engine is None:
         return None
     return engine.model, engine.effort
@@ -332,20 +251,20 @@ def _maybe_respawn_for_settings_change(
     """Shared tail for `respawn_engine_for_model_change`/
     `respawn_engine_for_effort_change` below -- tear down `card_id`'s live
     resident engine and replace it with a fresh, unresumed one (see
-    `_spawn_fresh_engine`) under `model`/`effort`, keeping the row in sync
-    (`claude_session_id`/`model`/`effort`/`context_pct`, mirroring
-    `_maybe_clear_for_next_phase`'s own respawn bookkeeping -- a fresh
-    conversation has a new session id and nothing yet measured for
-    `context_pct`). Only ever touches `_pty_engines[card_id]` -- no other
-    card's engine, and no project's standby engine, is read or written here.
-    Always returns True; callers only call this once they've already
+    `_spawn_fresh_stream_json_engine`) under `model`/`effort`, keeping the
+    row in sync (`claude_session_id`/`model`/`effort`/`context_pct`,
+    mirroring `_maybe_clear_for_next_phase`'s own respawn bookkeeping -- a
+    fresh conversation has a new session id and nothing yet measured for
+    `context_pct`). Only ever touches `_stream_json_engines[card_id]` -- no
+    other card's engine, and no project's standby engine, is read or written
+    here. Always returns True; callers only call this once they've already
     confirmed (via `get_engine_model_effort`) that `card_id` has a live
     engine to replace."""
-    _close_engine(card_id)
-    engine = _spawn_fresh_engine(cwd=cwd, model=model, effort=effort)
-    _pty_engines[card_id] = engine
+    _close_stream_json_engine(card_id)
+    engine = _spawn_fresh_stream_json_engine(cwd=cwd, model=model, effort=effort)
+    _stream_json_engines[card_id] = engine
     db.update_session(
-        conn, card_id, claude_session_id=engine.claude_session_id, model=model, effort=effort, context_pct=None
+        conn, card_id, claude_session_id=engine.session_id, model=model, effort=effort, context_pct=None
     )
     return True
 
@@ -389,55 +308,37 @@ def respawn_engine_for_effort_change(conn, card_id: int | None, *, cwd: str | No
     return _maybe_respawn_for_settings_change(conn, card_id, cwd=cwd, model=current_model, effort=effort)
 
 
-def open_pty_tab_count() -> int:
-    """How many `PtyEngine` "tabs" are currently resident (issue #88) --
-    one per `card_id` with a live entry in `_pty_engines`, across every
-    active session regardless of phase, plus any pre-warmed standby engines
-    (issue #136) -- both are real, live `claude` processes. Backs the web
-    UI's tab-count indicator next to the "Sessions" label (`GET
-    /api/pty-tabs/count` in `rhubarb/web/app.py`); polled rather than
-    pushed since it's a global count, not scoped to any one card's SSE
-    stream.
-
-    Issue #184: also counts a grilling card's resident `StreamJsonEngine`
-    tabs (`_stream_json_engines`) and its pre-warmed standby
-    (`_standby_stream_json_engines`) -- both are real, live `claude`
-    processes exactly like their `PtyEngine` counterparts, so the indicator
-    stays meaningful regardless of which engine backs a given card."""
-    return len(_pty_engines) + len(_standby_engines) + len(_stream_json_engines) + len(_standby_stream_json_engines)
+def count_resident_engines() -> int:
+    """How many `StreamJsonEngine` "tabs" are currently resident (issue #88)
+    -- one per `card_id` with a live entry in `_stream_json_engines`, across
+    every active session regardless of phase, plus any pre-warmed standby
+    engines (issue #136) -- both are real, live `claude` processes. Backs
+    the web UI's tab-count indicator next to the "Sessions" label; polled
+    rather than pushed since it's a global count, not scoped to any one
+    card's SSE stream."""
+    return len(_stream_json_engines) + len(_standby_stream_json_engines)
 
 
 def list_live_engines() -> list[dict]:
-    """One record per live `PtyEngine` "tab" across both `_pty_engines` and
-    `_standby_engines` (issue #140), each shaped
-    `{"card_id": int | "standby", "model": str | None, "effort": str | None}`
-    -- ground truth `(model, effort)` read straight off the resident
-    engine's own attributes for a card (same source `get_engine_model_effort`
-    already uses), or off the stored tuple for a standby (never touched
-    beyond what `ensure_standby_engine`/`claim_standby_engine` already
-    track). A standby's `card_id` is the literal string `"standby"` -- it
-    has no card yet, and at most one exists per project, so no further
+    """One record per live `StreamJsonEngine` "tab" across both
+    `_stream_json_engines` and `_standby_stream_json_engines` (issue #140),
+    each shaped `{"card_id": int | "standby", "model": str | None, "effort":
+    str | None}` -- ground truth `(model, effort)` read straight off the
+    resident engine's own attributes for a card (same source
+    `get_engine_model_effort` already uses), or off the stored tuple for a
+    standby (never touched beyond what
+    `ensure_standby_stream_json_engine`/`claim_standby_stream_json_engine`
+    already track). A standby's `card_id` is the literal string `"standby"`
+    -- it has no card yet, and at most one exists per project, so no further
     disambiguation (e.g. project_id) is included here.
 
-    Backs `GET /api/pty-tabs/count`'s additive `"engines"` field -- purely a
+    Backs the tab-count endpoint's additive `"engines"` field -- purely a
     read-only listing for the background-visibility UI; does not stream, or
-    otherwise touch, any engine.
-
-    Issue #184: also includes a grilling card's resident `StreamJsonEngine`
-    tabs and standby, same shape, so this listing stays consistent with
-    `open_pty_tab_count()`'s own extended total."""
+    otherwise touch, any engine."""
     engines = [
         {"card_id": card_id, "model": engine.model, "effort": engine.effort}
-        for card_id, engine in _pty_engines.items()
-    ]
-    engines.extend(
-        {"card_id": "standby", "model": model, "effort": effort}
-        for engine, model, effort in _standby_engines.values()
-    )
-    engines.extend(
-        {"card_id": card_id, "model": engine.model, "effort": engine.effort}
         for card_id, engine in _stream_json_engines.items()
-    )
+    ]
     engines.extend(
         {"card_id": "standby", "model": model, "effort": effort}
         for engine, model, effort in _standby_stream_json_engines.values()
@@ -445,120 +346,43 @@ def list_live_engines() -> list[dict]:
     return engines
 
 
-# Pre-warmed, unclaimed PtyEngine per project (issue #136) -- kept ready so a
-# brand-new /do session can claim an already-running process directly
-# instead of paying the "wait for claude to open" spawn cost inline on its
-# first turn. Keyed by project_id (only one project is ever active at a
-# time -- see `_active_project_id` in `rhubarb/web/app.py`), not card_id: a
-# standby is never assigned to a card_id or run through a turn until
-# claimed. Stores the (model, effort) it was spawned with alongside the
-# engine so a claim attempt can tell a match from a stale one.
-_standby_engines: dict[int, tuple[PtyEngine, str | None, str | None]] = {}
-
-
-async def ensure_standby_engine(
-    project_id: int, *, cwd: str | None, model: str | None, effort: str | None
-) -> None:
-    """Make sure a live, matching standby exists for `project_id`, spawning
-    one if it doesn't (or replacing a dead one). A no-op when a live,
-    already-matching standby is already there -- never more than one
-    standby per project. Fire-and-forget: callers schedule this via
-    `asyncio.create_task` rather than awaiting it, since nothing should
-    block on a pre-warm."""
-    existing = _standby_engines.get(project_id)
-    if existing is not None:
-        engine, standby_model, standby_effort = existing
-        if engine.isalive() and standby_model == model and standby_effort == effort:
-            return
-        engine.close()
-        del _standby_engines[project_id]
-
-    engine = await asyncio.to_thread(_spawn_fresh_engine, cwd=cwd, model=model, effort=effort)
-    _standby_engines[project_id] = (engine, model, effort)
-
-
-def claim_standby_engine(project_id: int, *, model: str | None, effort: str | None) -> PtyEngine | None:
-    """Pop and return `project_id`'s standby if it's alive and its
-    model/effort match what's being requested; otherwise discard whatever
-    was there (dead or mismatched -- never left dangling) and return `None`
-    so the caller falls back to today's spawn-on-demand/DB-pool path."""
-    existing = _standby_engines.pop(project_id, None)
-    if existing is None:
-        return None
-    engine, standby_model, standby_effort = existing
-    if not engine.isalive() or standby_model != model or standby_effort != effort:
-        engine.close()
-        return None
-    return engine
-
-
-def close_standby_engine(project_id: int) -> None:
-    """Close and discard `project_id`'s standby, if any -- called when a
-    project is closed or switched away from, so a standby never leaks past
-    the project it was warmed for."""
-    existing = _standby_engines.pop(project_id, None)
-    if existing is not None:
-        existing[0].close()
-
-
-def _spawn_fresh_engine(*, cwd: str | None, model: str | None, effort: str | None) -> PtyEngine:
-    """Construct and start a genuinely fresh `PtyEngine` -- no
-    `resume_session_id` -- a brand-new, empty conversation. Used everywhere
-    this module used to call `cli_client.clear_session`: issue #87 replaces
-    sending the literal text "/clear" to a resident process with tearing
-    that tab down and starting an actually-fresh one, since the whole point
-    of clearing is to reclaim context by starting over, not to keep talking
-    to the same process. Blocking (real spawn is a subprocess call) --
-    callers run this via `asyncio.to_thread`."""
-    engine = PtyEngine(cwd=cwd, model=model, effort=effort)
-    engine.start()
-    return engine
-
-
 # ---------------------------------------------------------------------------
-# Stream-json engine wiring, grilling phase ONLY (issue #184, step 2 of PRD
-# #182 -- `gh issue view 182` for full context). Every other phase
-# (creating_prd, creating_issues, implementing, qa, ...) keeps using
-# `PtyEngine`/`_pty_engines`/`_get_or_create_engine`/`_run_turn` above,
-# completely unchanged -- dispatch happens only in `start_session_job` and
-# `continue_session_job` below (the only two entry points that ever run a
-# grilling-phase turn), which check `row["phase"] == "grilling"` and route
-# to this section instead. Everything here mirrors its `PtyEngine`
-# counterpart above by name/shape on purpose, for the same reason issue
-# #183's own docstring gives: tests stay familiar, and a future reader can
-# diff the two sections directly.
+# StreamJsonEngine wiring -- the sole transport for every phase (issue #184
+# introduced it for grilling only; issue #225's live testing found
+# `PtyEngine`'s `--resume` reattachment from a headless-originated session
+# hangs indefinitely with no output/error on this platform, so every other
+# phase migrated here too and `PtyEngine`/`rhubarb/pty_engine.py` was
+# removed entirely).
 #
-# KNOWN GAP -- deliberate, not an oversight (see issue #184's "explicitly
-# deferred" section): none of this survives a full Rhubarb server restart.
-# `_stream_json_engines`/`_standby_stream_json_engines` are in-memory only,
-# exactly like `_pty_engines`/`_standby_engines` -- but unlike a `PtyEngine`
-# row (which can always be reattached later via `--resume claude_session_id`
-# against a freshly-constructed `PtyEngine`), nothing here has been built to
-# pick a grilling session back up after a restart. If the server restarts
-# mid-grilling, that session is simply lost and the user starts over.
-# Restart-survival for this engine is out of scope for this experiment and
+# KNOWN GAP -- deliberate, not an oversight: none of this survives a full
+# Rhubarb server restart. `_stream_json_engines`/`_standby_stream_json_engines`
+# are in-memory only, and nothing here has been built to pick a session back
+# up after a restart. If the server restarts mid-session, that session is
+# simply lost and the user starts over. Restart-survival is out of scope and
 # left for a future issue.
 # ---------------------------------------------------------------------------
 
 _stream_json_engines: dict[int, StreamJsonEngine] = {}
 
-# Pre-warmed, unclaimed StreamJsonEngine per project (mirrors
-# `_standby_engines`, issue #136, for the new engine) -- so a brand-new
-# session's first (grilling) turn doesn't pay inline spawn latency. Every
-# brand-new session begins in grilling (see `db.create_session`'s own
-# `phase="grilling"` default), so this is the ONLY standby a fresh
-# `/api/session/start` call needs any more -- see `rhubarb/web/app.py`'s
-# `open_project`/`close_project`/`start_session`, which now warm/claim this
-# standby instead of `_standby_engines`.
+# Pre-warmed, unclaimed StreamJsonEngine per project (issue #136) -- so a
+# brand-new session's first turn doesn't pay inline spawn latency. Keyed by
+# project_id (only one project is ever active at a time -- see
+# `_active_project_id` in `rhubarb/web/app.py`), not card_id: a standby is
+# never assigned to a card_id or run through a turn until claimed. Stores
+# the (model, effort) it was spawned with alongside the engine so a claim
+# attempt can tell a match from a stale one.
 _standby_stream_json_engines: dict[int, tuple[StreamJsonEngine, str | None, str | None]] = {}
 
 
 def _get_or_create_stream_json_engine(
     card_id: int, *, cwd: str | None, model: str | None, effort: str | None, resume_session_id: str | None
 ) -> StreamJsonEngine:
-    """Stream-json analogue of `_get_or_create_engine` -- see its docstring
-    for the shared contract (construct+start on first use, reuse thereafter,
-    never recreated per turn)."""
+    """Return this card's resident tab, constructing and starting one
+    (fresh, or reattached via `--resume resume_session_id` -- e.g. a reused
+    pooled session, or a session picked back up after a Rhubarb restart) if
+    this is the first turn for this `card_id`. Every later turn for the
+    same `card_id` reuses the exact same `StreamJsonEngine` instance --
+    never recreated per turn."""
     engine = _stream_json_engines.get(card_id)
     if engine is not None:
         return engine
@@ -569,18 +393,21 @@ def _get_or_create_stream_json_engine(
 
 
 def register_stream_json_engine(card_id: int, engine: StreamJsonEngine) -> None:
-    """Stream-json analogue of `register_engine` -- registers an
-    already-running engine (a claimed standby) as `card_id`'s resident tab."""
+    """Register an already-running engine (a claimed standby) as `card_id`'s
+    resident tab, so `_get_or_create_stream_json_engine`'s own "already
+    resident, don't spawn" check picks it up on the first turn, exactly as
+    if it had been spawned for this card_id from the start."""
     _stream_json_engines[card_id] = engine
 
 
 def _close_stream_json_engine(card_id: int) -> None:
-    """Stream-json analogue of `_close_engine` -- pop and close this card's
-    resident `StreamJsonEngine`, if any, and drop its turn lock (the same
-    `_turn_locks` registry `_close_engine` itself already pops -- this is
-    genuinely the SAME lock mechanism, just recreated at the same natural
-    "this card's engine incarnation just ended" boundary `_close_engine`
-    already recreates it at)."""
+    """Close and forget this card's resident tab, if any -- called whenever
+    a card's tab finishes: pooled for reuse, fully done, handed off to a
+    different card_id (the /implement -> /qa auto-handoff), or errored out
+    (a later retry reattaches a fresh tab via `--resume` instead of
+    continuing to drive a process that just raised). Also drops this card's
+    turn lock from `_turn_locks`, recreated on first use by the next
+    incarnation."""
     engine = _stream_json_engines.pop(card_id, None)
     if engine is not None:
         engine.close()
@@ -590,8 +417,12 @@ def _close_stream_json_engine(card_id: int) -> None:
 async def ensure_standby_stream_json_engine(
     project_id: int, *, cwd: str | None, model: str | None, effort: str | None
 ) -> None:
-    """Stream-json analogue of `ensure_standby_engine` -- see its docstring
-    for the shared contract."""
+    """Make sure a live, matching standby exists for `project_id`, spawning
+    one if it doesn't (or replacing a dead one). A no-op when a live,
+    already-matching standby is already there -- never more than one
+    standby per project. Fire-and-forget: callers schedule this via
+    `asyncio.create_task` rather than awaiting it, since nothing should
+    block on a pre-warm."""
     existing = _standby_stream_json_engines.get(project_id)
     if existing is not None:
         engine, standby_model, standby_effort = existing
@@ -607,8 +438,10 @@ async def ensure_standby_stream_json_engine(
 def claim_standby_stream_json_engine(
     project_id: int, *, model: str | None, effort: str | None
 ) -> StreamJsonEngine | None:
-    """Stream-json analogue of `claim_standby_engine` -- see its docstring
-    for the shared contract."""
+    """Pop and return `project_id`'s standby if it's alive and its
+    model/effort match what's being requested; otherwise discard whatever
+    was there (dead or mismatched -- never left dangling) and return `None`
+    so the caller falls back to today's spawn-on-demand/DB-pool path."""
     existing = _standby_stream_json_engines.pop(project_id, None)
     if existing is None:
         return None
@@ -620,23 +453,26 @@ def claim_standby_stream_json_engine(
 
 
 def close_standby_stream_json_engine(project_id: int) -> None:
-    """Stream-json analogue of `close_standby_engine` -- see its docstring
-    for the shared contract."""
+    """Close and discard `project_id`'s standby, if any -- called when a
+    project is closed or switched away from, so a standby never leaks past
+    the project it was warmed for."""
     existing = _standby_stream_json_engines.pop(project_id, None)
     if existing is not None:
         existing[0].close()
 
 
 def _spawn_fresh_stream_json_engine(*, cwd: str | None, model: str | None, effort: str | None) -> StreamJsonEngine:
-    """Stream-json analogue of `_spawn_fresh_engine` -- a genuinely fresh
-    `StreamJsonEngine`, no `resume_session_id`. Blocking (real spawn is a
+    """Construct and start a genuinely fresh `StreamJsonEngine` -- no
+    `resume_session_id` -- a brand-new, empty conversation. Used everywhere
+    this module needs to reclaim context by starting over rather than
+    keeping talking to the same process. Blocking (real spawn is a
     subprocess call) -- callers run this via `asyncio.to_thread`."""
     engine = StreamJsonEngine(cwd=cwd, model=model, effort=effort)
     engine.start()
     return engine
 
 
-async def _run_grilling_stream_json_turn(
+async def _run_stream_json_turn(
     card_id: int,
     prompt: str,
     *,
@@ -644,37 +480,52 @@ async def _run_grilling_stream_json_turn(
     cwd: str | None,
     model: str | None,
     effort: str | None,
+    phase: str,
 ) -> dict | None:
-    """Stream-json analogue of `_run_turn` (see its docstring for the full
-    shared contract), used ONLY for a grilling card's turns. Runs one turn
-    against this card's resident `StreamJsonEngine`
-    (`_get_or_create_stream_json_engine`), guarded by the EXACT SAME
-    per-card turn lock `_run_turn` itself uses (`_get_turn_lock`, unmodified
-    -- see issue #184's explicit "reuse the turn lock as-is" requirement) --
-    so a second write for the same `card_id` while a grilling turn is in
-    flight produces the identical "Another turn for this session is already
-    in progress" error a `PtyEngine`-backed card's `_run_turn` would
-    produce, via the same lock. Returns `None` (having already published
-    that error itself, same contract as `_run_turn`) when the lock was
-    already held.
+    """Run one turn against this card's resident `StreamJsonEngine` tab (see
+    `_get_or_create_stream_json_engine` -- constructed and started on the
+    first call for this `card_id`, reattached via `--resume session_id` if
+    one is already known, and reused unchanged on every later call for the
+    same `card_id`), streaming translated events into the session's live
+    buffer as they arrive.
 
     Every raw event `StreamJsonEngine.stream_turn` yields is translated via
-    the same `stream_translate.translate_event()` `_run_turn` uses and
-    published on this card's stream via the same `publish()` call, except
-    the translated `turn` (`result`) event, which is returned to the caller
-    instead (same "boundary marker" contract as `_run_turn`).
+    `stream_translate.translate_event()` and published on this card's
+    stream via `publish()`, except the translated `turn` (`result`) event,
+    which is returned to the caller instead (the turn's "boundary marker").
 
-    Any turn failure -- including `StreamJsonEngineUnrecoverableError`
-    (this engine's own internal crash-retry-once, see `stream_json_engine
-    .py`, already gave up) -- is folded into a plain `ClaudeCLIError`,
-    UNLIKE `_run_turn`'s special-cased `PtyEngineUnrecoverableError`
-    routing to the generic "blocked, reply to retry" flow
-    (`_route_crash_to_blocked`): `StreamJsonEngine` exposes no raw
-    keystroke `write()`/`stream_reply()` passthrough for a human to nudge a
-    dead subprocess back to life the way `PtyEngine` does, so there is
-    nothing a "blocked" UI could usefully resume into here -- a plain error
-    turn (which the frontend already shows a retry affordance for) is the
-    honest outcome instead."""
+    `full_text` on the returned dict is the turn's ENTIRE accumulated
+    stream of `text` deltas, not just the CLI's own terse final `result`
+    field -- bug found live-testing PRD #222: the CLI's own `result` event
+    text is only the LAST assistant text block of the turn -- if the model
+    prints a question round, then calls a tool (e.g. writing
+    `.claude/rhubarb_question.md`), then closes with a short remark
+    ("Waiting on your answers..."), `result` captures only that closing
+    remark, silently dropping the earlier content the Live Terminal panel
+    already streamed to the user. Every `text` delta is accumulated here
+    into `full_text` (a superset of `result`, since every content block --
+    including ones before a tool call -- streams via `content_block_delta`
+    first) so a caller's parsing/extraction sees exactly what the user
+    already saw on screen, not just the turn's final sentence. Callers
+    should use `full_text`, not `result`, for any text they parse.
+
+    Issue #144: guarded by this card's turn lock (`_get_turn_lock`) so two
+    overlapping calls for the same `card_id` can never both write to and
+    read from the same resident engine at once. If the lock is already
+    held -- a genuine in-flight turn for this card_id -- this call (issue
+    #149) publishes an explicit error `turn` event (`_turn_event`, tagged
+    with the caller's own in-flight `phase`) on this card's stream, then
+    returns `None` immediately, touching neither the engine nor anything
+    else. Every caller must check for `None` and return early rather than
+    treat it as a normal completed (or failed) turn -- and must NOT publish
+    or log anything further for this case, since the error has already
+    been surfaced here.
+
+    Raises `ClaudeCLIError` on an ordinary failure, or propagates
+    `StreamJsonEngineUnrecoverableError` (this engine's own internal
+    crash-retry-once already gave up) unwrapped -- callers route that into
+    the blocked-card flow (see `_route_crash_to_blocked`) instead of
+    treating it like a plain `ClaudeCLIError`."""
     lock = _get_turn_lock(card_id)
     if lock.locked():
         lookup_conn = db.get_connection()
@@ -682,7 +533,7 @@ async def _run_grilling_stream_json_turn(
         publish(
             card_id,
             _turn_event(
-                phase="grilling",
+                phase=phase,
                 error="Another turn for this session is already in progress -- please wait for it to finish.",
                 needs_github_login=False,
                 card_id=card_id,
@@ -698,19 +549,33 @@ async def _run_grilling_stream_json_turn(
             engine = _get_or_create_stream_json_engine(
                 card_id, cwd=cwd, model=model, effort=effort, resume_session_id=session_id
             )
+            text_chunks: list[str] = []
             async for raw_event in engine.stream_turn(prompt):
                 translated = translate_event(raw_event)
                 if translated is None:
                     continue
+                if translated["type"] == "text":
+                    text_chunks.append(translated["text"])
                 if translated["type"] == "turn":
                     translated["context_pct"] = _context_window_pct(raw_event)
+                    translated["full_text"] = "".join(text_chunks) or translated["result"]
                     holder["turn"] = translated
                     continue
                 publish(card_id, translated)
 
         try:
             await runner()
+        except StreamJsonEngineUnrecoverableError:
+            raise
+        except ClaudeCLIError as e:
+            holder["error"] = e
         except Exception as e:
+            # Anything unexpected (a malformed raw event, a bug in
+            # translation) must still resolve into a recorded session
+            # error, not an unhandled exception on the fire-and-forget
+            # asyncio task -- that would leave the card stuck in its
+            # in-flight phase silently instead of surfacing the failure to
+            # the user.
             holder["error"] = ClaudeCLIError(str(e))
 
         if "error" in holder:
@@ -718,45 +583,49 @@ async def _run_grilling_stream_json_turn(
         return holder["turn"]
 
 
-async def _extract_grilling_questions_via_parser_session(project_id: int, text: str) -> dict | None:
-    """Issue #221 (child of PRD #187/#220): drive `project_id`'s already-
-    running parser session synchronously to extract structured questions out
-    of `text` -- a grilling turn's raw result that `parse_grilling_response`
-    already regex-parsed to zero questions. Uses the exact same extraction
-    prompt/validation `parser_session._process_one_queued_item` uses for the
-    needs-input queue (`_EXTRACTION_PROMPT_TEMPLATE`, `_extract_json_object`,
-    `_is_valid_grilling_shape`), just called inline here instead of via that
-    queue -- grilling has no need for the queue's async/routing machinery
-    since this call's result is used immediately, in the same request.
+async def _extract_questions_via_parser_session(project_id: int, text: str, *, phase: str) -> dict | None:
+    """Issue #221 (child of PRD #187/#220), simplified by issue #230's own
+    scope-update to a shared helper, and -- PRD #227 follow-up, gap 1,
+    discovered during manual testing/design review after #228/#229/#230 were
+    already closed out in code -- now delegates to `parser_session.
+    extract_with_validation` instead of duplicating its own copy of the
+    extraction/validation sequence. Before this change, this function called
+    `parser_session.stream_turn`/`_extract_json_object`/
+    `_is_valid_grilling_shape` directly, with NO call into issue #229's
+    post-extraction mismatch-detection/single-retry/`extraction_incomplete`-
+    tagging logic at all -- meaning the original PRD #227 bug (a question's
+    options/recommended silently dropped) was NOT actually protected against
+    on this path, the live-turn path that produced the bug in the first
+    place; only `parser_session._process_one_queued_item`'s async
+    needs-input-queue consumer had that protection. `extract_with_validation`
+    is the single shared implementation both now call.
+
+    `phase` is passed straight through -- it only labels which phase this
+    text came from for the skill's own reference; for every phase this
+    function is called with (grilling, implementing), it never changes the
+    output shape or the validation applied to it (`extract_with_validation`'s
+    default `_is_valid_grilling_shape`/`detect_mismatches=True`).
 
     Returns a `{header, questions, footer, source: "parser_session"}` dict on
-    a successful, schema-valid parse. Returns `None` on any failure -- a
-    dead/missing parser session, a turn that produced no `result` event, or
-    a response that isn't valid JSON matching the expected shape -- so a
-    caller treats `None` exactly like "the parser session found no questions
-    either" and falls through to the existing `publish_when_empty` handling.
-    Deliberately no legacy regex/Ollama-rescue fallback here (unlike
-    `parser_session.drain_needs_input_queue`'s own queue path): the regex
-    parser has already run and found nothing before this is ever called, so
-    falling back to it again would just re-run the same failed parse."""
-    prompt = parser_session._EXTRACTION_PROMPT_TEMPLATE.format(phase="grilling", text=text)
+    a successful, schema-valid parse (now possibly carrying
+    `extraction_incomplete: true` on individual questions per issue #229).
+    Returns `None` on any failure -- a dead/missing parser session, a turn
+    that produced no `result` event, or a response that isn't valid JSON
+    matching the expected shape -- so a caller treats `None` exactly like
+    "the parser session found no questions either". Deliberately no legacy
+    regex/Ollama-rescue fallback here (unlike
+    `parser_session.drain_needs_input_queue`'s own queue path): a caller with
+    no live parser session has nothing else to try for this phase anymore."""
+    return await parser_session.extract_with_validation(project_id, text, phase=phase)
 
-    try:
-        result_text = None
-        async for event in parser_session.stream_turn(project_id, prompt):
-            if event.get("type") == "result":
-                result_text = event.get("result")
-    except Exception:  # noqa: BLE001 -- a dead/failed parser session must not crash the grilling turn
-        return None
 
-    if result_text is None:
-        return None
-
-    data = parser_session._extract_json_object(result_text)
-    if data is None or not _is_valid_grilling_shape(data):
-        return None
-
-    return {"header": data["header"], "questions": data["questions"], "footer": data["footer"], "source": "parser_session"}
+async def _extract_grilling_questions_via_parser_session(project_id: int, text: str) -> dict | None:
+    """Grilling's own call into the shared `_extract_questions_via_parser_
+    session` helper above, with phase `"grilling"` -- kept as its own named
+    function (rather than inlining the phase literal at `_run_grilling_turn_
+    stream_json`'s own call site) since it's referenced by name in this
+    module's docstrings/comments elsewhere."""
+    return await _extract_questions_via_parser_session(project_id, text, phase="grilling")
 
 
 async def _run_grilling_turn_stream_json(
@@ -770,44 +639,60 @@ async def _run_grilling_turn_stream_json(
     effort: str | None,
     publish_when_empty: bool = False,
 ) -> dict | None:
-    """Stream-json analogue of `_run_grilling_turn`, for a grilling card
-    dispatched to the new engine (issue #184). Mirrors that function's
-    publish/persist contract exactly (`turn` event shape, DB fields,
-    `publish_when_empty` semantics, return value) but its question-parsing
-    is deliberately much simpler: `qa_parser.parse_grilling_response` is
-    called directly on the completed turn's own `result` text, with NO
-    `.claude/rhubarb_question.md` file-preference read/delete and NO Ollama
-    rescue-classifier fallback, and NO corrective-retry follow-up turn.
+    """Run one grilling turn and parse its structured questions -- question
+    extraction here is a single synchronous parser-session pass
+    (`_extract_grilling_questions_via_parser_session`) against the completed
+    turn's own accumulated `full_text` (see `_run_stream_json_turn`'s
+    docstring -- NOT just the CLI's own terse `result` sentence, which can
+    silently omit an earlier text block), with NO `.claude/
+    rhubarb_question.md` file-preference read/delete and NO Ollama
+    rescue-classifier fallback, and NO corrective-retry follow-up turn:
+    those all existed historically to compensate for `PtyEngine`'s
+    PTY-rendering/capture-timing unreliability (word-wrap, ANSI
+    cursor-movement redraws, a file write racing a terminal read), which
+    doesn't apply to `StreamJsonEngine`'s structured stream-json output --
+    see issue #184's acceptance criteria and issue #225's removal of
+    `PtyEngine` entirely. QA and implementing keep their own equivalent
+    file-preference conventions (`_QA_QUESTION_FILE`, `_IMPLEMENT_BLOCKED_FILE`),
+    untouched by this.
 
-    That whole file-preference/rescue/corrective-retry chain
-    (`_run_grilling_turn`/`_run_grilling_corrective_retry`
-    /`_maybe_extract_needs_input_grilling`) exists specifically to
-    compensate for `PtyEngine`'s PTY-rendering/capture-timing unreliability
-    -- word-wrap, ANSI cursor-movement redraws, a file write racing a
-    terminal read. None of that applies here: `StreamJsonEngine`'s `result`
-    event text comes straight from the CLI's own structured stream-json
-    output, not a scraped/rendered terminal buffer, so there is nothing for
-    that compensation mechanism to compensate for -- see the issue's
-    acceptance criteria: a grilling card under this engine must NOT touch
-    the question file or invoke the Ollama rescue path. That existing
-    chain is left completely untouched and still fully exercised by every
-    other phase that has its own equivalent (`_QA_QUESTION_FILE`,
-    `_IMPLEMENT_BLOCKED_FILE`).
+    Issue #221 (child of PRD #187/#220), simplified by issue #230: this used
+    to try `qa_parser.parse_grilling_response`'s regex parser first and only
+    call `_extract_grilling_questions_via_parser_session` when that came back
+    empty -- but the grilling skill's real output (`❓ **Qn** - **title**:
+    body`) never matches that regex format, so the "try regex first" step
+    was confirmed dead (always empty) and removed; this now goes straight to
+    the parser-session extraction pass. This replaced the old
+    `handle_turn_completed` Ollama needs-input classifier gate for this
+    phase specifically, which the issue's acceptance criteria requires be
+    gone (grilling always transitions to PRD next; there is no "needs input"
+    holding state for it to gate into).
 
-    Issue #221 (child of PRD #187/#220): a turn `parse_grilling_response`
-    can't find questions in also gets one synchronous parser-session pass
-    (`_extract_grilling_questions_via_parser_session`) before falling back to
-    `publish_when_empty` -- this replaced the old `handle_turn_completed`
-    Ollama needs-input classifier gate for this phase specifically, which
-    the issue's acceptance criteria requires be gone (grilling always
-    transitions to PRD next; there is no "needs input" holding state for it
-    to gate into)."""
+    Issue #223 (child of PRD #222): once the frontier comes back empty (no
+    parsed questions, and the turn wasn't already routed to `_finish_chain`
+    by the issue #219 fast path above), this now calls `advance_past_grilling`
+    itself before returning -- no "Yes, proceed" confirmation click required
+    anymore. The empty-questions `turn` event is still published first (when
+    `publish_when_empty`), so the frontend briefly sees the wrap-up header
+    exactly as before; it's the very next thing on this same stream that now
+    differs (a `creating_prd` phase event instead of silence).
+
+    Issue #225 (child of PRD #222): a `StreamJsonEngineUnrecoverableError`
+    (this engine's own crash-retry-once already gave up) now routes into
+    the same generic "blocked, reply to retry" flow every other phase uses
+    (`_route_crash_to_blocked`), instead of folding into a plain
+    `ClaudeCLIError` -- grilling gains blocked-crash-recovery for the first
+    time here, removing an asymmetry that only existed because no other
+    phase used `StreamJsonEngine` before this migration."""
     publish(card_id, {"type": "phase", "phase": "grilling"})
 
     try:
-        turn = await _run_grilling_stream_json_turn(
-            card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort
+        turn = await _run_stream_json_turn(
+            card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort, phase="grilling"
         )
+    except StreamJsonEngineUnrecoverableError as e:
+        await _route_crash_to_blocked(card_id, conn, e, phase="grilling")
+        return None
     except ClaudeCLIError as e:
         _close_stream_json_engine(card_id)
         message = str(e)
@@ -826,12 +711,18 @@ async def _run_grilling_turn_stream_json(
 
     if turn is None:
         # Issue #144/#149: a genuine turn for this card_id is already in
-        # flight -- `_run_grilling_stream_json_turn` already published the
+        # flight -- `_run_stream_json_turn` already published the
         # duplicate-call error itself; nothing more to do here.
         return None
 
-    parsed = parse_grilling_response(turn["result"])
-    console_text = row["console_text"] + "\n\n" + turn["result"] if row["console_text"] else turn["result"]
+    # Use the turn's full accumulated text (every streamed text block, not
+    # just the CLI's own final `result` sentence -- see
+    # `_run_grilling_stream_json_turn`'s docstring above) for parsing,
+    # extraction, and history -- this is what the Live Terminal panel
+    # already showed the user, so a round that streamed real questions
+    # before a trailing tool call/closing remark is never silently dropped.
+    full_text = turn["full_text"]
+    console_text = row["console_text"] + "\n\n" + full_text if row["console_text"] else full_text
 
     # Issue #219: when the grilling skill auto-advances through the full /do
     # chain (PRD + issues) in one turn, no questions come back but the result
@@ -839,9 +730,13 @@ async def _run_grilling_turn_stream_json(
     # title-extracting _DETAIL_RE, which requires ": " or "- " after the number
     # and fails against natural-language summaries like "Created PRD #N and its
     # issue #M") to detect this. This chain-completion guard runs BEFORE the
-    # issue #221 parser-session dispatch below and is unchanged by it -- a
-    # turn that already completed the chain never needs question extraction.
-    if not parsed["questions"] and re.search(r"\b(?:PRD|Issue)\s*#\d+", console_text, re.IGNORECASE):
+    # issue #221 parser-session dispatch below -- a turn that already
+    # completed the chain never needs question extraction. (Issue #230: this
+    # used to also require the now-removed regex parser to have found zero
+    # questions, but that regex never matched the grilling skill's real
+    # output, so the extra condition was always true in practice and is
+    # dropped along with the dead parse call.)
+    if re.search(r"\b(?:PRD|Issue)\s*#\d+", console_text, re.IGNORECASE):
         db.update_session(
             conn,
             card_id,
@@ -849,7 +744,7 @@ async def _run_grilling_turn_stream_json(
             effort=effort,
             claude_session_id=turn["session_id"],
             console_text=console_text,
-            interview_json=json.dumps(parsed),
+            interview_json=json.dumps({"header": full_text, "questions": [], "footer": "", "source": None}),
             context_pct=turn.get("context_pct"),
         )
         # _finish_chain re-reads console_text from DB (already persisted
@@ -857,23 +752,18 @@ async def _run_grilling_turn_stream_json(
         await _finish_chain(card_id, conn, turn["session_id"], cwd, summary=turn["result"])
         return None
 
-    if not parsed["questions"]:
-        # Issue #221 (child of PRD #187/#220): this engine's own regex-only
-        # parsing (`parse_grilling_response`) doesn't recognise every format
-        # the grilling skill can emit (e.g. `❓ **Q1** - **title**: body`), so
-        # a turn that regex-parsed to zero questions gets one more shot via
-        # this project's live parser session -- the SAME synchronous-
-        # extraction contract `parser_session._process_one_queued_item`
-        # already uses for the needs-input queue, just driven inline here
-        # instead of via that queue. Replaces the old `handle_turn_completed`
-        # Ollama needs-input classifier gate entirely: grilling always
-        # transitions to PRD next, so there is no "needs input" holding
-        # state for it to gate into anymore.
-        extracted = await _extract_grilling_questions_via_parser_session(
-            row["project_id"], turn["result"]
-        )
-        if extracted is not None:
-            parsed = extracted
+    # Issue #221 (child of PRD #187/#220), simplified by issue #230: go
+    # straight to this project's live parser session -- the SAME
+    # synchronous-extraction contract `parser_session._process_one_queued_
+    # item` already uses for the needs-input queue, just driven inline here
+    # instead of via that queue -- to extract structured questions out of
+    # the turn's own free text (e.g. `❓ **Q1** - **title**: body`). Replaces
+    # the old `handle_turn_completed` Ollama needs-input classifier gate
+    # entirely: grilling always transitions to PRD next, so there is no
+    # "needs input" holding state for it to gate into anymore.
+    parsed = await _extract_grilling_questions_via_parser_session(row["project_id"], full_text)
+    if parsed is None:
+        parsed = {"header": full_text, "questions": [], "footer": "", "source": None}
 
     db.update_session(
         conn,
@@ -889,7 +779,11 @@ async def _run_grilling_turn_stream_json(
     if parsed["questions"] or publish_when_empty:
         publish(card_id, _turn_event(phase="grilling", interview=parsed))
 
-    return parsed if parsed["questions"] else None
+    if parsed["questions"]:
+        return parsed
+
+    await advance_past_grilling(card_id, cwd)
+    return None
 
 
 async def _maybe_clear_for_next_phase(card_id: int, conn, row, *, cwd: str | None, cutoff: float) -> str:
@@ -901,30 +795,28 @@ async def _maybe_clear_for_next_phase(card_id: int, conn, row, *, cwd: str | Non
 
     Reads `row["context_pct"]` (persisted after the previous phase's last
     turn) rather than measuring anything fresh: an unknown value (`None`,
-    e.g. no turn has completed yet, or a `PtyEngine`-driven turn's usage
-    fields are unavailable -- see the module-level note above) is treated
-    as safe to continue, same as `_context_window_pct`'s own
-    None-on-uncertainty behavior.
+    e.g. no turn has completed yet) is treated as safe to continue, same as
+    `_context_window_pct`'s own None-on-uncertainty behavior.
 
     At or under `cutoff`: returns the row's existing `claude_session_id`
     unchanged -- the next phase continues in the same tab, no fresh engine.
 
     Over `cutoff`: tears down this card's resident tab and starts a
-    genuinely fresh one (see `_spawn_fresh_engine`) *for this same
-    card_id* -- the next phase continues right on in the new tab, it's just
-    talking to an empty conversation instead of the old one. Persists the
-    new session id and resets `context_pct` to `None` on the row (the fresh
-    tab starts with an empty, unmeasured context again). This is a
+    genuinely fresh one (see `_spawn_fresh_stream_json_engine`) *for this
+    same card_id* -- the next phase continues right on in the new tab, it's
+    just talking to an empty conversation instead of the old one. Persists
+    the new session id and resets `context_pct` to `None` on the row (the
+    fresh tab starts with an empty, unmeasured context again). This is a
     pre-phase gate only -- once the next phase is running, it is never
     interrupted mid-run even if it goes on to cross `cutoff` itself."""
     context_pct = row["context_pct"]
     if context_pct is None or context_pct <= cutoff:
         return row["claude_session_id"]
 
-    _close_engine(card_id)
-    engine = await asyncio.to_thread(_spawn_fresh_engine, cwd=cwd, model=row["model"], effort=row["effort"])
-    _pty_engines[card_id] = engine
-    new_session_id = engine.claude_session_id
+    _close_stream_json_engine(card_id)
+    engine = await asyncio.to_thread(_spawn_fresh_stream_json_engine, cwd=cwd, model=row["model"], effort=row["effort"])
+    _stream_json_engines[card_id] = engine
+    new_session_id = engine.session_id
     db.update_session(conn, card_id, claude_session_id=new_session_id, context_pct=None)
     return new_session_id
 
@@ -933,27 +825,27 @@ async def _clear_for_reuse(
     card_id: int, *, project_id: int, cwd: str | None, model: str | None, effort: str | None
 ) -> str:
     """Reclaim context by starting a genuinely fresh conversation (see
-    `_spawn_fresh_engine`), for a card whose row is about to be pooled
-    (`db.mark_session_available`) for reuse under a *different*, future
-    card_id -- this card's own tab is closed for good here, since nothing
-    will ever run another turn against this `card_id` again.
+    `_spawn_fresh_stream_json_engine`), for a card whose row is about to be
+    pooled (`db.mark_session_available`) for reuse under a *different*,
+    future card_id -- this card's own tab is closed for good here, since
+    nothing will ever run another turn against this `card_id` again.
 
     Unlike before issue #136, the freshly-spawned engine is NOT immediately
     closed after reading its id -- it's kept alive as `project_id`'s standby
-    (`ensure_standby_engine`'s registry), so the next `/do` for this project
-    can claim it directly with no spawn at all, instead of every pooling
-    cycle paying a full spawn just to throw the process away unused. The
-    returned id is still recorded via `db.mark_session_available` by every
-    caller, unchanged -- that DB-level pool remains the fallback path for
-    whenever this standby isn't claimed (mismatched model/effort, or a
-    different project became active first)."""
-    _close_engine(card_id)
-    engine = await asyncio.to_thread(_spawn_fresh_engine, cwd=cwd, model=model, effort=effort)
-    existing = _standby_engines.pop(project_id, None)
+    (`ensure_standby_stream_json_engine`'s registry), so the next `/do` for
+    this project can claim it directly with no spawn at all, instead of
+    every pooling cycle paying a full spawn just to throw the process away
+    unused. The returned id is still recorded via `db.mark_session_available`
+    by every caller, unchanged -- that DB-level pool remains the fallback
+    path for whenever this standby isn't claimed (mismatched model/effort,
+    or a different project became active first)."""
+    _close_stream_json_engine(card_id)
+    engine = await asyncio.to_thread(_spawn_fresh_stream_json_engine, cwd=cwd, model=model, effort=effort)
+    existing = _standby_stream_json_engines.pop(project_id, None)
     if existing is not None:
         existing[0].close()
-    _standby_engines[project_id] = (engine, model, effort)
-    return engine.claude_session_id
+    _standby_stream_json_engines[project_id] = (engine, model, effort)
+    return engine.session_id
 
 
 # In-memory, per-project FIFO queue for serial-mode ("parallel_implementation"
@@ -1009,13 +901,14 @@ def parse_details(text: str) -> dict:
     return {"prd": prd, "issues": issues, "raw": text}
 
 
-def _blocked_payload_from_crash(exc: PtyEngineUnrecoverableError) -> dict:
+def _blocked_payload_from_crash(exc: StreamJsonEngineUnrecoverableError) -> dict:
     """Synthesize the same shape of payload a genuine `implement_blocked`
     marker produces (see `_parse_implement_blocked_block`) out of a
-    `PtyEngineUnrecoverableError` -- issue #87's crash-routing requirement:
-    a turn that dies twice in a row (see that exception's docstring) is
-    routed into the exact same suspend-and-wait-for-a-human-reply mechanism
-    a genuine blocked marker already uses, rather than a new UI/error path."""
+    `StreamJsonEngineUnrecoverableError` -- issue #87's crash-routing
+    requirement: a turn that dies twice in a row (see that exception's
+    docstring) is routed into the exact same suspend-and-wait-for-a-human-
+    reply mechanism a genuine blocked marker already uses, rather than a new
+    UI/error path."""
     return {
         "phase": "implement_blocked",
         "issue": None,
@@ -1027,8 +920,8 @@ def _blocked_payload_from_crash(exc: PtyEngineUnrecoverableError) -> dict:
     }
 
 
-async def _route_crash_to_blocked(card_id: int, conn, exc: PtyEngineUnrecoverableError, *, phase: str) -> None:
-    """A `stream_turn` call raised `PtyEngineUnrecoverableError` (its
+async def _route_crash_to_blocked(card_id: int, conn, exc: StreamJsonEngineUnrecoverableError, *, phase: str) -> None:
+    """A `stream_turn` call raised `StreamJsonEngineUnrecoverableError` (its
     underlying process died twice in a row and gave up). Suspend this
     session exactly like a genuine `implement_blocked` marker would: `phase:
     blocked`, `blocked_json` set, a `turn` event carrying it -- so the same
@@ -1036,159 +929,21 @@ async def _route_crash_to_blocked(card_id: int, conn, exc: PtyEngineUnrecoverabl
     (`continue_implement_job`) picks this up too, regardless of which phase
     hit the crash. The dead tab is dropped from the registry so the next
     turn (that reply) constructs a fresh one, reattaching via `--resume` at
-    `exc.claude_session_id`."""
-    _close_engine(card_id)
+    `exc.session_id` -- unless that turn crashed before ever completing a
+    single one (`exc.session_id is None`), in which case a later reply
+    starts a genuinely fresh conversation rather than truly resuming; an
+    accepted, structural limitation of this transport, not a regression."""
+    _close_stream_json_engine(card_id)
     blocked = _blocked_payload_from_crash(exc)
     db.update_session(
         conn,
         card_id,
-        claude_session_id=exc.claude_session_id,
+        claude_session_id=exc.session_id,
         phase="blocked",
         blocked_json=json.dumps(blocked),
         stalled_json=None,
     )
     publish(card_id, _turn_event(phase="blocked", blocked=blocked))
-
-
-async def _run_turn(
-    card_id: int,
-    prompt: str,
-    *,
-    session_id: str | None,
-    cwd: str | None,
-    model: str | None = None,
-    effort: str | None = None,
-    phase: str,
-) -> dict | None:
-    """Run one turn against this card's resident `PtyEngine` tab (see
-    `_get_or_create_engine` -- constructed and started on the first call for
-    this `card_id`, reattached via `--resume session_id` if one is already
-    known, and reused unchanged on every later call for the same
-    `card_id`), streaming translated events into the session's live buffer
-    as they arrive. Returns the raw `result` event's translated boundary
-    marker ({"result", "session_id", "is_error"}) once the turn finishes;
-    raises `ClaudeCLIError` on an ordinary failure, or propagates
-    `PtyEngineUnrecoverableError` unwrapped -- callers route that into the
-    blocked-card flow (see `_route_crash_to_blocked`) instead of treating it
-    like a plain `ClaudeCLIError`.
-
-    Issue #144: guarded by this card's turn lock (`_get_turn_lock`) so two
-    overlapping calls for the same `card_id` can never both write to and
-    read from the same resident `PtyEngine` at once. If the lock is already
-    held -- a genuine in-flight turn for this card_id -- this call (issue
-    #149) publishes an explicit error `turn` event (`_turn_event`, tagged
-    with the caller's own in-flight `phase` so the frontend's existing
-    per-phase error handling -- e.g. `grilling`'s Submit/Send re-enable --
-    picks it up exactly like any other turn failure) on this card's stream,
-    then returns `None` immediately, touching neither the engine nor
-    anything else. Every caller must check for `None` and return early
-    rather than treat it as a normal completed (or failed) turn -- and must
-    NOT publish or log anything further for this case, since the error has
-    already been surfaced here.
-    """
-    lock = _get_turn_lock(card_id)
-    if lock.locked():
-        # No `conn`/`row` in scope on this path (unlike every other
-        # `_turn_event(error=...)` call site) -- look up just the
-        # `project_id` this log line needs.
-        lookup_conn = db.get_connection()
-        lookup_row = db.get_session(lookup_conn, card_id)
-        publish(
-            card_id,
-            _turn_event(
-                phase=phase,
-                error="Another turn for this session is already in progress -- please wait for it to finish.",
-                needs_github_login=False,
-                card_id=card_id,
-                project_id=lookup_row["project_id"] if lookup_row is not None else None,
-            ),
-        )
-        return None
-
-    async with lock:
-        holder: dict = {}
-
-        async def runner():
-            engine = _get_or_create_engine(
-                card_id, cwd=cwd, model=model, effort=effort, resume_session_id=session_id
-            )
-            # Lazily opened on this turn's first `stall`-shaped progress
-            # event (see below). Issue #173 replaced the old timer-based
-            # stall detection with an unconditional per-chunk progress event
-            # -- so, unlike issue #169's original "most turns never do"
-            # assumption, this now opens on (essentially) every turn, at its
-            # first chunk. Still just ONE connection for the whole turn,
-            # though: reused for every persist below and for clearing it
-            # again once the turn resolves, never reopened per chunk -- so
-            # staying lazy here still costs nothing extra over eagerly
-            # opening it up front, and skips the connection entirely for the
-            # rare turn that dies before a single chunk is ever read.
-            stall_conn = None
-            stalled = False
-
-            async for raw_event in engine.stream_turn(prompt):
-                translated = translate_event(raw_event)
-                if translated is None:
-                    continue
-                if translated["type"] == "stall":
-                    # Issue #173 (replacing issue #169's timer-based stall
-                    # detection): this now fires after every chunk read,
-                    # unconditionally, for the whole duration of any turn --
-                    # it is a turn-progress heartbeat, not a signal that
-                    # anything is actually stuck. The underlying read
-                    # `stream_turn` is awaiting is still pending underneath
-                    # each time this fires -- this loop is NOT ending, and
-                    # the turn lock (`lock`, held for this whole `async
-                    # with` block) is NOT released. Publish this as the
-                    # existing `turn` event shape (extended with
-                    # `stalled`/`stalled_context`) so a caller already
-                    # listening for `turn` events picks it up for free, and
-                    # persist the same context on the row -- mirroring how
-                    # `blocked_json` is persisted -- so a later reconnect
-                    # can recover and re-show it even after this event
-                    # itself has scrolled out of the live SSE stream.
-                    stalled = True
-                    if stall_conn is None:
-                        stall_conn = db.get_connection()
-                    db.update_session(
-                        stall_conn,
-                        card_id,
-                        stalled_json=json.dumps({"phase": phase, "context": translated["data"]}),
-                    )
-                    publish(card_id, _turn_event(phase=phase, stalled=True, stalled_context=translated["data"]))
-                    continue
-                if translated["type"] == "turn":
-                    translated["context_pct"] = _context_window_pct(raw_event)
-                    holder["turn"] = translated
-                    if stalled:
-                        # The turn genuinely resolved (the marker was seen)
-                        # after having stalled at least once -- clear the
-                        # persisted stall context so a reconnect no longer
-                        # sees a stall that's actually long over.
-                        if stall_conn is None:
-                            stall_conn = db.get_connection()
-                        db.update_session(stall_conn, card_id, stalled_json=None)
-                    continue
-                publish(card_id, translated)
-
-        try:
-            await runner()
-        except PtyEngineUnrecoverableError:
-            raise
-        except ClaudeCLIError as e:
-            holder["error"] = e
-        except Exception as e:
-            # Anything unexpected (a malformed raw event, a bug in
-            # translation) must still resolve into a recorded session
-            # error, not an unhandled exception on the fire-and-forget
-            # asyncio task -- that would leave the card stuck in its
-            # in-flight phase silently instead of surfacing the failure to
-            # the user.
-            holder["error"] = ClaudeCLIError(str(e))
-
-        if "error" in holder:
-            raise holder["error"]
-        return holder["turn"]
 
 
 def _turn_event(
@@ -1222,19 +977,16 @@ def _turn_event(
 
     `stalled`/`stalled_context` were originally (issue #173, replacing issue
     #169/PRD #168's timer-based version) this same `turn` event shape
-    extended for a turn still genuinely in flight, published by `_run_turn`'s
-    translation loop on every chunk read off the live process. Issue #175
-    retired that per-chunk mechanism entirely -- `PtyEngine` no longer emits
-    any event `translate_event` maps to `"stall"`, so `_run_turn` no longer
-    ever sets these fields; that call site is dead code kept only because
-    nothing has removed it yet. `_finish_implement_turn` (issue #179, child
-    of PRD #174) is the one live caller today: it sets these on a
-    *completed* implementing turn that the local Ollama classifier
-    (`classify_needs_input`) flagged as needing a human's input but whose
-    text had no recognizable question/option content to extract -- reviving
-    the existing `renderStalledSession`/`sendStallReply` frontend panel
-    (dead since #175 for the same reason) for that fallback case. Unlike the
-    old mid-turn meaning, `stalled_context` here is a short reason string
+    extended for a turn still genuinely in flight, published on every chunk
+    read off a live `PtyEngine` process. Issue #175 retired that per-chunk
+    mechanism entirely, and issue #225 removed `PtyEngine` itself -- no
+    remaining transport ever emits a mid-turn "stall" this way. Both
+    `_finish_implement_turn` (issue #179, child of PRD #174) and
+    `_run_chain_step` (issue #225) are live callers today: each sets these
+    on a *completed* turn that needs a human's input before the
+    phase/session can usefully continue on its own -- reviving the existing
+    `renderStalledSession`/`sendStallReply` frontend panel for that case.
+    Unlike the old mid-turn meaning, `stalled_context` here is a short reason string
     from the classifier, not a live buffer-so-far snapshot -- the turn is
     already over.
     """
@@ -1339,445 +1091,11 @@ async def handle_turn_completed(
     return classification
 
 
-_GRILLING_CORRECTIVE_PROMPT_TEMPLATE = (
-    'Your last reply for this round of grilling questions did not parse -- '
-    'it did not match the required `Question N: "..."` format (with '
-    "`Options:`/`Option N:`/`Recommended:` for a choice question, or "
-    "`Recommended text:` for an open one), so Rhubarb could not render it. "
-    "Here is exactly what you sent, unparsed:\n\n"
-    "-----\n{broken_output}\n-----\n\n"
-    "Please rewrite this same round's questions in the exact required "
-    "format described in your grilling instructions, and write the "
-    "rewritten `Question N:` blocks to `.claude/rhubarb_question.md` again "
-    "(overwriting it), exactly as you would for any other round -- do not "
-    "ask any new questions, just reformat the ones above."
-)
-
-
-def _grilling_result_is_suspicious(parsed: dict, file_text: str | None, terminal_text: str) -> bool:
-    """True when this round's parsed result came back with no questions, but
-    either the question file's raw content (captured before
-    `_run_grilling_turn` drops it for being unparseable) or the raw terminal
-    text looks like it was trying to contain questions -- issue #158's
-    extension of `should_attempt_grilling_rescue`'s own trigger check (the
-    `"question "` substring) to both sources, rather than terminal text
-    alone as the pre-existing Ollama-rescue check above does. Never true
-    for a genuine "no more questions" wrap-up turn, since that contains the
-    trigger substring in neither source."""
-    if should_attempt_grilling_rescue(parsed, terminal_text):
-        return True
-    return file_text is not None and should_attempt_grilling_rescue(parsed, file_text)
-
-
-async def _run_grilling_corrective_retry(
-    card_id: int,
-    conn,
-    row,
-    *,
-    broken_output: str,
-    session_id: str,
-    cwd: str | None,
-    model: str | None,
-    effort: str | None,
-) -> tuple[dict, dict] | None:
-    """Issue #158: a one-shot corrective follow-up turn for when
-    `_run_grilling_turn`'s existing file/terminal-text/Ollama-rescue chain
-    still leaves `parsed["questions"]` empty on a result that looks like it
-    was trying to contain questions (see `_grilling_result_is_suspicious`)
-    rather than a genuine wrap-up. Hands the model `broken_output` -- its
-    own unparseable output from the round just run -- back verbatim, states
-    plainly that it didn't parse, and asks it to rewrite that same round's
-    questions in the exact required format.
-
-    Returns `(turn, parsed)` once the corrective turn completes -- `parsed`
-    may still have empty `questions` if the corrective retry *also* failed
-    to produce something parseable; the caller decides what to do with
-    that (this function makes no second attempt). Returns `None` when the
-    retry turn could not be run to completion at all: a crash (routed to
-    the blocked-card flow, same as any other grilling turn's crash), a
-    genuine CLI error (persisted/published as this session's error, same
-    shape as `_run_grilling_turn`'s own `ClaudeCLIError` branch), or a
-    lock-busy no-op (`_run_turn` has already published that error itself).
-    In every `None` case the error has already been fully handled/published
-    here or upstream -- the caller must stop immediately without publishing
-    or persisting anything further of its own."""
-    prompt = _GRILLING_CORRECTIVE_PROMPT_TEMPLATE.format(broken_output=broken_output)
-    try:
-        turn = await _run_turn(
-            card_id,
-            prompt,
-            session_id=session_id,
-            cwd=cwd,
-            model=model,
-            effort=effort,
-            phase="grilling",
-        )
-    except PtyEngineUnrecoverableError as e:
-        await _route_crash_to_blocked(card_id, conn, e, phase="grilling")
-        return None
-    except ClaudeCLIError as e:
-        _close_engine(card_id)
-        message = str(e)
-        db.update_session(
-            conn, card_id, model=model, effort=effort, error_text=message, needs_github_login=0
-        )
-        publish(
-            card_id,
-            _turn_event(
-                phase="grilling",
-                error=message,
-                needs_github_login=False,
-                card_id=card_id,
-                project_id=row["project_id"],
-            ),
-        )
-        return None
-
-    if turn is None:
-        # Issue #144/#149: lock busy -- `_run_turn` already published the
-        # duplicate-call error itself.
-        return None
-
-    file_text = read_question_file(cwd, _GRILLING_QUESTION_FILE)
-    parsed = parse_grilling_response(file_text) if file_text is not None else None
-    if file_text is not None and not parsed["questions"]:
-        delete_question_file(cwd, _GRILLING_QUESTION_FILE)
-        parsed = None
-    if parsed is None:
-        parsed = parse_grilling_response(turn["result"])
-
-    return turn, parsed
-
-
-async def _maybe_extract_needs_input_grilling(card_id: int, conn, row, text: str) -> dict | None:
-    """Issue #178: the last-resort check `_run_grilling_turn` runs right
-    before treating a round as a genuine "no more questions" wrap-up --
-    after its existing file/terminal-text/Ollama-rescue chain (and, where
-    attempted, the PRD #157 corrective retry) has already concluded
-    `text` carries no parseable questions.
-
-    Asks the local Ollama needs-input classifier, via the shared
-    `handle_turn_completed` hook (issue #191), whether a human's input is
-    actually still needed for this turn -- that hook also enqueues this turn
-    onto the project's needs-input queue when it says yes, alongside the
-    classification itself. If it says yes, makes one more attempt at
-    structured extraction from the same `text` via `rescue_grilling_response`
-    -- the same Ollama rescue extraction the existing chain already uses,
-    just tried again here as a second, independent attempt now that the
-    classifier has flagged this text as worth another look.
-
-    Returns the extracted `{header, questions, footer, source}` dict only
-    when *both* the classifier says input is needed *and* extraction
-    actually produced at least one question. Returns `None` in every other
-    case -- classifier declined/unavailable/says no input needed, or
-    extraction still came up empty -- which callers treat exactly like a
-    genuine wrap-up, unchanged."""
-    classification = await handle_turn_completed(card_id, conn, row, text, "grilling")
-    if classification is None or not classification.get("needs_input"):
-        return None
-    rescued = await asyncio.to_thread(rescue_grilling_response, text)
-    if rescued is None or not rescued["questions"]:
-        return None
-    return rescued
-
-
-async def _run_grilling_turn(
-    card_id: int,
-    conn,
-    row,
-    prompt: str,
-    *,
-    cwd: str | None,
-    model: str | None,
-    effort: str | None,
-    publish_when_empty: bool = False,
-) -> dict | None:
-    """Run one grilling-phase turn and publish its `turn` event. Returns the
-    parsed interview dict if grilling is still ongoing, `None` if this turn
-    finished grilling (no more questions) or failed.
-
-    `model` is the model this *session* (not just this turn) was created
-    with -- see `start_session_job`/`continue_session_job` for where it comes
-    from. It's persisted back onto the row alongside the other per-turn
-    fields so a later call (a follow-up reply, a retry) can keep reading it
-    off the row instead of re-checking the current setting.
-
-    `publish_when_empty` covers `start_session_job`: a brand-new session's
-    very first turn must always render (even a bare header with no
-    structured questions), matching the old behavior of always surfacing
-    `parse_grilling_response`'s result on start. `continue_session_job` now
-    always passes `True` too -- zero questions there means grilling is done
-    and the turn's header is the assistant's wrap-up message, which the
-    frontend renders as a "ready to proceed?" gate rather than the chain
-    auto-advancing on its own."""
-    publish(card_id, {"type": "phase", "phase": "grilling"})
-
-    try:
-        turn = await _run_turn(
-            card_id,
-            prompt,
-            session_id=row["claude_session_id"],
-            cwd=cwd,
-            model=model,
-            effort=effort,
-            phase="grilling",
-        )
-    except PtyEngineUnrecoverableError as e:
-        await _route_crash_to_blocked(card_id, conn, e, phase="grilling")
-        return None
-    except ClaudeCLIError as e:
-        # Grilling's Claude turn never calls `gh` (see .claude/skills' own
-        # instructions), so any match here would be a false positive --
-        # always report no GitHub login is needed.
-        _close_engine(card_id)
-        message = str(e)
-        db.update_session(
-            conn, card_id, model=model, effort=effort, error_text=message, needs_github_login=0
-        )
-        publish(
-            card_id,
-            _turn_event(
-                phase="grilling",
-                error=message,
-                needs_github_login=False,
-                card_id=card_id,
-                project_id=row["project_id"],
-            ),
-        )
-        return None
-
-    if turn is None:
-        # Issue #144/#149: a genuine turn for this card_id is already in
-        # flight (the lock was held) -- `_run_turn` has already published
-        # the duplicate-call error itself, so there's nothing left to do
-        # here: no DB update, no additional publish, and the in-flight
-        # turn's own engine is left completely untouched.
-        return None
-
-    file_text = read_question_file(cwd, _GRILLING_QUESTION_FILE)
-    parsed = parse_grilling_response(file_text) if file_text is not None else None
-    if file_text is not None and not parsed["questions"]:
-        # Present but unparseable -- never let a corrupt file wedge every
-        # future round; drop it and fall back to the terminal-text path
-        # below exactly as if it had never been written.
-        delete_question_file(cwd, _GRILLING_QUESTION_FILE)
-        parsed = None
-    if parsed is None:
-        parsed = parse_grilling_response(turn["result"])
-    if should_attempt_grilling_rescue(parsed, turn["result"]) and not db.get_ollama_declined(conn):
-        # The regex parser found nothing, but the text looks like it was
-        # trying to be in the structured format -- give the local Ollama
-        # rescue path (issue #114) a chance before giving up. A `None`
-        # result (Ollama unavailable/invalid response/timeout) just keeps
-        # `parsed` as the original empty result, same as before this existed.
-        # Skipped entirely when the user has declined Ollama-assisted
-        # parsing (issue #119) -- same empty-result fallback as if the
-        # rescue call had run and come back unavailable.
-        rescued = await asyncio.to_thread(rescue_grilling_response, turn["result"])
-        if rescued is not None:
-            parsed = rescued
-    console_text = row["console_text"] + "\n\n" + turn["result"] if row["console_text"] else turn["result"]
-
-    if not parsed["questions"] and _grilling_result_is_suspicious(parsed, file_text, turn["result"]):
-        # Issue #158: the file and/or terminal text looked like it was
-        # trying to contain questions, but nothing in the fallback chain
-        # above (file -> terminal text -> Ollama rescue) managed to parse
-        # any -- this is not a genuine "no more questions" wrap-up. Give the
-        # model exactly one corrective follow-up turn with its own broken
-        # output handed back, rather than silently treating this as done.
-        broken_output = file_text if file_text is not None else turn["result"]
-        retry_outcome = await _run_grilling_corrective_retry(
-            card_id,
-            conn,
-            row,
-            broken_output=broken_output,
-            session_id=turn["session_id"],
-            cwd=cwd,
-            model=model,
-            effort=effort,
-        )
-        if retry_outcome is None:
-            # Already fully handled (a crash routed to the blocked-card
-            # flow, a genuine CLI error published/persisted, or a
-            # lock-busy no-op) -- nothing further to do here.
-            return None
-
-        retry_turn, retry_parsed = retry_outcome
-        console_text = console_text + "\n\n" + retry_turn["result"]
-
-        if not retry_parsed["questions"]:
-            # Issue #178: the corrective retry also failed to produce
-            # anything parseable via the existing chain -- before giving up,
-            # ask Ollama's needs-input classifier whether this retry's own
-            # result actually still needs a human's input and, if so, make
-            # one more attempt at structured extraction from it.
-            rescued_via_classifier = await _maybe_extract_needs_input_grilling(
-                card_id, conn, row, retry_turn["result"]
-            )
-            if rescued_via_classifier is not None:
-                turn = retry_turn
-                parsed = rescued_via_classifier
-            else:
-                # Stop trying automatically. Publish/persist an explicit
-                # error through the same `_turn_event` path every other
-                # grilling error already uses (which also feeds the
-                # app-wide error log, see `error_log.log_error`), instead of
-                # falling back to the generic "ready to proceed?" wrap-up
-                # gate -- that gate would misrepresent a parse failure as
-                # grilling being genuinely done.
-                message = (
-                    "This grilling round's questions did not parse, and a "
-                    "corrective retry asking the model to reformat them also "
-                    "failed to produce parseable questions. Stopping "
-                    "automatically rather than risk silently treating this as "
-                    "\"no more questions\"."
-                )
-                db.update_session(
-                    conn,
-                    card_id,
-                    model=model,
-                    effort=effort,
-                    claude_session_id=retry_turn["session_id"],
-                    console_text=console_text,
-                    error_text=message,
-                    needs_github_login=0,
-                )
-                publish(
-                    card_id,
-                    _turn_event(
-                        phase="grilling",
-                        error=message,
-                        needs_github_login=False,
-                        card_id=card_id,
-                        project_id=row["project_id"],
-                    ),
-                )
-                return None
-        else:
-            turn = retry_turn
-            parsed = retry_parsed
-    elif not parsed["questions"]:
-        # Issue #178: the chain concluded no questions without even
-        # attempting the corrective retry above (not suspicious) -- same
-        # last-resort Ollama needs-input check before treating this as a
-        # genuine wrap-up.
-        rescued_via_classifier = await _maybe_extract_needs_input_grilling(card_id, conn, row, turn["result"])
-        if rescued_via_classifier is not None:
-            parsed = rescued_via_classifier
-
-    db.update_session(
-        conn,
-        card_id,
-        model=model,
-        effort=effort,
-        claude_session_id=turn["session_id"],
-        console_text=console_text,
-        interview_json=json.dumps(parsed),
-        context_pct=turn.get("context_pct"),
-    )
-
-    if parsed["questions"] or publish_when_empty:
-        publish(card_id, _turn_event(phase="grilling", interview=parsed))
-
-    return parsed if parsed["questions"] else None
-
-
-
-async def _await_stalled_reply(
-    card_id: int, conn, row, turn: dict, *, phase: str
-) -> dict | None:
-    """Issue #177 (child of PRD #174): `turn` just resolved for `phase`
-    (`creating_prd`/`creating_issues`, driven through `_run_chain_step`),
-    but `classify_needs_input` flagged its rendered text as needing a
-    human's input before this phase can usefully proceed on its own.
-
-    Resurrects the PRD #168/#172 stall-reply plumbing that's sat dead since
-    issue #175 removed the per-chunk PTY stall mechanism that used to drive
-    it: persists `stalled_json` and publishes the same `turn` event shape
-    (`stalled=True`, `stalled_context=turn["result"]`) genuine mid-turn
-    stalls always used, so the existing, UNCHANGED frontend
-    (`renderStalledSession`/`sendStallReply`/`applyTurn`'s `event.stalled`
-    branch) shows the exact same generic reply panel for this case too --
-    the turn's own rendered text as context, no rich question/options UI.
-
-    Unlike a genuine mid-turn stall (where `_run_turn`'s own read loop is
-    still live, still holding the turn lock, and just keeps reading until
-    the marker it was already waiting for shows up), this turn has ALREADY
-    completed -- there is no live read loop left to pick up whatever the
-    human eventually types into that panel. So this function starts one:
-    it reacquires this card's turn lock (mirroring the "the turn lock is
-    NOT released" invariant a genuine stall already relies on) and awaits
-    `PtyEngine.stream_reply()` -- the read-only counterpart to `stream_turn`
-    -- which yields nothing until the live process actually responds to
-    whatever gets written into its stdin next. That next write is exactly
-    the human's reply, forwarded completely unchanged by the existing,
-    untouched `/api/sessions/{card_id}/stall-reply` endpoint (still just
-    `PtyEngine.write()`, same as a genuine mid-turn stall's reply always
-    was) -- this function makes no write of its own, and never touches that
-    endpoint's behavior.
-
-    Returns the resumed turn dict (same `{"result", "session_id", ...}`
-    shape `_run_turn` returns) once the human's reply is answered and the
-    live process prints its next completion marker -- `_run_chain_step`
-    treats this exactly like the original turn having resolved directly,
-    and proceeds with this phase's normal completion bookkeeping (no
-    second `classify_needs_input` call is made on it; one nudge-and-resume
-    cycle per chain step is all this supports).
-
-    Returns `None` if the live process dies instead while waiting (there is
-    no prompt to retry -- see `PtyEngine.stream_reply`'s own docstring):
-    this closes the card's engine, persists an explicit error, publishes it
-    plus `done`, and clears `stalled_json` -- the same shape every other
-    unrecoverable failure in this module already reports. `None` is also
-    returned (no further action -- nothing to persist or publish, the
-    engine is simply gone) if `card_id` has no live resident engine at all
-    to wait on, which should not normally happen here since the turn that
-    just resolved ran against this exact engine moments ago."""
-    db.update_session(conn, row["id"], stalled_json=json.dumps({"phase": phase, "context": turn["result"]}))
-    publish(card_id, _turn_event(phase=phase, stalled=True, stalled_context=turn["result"]))
-
-    engine = get_engine(card_id)
-    if engine is None:
-        return None
-
-    lock = _get_turn_lock(card_id)
-    async with lock:
-        holder: dict = {}
-        try:
-            async for raw_event in engine.stream_reply():
-                translated = translate_event(raw_event)
-                if translated is None:
-                    continue
-                if translated["type"] == "turn":
-                    translated["context_pct"] = _context_window_pct(raw_event)
-                    holder["turn"] = translated
-                    continue
-                publish(card_id, translated)
-        except PtyEngineError as e:
-            _close_engine(card_id)
-            message = str(e)
-            db.update_session(conn, row["id"], error_text=message, needs_github_login=0, stalled_json=None)
-            publish(
-                card_id,
-                _turn_event(
-                    phase=phase,
-                    error=message,
-                    needs_github_login=False,
-                    card_id=card_id,
-                    project_id=row["project_id"],
-                ),
-            )
-            publish(card_id, {"type": "done"})
-            return None
-
-    db.update_session(conn, row["id"], stalled_json=None)
-    return holder.get("turn")
-
-
 async def _run_chain_step(
     card_id: int, conn, row, *, phase: str, prompt: str, cwd: str | None, model: str | None, effort: str | None
 ) -> tuple[bool, str | None, str]:
-    """Run one /to-prd or /to-issues step, live-streamed. Returns (ok, claude_session_id, last_result).
+    """Run one /to-prd, /to-issues, or /publish-to-github step, live-streamed.
+    Returns (ok, claude_session_id, last_result).
 
     On failure, publishes the error `turn` event and `done` itself -- the
     chain stops here exactly as the old blocking version did.
@@ -1790,18 +1108,29 @@ async def _run_chain_step(
     queue alongside the classification. A `None` result (Ollama declined, or
     genuinely unavailable -- either way already handled/published by
     `classify_needs_input` itself) or `needs_input: False` changes nothing
-    here -- this phase completes exactly as it always has. A `needs_input:
-    True` result pauses here via `_await_stalled_reply` (see its docstring
-    for the full resume story) instead of proceeding straight to the success
-    bookkeeping below; only once that resolves (a human's reply was answered
-    and the live process moved on) does this function fall through to the
-    same completion bookkeeping any other resolved turn gets.
-    """
+    here -- this phase completes exactly as it always has.
+
+    Issue #225 (child of PRD #222): a `needs_input: True` result persists
+    `stalled_json`/publishes the stalled `turn` event and returns `(False,
+    None, "")` -- treated by every caller exactly like a genuine failure
+    (`if not ok: return`), WITHOUT publishing `done` (the SSE stream stays
+    open). This function does NOT await inline for the human's reply the
+    way it used to (`PtyEngine`'s raw keystroke passthrough let a reply be
+    written directly into a still-open process's stdin mid-wait --
+    `StreamJsonEngine` has no such passthrough, headless turns are a
+    complete request/response each). `continue_stalled_chain_step_job`
+    resumes this phase later as a genuinely new turn, with the human's
+    reply as `prompt` -- mirroring the pattern `_finish_implement_turn`'s
+    own needs-input handling already uses successfully for `implementing`.
+    Re-stalling on that resumed turn needs no special handling: this
+    function re-runs `handle_turn_completed` on every turn it drives,
+    including a reply-resumed one, so it naturally re-persists/re-returns
+    not-ok if the reply still doesn't satisfy the classifier."""
     db.update_session(conn, row["id"], phase=phase, error_text=None, needs_github_login=0)
     publish(card_id, {"type": "phase", "phase": phase})
 
     try:
-        turn = await _run_turn(
+        turn = await _run_stream_json_turn(
             card_id,
             prompt,
             session_id=row["claude_session_id"],
@@ -1810,11 +1139,11 @@ async def _run_chain_step(
             effort=effort,
             phase=phase,
         )
-    except PtyEngineUnrecoverableError as e:
+    except StreamJsonEngineUnrecoverableError as e:
         await _route_crash_to_blocked(card_id, conn, e, phase=phase)
         return False, None, ""
     except ClaudeCLIError as e:
-        _close_engine(card_id)
+        _close_stream_json_engine(card_id)
         message = str(e)
         needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, row["id"], error_text=message, needs_github_login=needs_login)
@@ -1833,29 +1162,36 @@ async def _run_chain_step(
 
     if turn is None:
         # Issue #144/#149: a genuine turn for this card_id is already in
-        # flight -- `_run_turn` already published the duplicate-call error
-        # itself; nothing more to do here.
+        # flight -- `_run_stream_json_turn` already published the
+        # duplicate-call error itself; nothing more to do here.
         return False, None, ""
 
-    classification = await handle_turn_completed(card_id, conn, row, turn["result"], phase)
+    full_text = turn["full_text"]
+    console_text = row["console_text"] + "\n\n" + full_text
+
+    classification = await handle_turn_completed(card_id, conn, row, full_text, phase)
     if classification is not None and classification.get("needs_input"):
-        resumed = await _await_stalled_reply(card_id, conn, row, turn, phase=phase)
-        if resumed is None:
-            # Already fully handled inside `_await_stalled_reply` (an
-            # explicit error published/persisted, or no live engine left to
-            # wait on) -- nothing further to do here.
-            return False, None, ""
-        turn = resumed
+        db.update_session(
+            conn,
+            row["id"],
+            claude_session_id=turn["session_id"],
+            console_text=console_text,
+            context_pct=turn.get("context_pct"),
+            stalled_json=json.dumps({"phase": phase, "context": full_text}),
+        )
+        publish(card_id, _turn_event(phase=phase, stalled=True, stalled_context=full_text))
+        return False, None, ""
 
     db.update_session(
         conn,
         row["id"],
         claude_session_id=turn["session_id"],
-        console_text=row["console_text"] + "\n\n" + turn["result"],
+        console_text=console_text,
         context_pct=turn.get("context_pct"),
+        stalled_json=None,
     )
 
-    return True, turn["session_id"], turn["result"]
+    return True, turn["session_id"], full_text
 
 
 
@@ -1881,41 +1217,105 @@ async def _finish_chain(card_id: int, conn, claude_session_id: str, cwd: str | N
     publish(card_id, _turn_event(phase="details", details=details))
 
 
+# The creating_prd -> creating_issues -> publishing chain, in order, paired
+# with each phase's own default skill prompt -- shared by `_run_chain_from`
+# below (issue #225, child of PRD #222): `/rhubarb:to-prd`/`/rhubarb:to-issues`
+# are pure drafting steps with no GitHub side effects of their own;
+# `/rhubarb:publish-to-github` runs last, in the same resumed conversation
+# (so both drafts are still in its context), and is the one place that
+# actually calls `gh issue create` for the PRD and every child issue.
+_CHAIN_PHASES: list[tuple[str, str]] = [
+    ("creating_prd", "/rhubarb:to-prd"),
+    ("creating_issues", "/rhubarb:to-issues"),
+    ("publishing", "/rhubarb:publish-to-github"),
+]
+
+
+async def _run_chain_from(
+    card_id: int,
+    conn,
+    cwd: str | None,
+    *,
+    start_phase: str,
+    start_prompt: str,
+    model: str | None,
+    effort: str | None,
+) -> None:
+    """Run the `_CHAIN_PHASES` cascade starting at `start_phase`, using
+    `start_prompt` for that first step and each later phase's own default
+    prompt thereafter -- shared by `advance_past_grilling` (start_phase=
+    "creating_prd", the original `/rhubarb:to-prd` skill prompt),
+    `retry_session_job` (a plain retry -- the same start_phase/prompt
+    pairing a fresh run would use), and `continue_stalled_chain_step_job`
+    (start_phase=the paused phase, start_prompt=the human's reply text).
+    Stops the moment one step comes back not-ok -- already fully handled
+    (an error, a crash routed to blocked, or a fresh stall) by
+    `_run_chain_step` itself, nothing further to do here. Calls
+    `_finish_chain` once every remaining phase succeeds."""
+    start_index = next(i for i, (phase, _) in enumerate(_CHAIN_PHASES) if phase == start_phase)
+    claude_session_id = None
+    last_result = ""
+    for i, (phase, default_prompt) in enumerate(_CHAIN_PHASES[start_index:], start=start_index):
+        prompt = start_prompt if i == start_index else default_prompt
+        row = db.get_session(conn, card_id)
+        ok, claude_session_id, last_result = await _run_chain_step(
+            card_id, conn, row, phase=phase, prompt=prompt, cwd=cwd, model=model, effort=effort
+        )
+        if not ok:
+            return
+
+    await _finish_chain(card_id, conn, claude_session_id, cwd, summary=last_result)
+
+
 async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
-    """Grilling just finished: run /to-prd, /to-issues (live-streamed), then
-    auto-/clear and pool the session. Uses the model already recorded on the
-    row (set back when the session started grilling) -- this is a
+    """Grilling just finished: run /to-prd, /to-issues, /publish-to-github
+    (live-streamed) via `_run_chain_from`. Uses the model already recorded
+    on the row (set back when the session started grilling) -- this is a
     continuation of that same session, not a fresh one, so the configured
     model is not re-read here even if it's changed since.
 
-    Issue #184: grilling itself just ended for good -- this card's resident
-    `StreamJsonEngine` (if any; a card that finished grilling with zero
-    questions on its very first turn never had one) is closed here, before
-    `_run_chain_step` below runs `/rhubarb:to-prd` through the ordinary,
-    unmodified `PtyEngine` path (`_get_or_create_engine`), which reattaches
-    via `--resume` at this row's `claude_session_id` -- the real session id
-    the stream-json engine's own `result` event handed back, same as any
-    other reattach. Every phase from here on is `PtyEngine`-driven again,
-    completely unchanged."""
+    This card's resident `StreamJsonEngine` (if any; a card that finished
+    grilling with zero questions on its very first turn never had one) is
+    closed here first -- `_run_chain_step` then constructs a fresh one for
+    `creating_prd`, reattaching via `--resume` at this row's
+    `claude_session_id`, the real session id grilling's own `result` event
+    handed back."""
     _close_stream_json_engine(card_id)
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
-    model = row["model"]
-    effort = row["effort"]
-    ok, _, _prd_result = await _run_chain_step(
-        card_id, conn, row, phase="creating_prd", prompt="/rhubarb:to-prd", cwd=cwd, model=model, effort=effort
+    await _run_chain_from(
+        card_id,
+        conn,
+        cwd,
+        start_phase="creating_prd",
+        start_prompt="/rhubarb:to-prd",
+        model=row["model"],
+        effort=row["effort"],
     )
-    if not ok:
-        return
 
+
+async def continue_stalled_chain_step_job(card_id: int, reply: str, *, cwd: str | None) -> None:
+    """Called from `POST /api/sessions/{card_id}/stall-reply` when the
+    paused phase is `creating_prd`/`creating_issues`/`publishing` (issue
+    #225, child of PRD #222). Resumes the chain at whichever phase paused
+    (read straight off the row, not off `stalled_json`, since `phase` is
+    already exactly that -- `_run_chain_step` never advances the row's
+    `phase` past the step it's currently running), sending the human's
+    `reply` as that step's turn prompt -- reattached via the row's existing
+    `claude_session_id`, same resumable-turn pattern grilling's own reply
+    flow already uses -- then cascades forward through the remaining phases
+    exactly like a fresh run would."""
+    conn = db.get_connection()
     row = db.get_session(conn, card_id)
-    ok, claude_session_id, last_result = await _run_chain_step(
-        card_id, conn, row, phase="creating_issues", prompt="/rhubarb:to-issues", cwd=cwd, model=model, effort=effort
+    await _run_chain_from(
+        card_id,
+        conn,
+        cwd,
+        start_phase=row["phase"],
+        start_prompt=reply,
+        model=row["model"],
+        effort=row["effort"],
     )
-    if not ok:
-        return
-
-    await _finish_chain(card_id, conn, claude_session_id, cwd, summary=last_result)
 
 
 async def start_do_continue_job(card_id: int, prompt: str, *, cwd: str | None) -> None:
@@ -1945,14 +1345,14 @@ async def start_do_continue_job(card_id: int, prompt: str, *, cwd: str | None) -
             _spawn_fresh_stream_json_engine, cwd=cwd, model=model, effort=effort
         )
         _stream_json_engines[card_id] = engine
-        db.update_session(conn, card_id, claude_session_id=engine.claude_session_id, context_pct=None)
+        db.update_session(conn, card_id, claude_session_id=engine.session_id, context_pct=None)
         row = db.get_session(conn, card_id)
 
     db.update_session(conn, card_id, phase="grilling")
     row = db.get_session(conn, card_id)
 
     await _run_grilling_turn_stream_json(
-        card_id, conn, row, f"/rhubarb:do {prompt}", cwd=cwd, model=model, effort=effort,
+        card_id, conn, row, f"/rhubarb:grilling {prompt}", cwd=cwd, model=model, effort=effort,
         publish_when_empty=True,
     )
 
@@ -1971,80 +1371,35 @@ async def start_session_job(card_id: int, prompt: str, *, cwd: str | None) -> No
     window between the row's creation and this task actually running --
     exactly the "still no turns sent yet" case that should apply immediately.
 
-    Issue #184: dispatches by phase. `db.create_session` defaults every
-    brand-new row's `phase` to `"grilling"`, and this function only ever
-    runs on a session's very first turn -- so in practice `row["phase"]` is
-    always `"grilling"` here. The check is kept explicit anyway (rather than
-    assuming it) per the issue's "dispatch by phase, not globally"
-    requirement: a grilling-phase row goes through the new
-    `StreamJsonEngine` path (`_run_grilling_turn_stream_json`); anything
-    else -- which should not normally happen here, but is handled safely
-    rather than assumed impossible -- falls back to the original,
-    completely unmodified `PtyEngine` path (`_run_grilling_turn`)."""
+    `db.create_session` defaults every brand-new row's `phase` to
+    `"grilling"`, and this function only ever runs on a session's very
+    first turn -- so `row["phase"]` is always `"grilling"` here. Every
+    grilling turn drives through `StreamJsonEngine`
+    (`_run_grilling_turn_stream_json`) -- issue #225's migration off
+    `PtyEngine` removed the only other transport this could ever have
+    dispatched to."""
     conn = db.get_connection()
     model = db.get_model(conn)
     row = db.get_session(conn, card_id)
-    if row is not None and row["phase"] == "grilling":
-        await _run_grilling_turn_stream_json(
-            card_id, conn, row, f"/rhubarb:do {prompt}", cwd=cwd, model=model, effort=row["effort"],
-            publish_when_empty=True,
-        )
-        return
-    await _run_grilling_turn(
-        card_id, conn, row, f"/rhubarb:do {prompt}", cwd=cwd, model=model, effort=row["effort"], publish_when_empty=True
+    await _run_grilling_turn_stream_json(
+        card_id, conn, row, f"/rhubarb:grilling {prompt}", cwd=cwd, model=model, effort=row["effort"],
+        publish_when_empty=True,
     )
 
 
-async def continue_session_job(card_id: int, reply: str, *, cwd: str | None, confirm_advance: bool = False) -> None:
-    """A grilling reply, or an explicit "yes, proceed" confirmation.
+async def continue_session_job(card_id: int, reply: str, *, cwd: str | None) -> None:
+    """A grilling reply.
 
-    Normal replies (`confirm_advance=False`, the default) always run one
-    more grilling CLI turn and publish its `turn` event -- whether or not
-    `questions` comes back empty -- and then stop; there is no auto-advance
-    into the PRD/issues chain anymore. When grilling has no more questions,
-    the frontend shows the turn's `header` with "Yes, proceed" / "No, keep
-    discussing" buttons, and "Yes" is what re-invokes this function with
-    `confirm_advance=True`.
-
-    `confirm_advance=True` skips running a grilling CLI turn entirely and
-    goes straight to `advance_past_grilling`, resuming the session's existing
-    `claude_session_id` -- exactly like `retry_session_job` does for a
-    `creating_prd` row. Both paths use the model already recorded on the row
-    -- this is a continuation of an existing session, not a fresh one.
-
-    Either way, this is the round being answered -- delete its
-    `.claude/rhubarb_question.md` (PRD #123) if one is still there, now that
-    it's served its purpose, before the next turn (which writes a fresh one
-    of its own if it has another round to ask).
-
-    Issue #184: a grilling card dispatched to the new `StreamJsonEngine`
-    never writes that file in the first place (see
-    `_run_grilling_turn_stream_json`'s docstring) -- so for that card, the
-    `delete_question_file` call above is skipped entirely, not just
-    harmlessly redundant, per the issue's explicit "must NOT touch
-    `.claude/rhubarb_question.md`" acceptance criterion. `row` is fetched
-    up front (rather than only in the non-`confirm_advance` branch, as
-    before) so that phase check can happen before deciding whether to make
-    that call at all; this is a pure read with no side effects, so it
-    changes nothing about the `PtyEngine` path's own behavior below."""
+    Runs one more grilling CLI turn and publishes its `turn` event. Issue
+    #223 (child of PRD #222): when that turn's parsed questions come back
+    empty, `_run_grilling_turn_stream_json` itself now auto-advances
+    straight into `advance_past_grilling` before returning -- there is no
+    confirmation click in between anymore, and no `confirm_advance` flag on
+    this function. A turn that still has open questions is unaffected: it
+    publishes and waits for the user's next reply, exactly as before."""
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
-    is_new_engine_grilling = row is not None and row["phase"] == "grilling"
-
-    if not is_new_engine_grilling:
-        delete_question_file(cwd, _GRILLING_QUESTION_FILE)
-
-    if confirm_advance:
-        await advance_past_grilling(card_id, cwd)
-        return
-
-    if is_new_engine_grilling:
-        await _run_grilling_turn_stream_json(
-            card_id, conn, row, reply, cwd=cwd, model=row["model"], effort=row["effort"], publish_when_empty=True
-        )
-        return
-
-    await _run_grilling_turn(
+    await _run_grilling_turn_stream_json(
         card_id, conn, row, reply, cwd=cwd, model=row["model"], effort=row["effort"], publish_when_empty=True
     )
 
@@ -2162,9 +1517,9 @@ async def start_or_queue_implement(
 
     `db.get_parallel_implementation`/`_implement_queues` remain the only
     concurrency policy: with it on, every PRD (this one included) starts
-    its own independent `PtyEngine` tab immediately; with it off, only one
-    implement tab runs per project at a time and everything else queues
-    here, same as before issue #87 -- only the underlying per-session
+    its own independent `StreamJsonEngine` tab immediately; with it off,
+    only one implement tab runs per project at a time and everything else
+    queues here, same as before issue #87 -- only the underlying per-session
     process model changed."""
     conn = db.get_connection()
     if db.has_active_implement_session(conn, project_id, number):
@@ -2207,7 +1562,7 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
     publish(card_id, {"type": "phase", "phase": "implementing"})
 
     try:
-        turn = await _run_turn(
+        turn = await _run_stream_json_turn(
             card_id,
             f"/rhubarb:implement prd: {prd_number}",
             session_id=row["claude_session_id"],
@@ -2216,13 +1571,13 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
             effort=effort,
             phase="implementing",
         )
-    except PtyEngineUnrecoverableError as e:
+    except StreamJsonEngineUnrecoverableError as e:
         await _route_crash_to_blocked(card_id, conn, e, phase="implementing")
         return
     except ClaudeCLIError as e:
         # /implement's PRD-selection step calls `gh issue list` directly, so
         # a genuine gh auth failure is possible here -- classify it.
-        _close_engine(card_id)
+        _close_stream_json_engine(card_id)
         message = str(e)
         needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
@@ -2243,8 +1598,8 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
 
     if turn is None:
         # Issue #144/#149: a genuine turn for this card_id is already in
-        # flight -- `_run_turn` already published the duplicate-call error
-        # itself; nothing more to do here.
+        # flight -- `_run_stream_json_turn` already published the
+        # duplicate-call error itself; nothing more to do here.
         return
 
     await _finish_implement_turn(card_id, conn, row, turn, cwd=cwd, model=model, effort=effort)
@@ -2267,22 +1622,92 @@ _QA_CORRECTIVE_RETRY_PROMPT_TEMPLATE = (
 )
 
 
+# Issue #230: `ollama_rescue.should_attempt_qa_rescue`'s own trigger check,
+# now local to this module -- it was only ever a cheap "does this look like
+# it was trying" fingerprint gating whether to spend a follow-up call, never
+# itself an extraction attempt, so it survives the retirement of the
+# regex-parser + Ollama-rescue chain it used to gate.
+_QA_ATTEMPT_TRIGGER = "qa session for prd"
+
+
+def _looks_like_qa_attempt(text: str) -> bool:
+    """True when `text` contains the `QA session for PRD` fingerprint
+    (case-insensitive) the qa-grilling skill always emits when it's
+    genuinely trying to produce a QA-grilling round."""
+    return _QA_ATTEMPT_TRIGGER in text.lower()
+
+
+async def _extract_qa_issues_via_skill(project_id: int, text: str) -> dict | None:
+    """PRD #227 follow-up, gap 2 (`gh issue view 227`; discovered during
+    manual testing/design review after #228/#229/#230 were already closed
+    out in code): the QA-grilling analogue of
+    `_extract_grilling_questions_via_parser_session` above. This used to be
+    `_extract_qa_issues_via_parser_session`, which sent its own hand-rolled
+    inline prompt (`_QA_EXTRACTION_PROMPT_TEMPLATE`, now deleted) directly
+    via `parser_session.stream_turn`, bypassing the `/rhubarb:parse-
+    interview` skill every other phase already went through -- a real
+    inconsistency, flagged during design review and confirmed by the user to
+    unify: the skill should handle both shapes. The skill's instructions
+    (`rhubarb/claude_plugin/skills/parse-interview/SKILL.md`) now have their
+    own `qa_grilling_issues`-phase section, ported over from
+    `_QA_EXTRACTION_PROMPT_TEMPLATE`'s own rules (issue grouping/detection,
+    the PRD header, the "no recognizable QA content" fallback) with no logic
+    lost, plus the SAME Recommended:-line-mapping/options rules the flat
+    shape already had -- so this is now just `parser_session.
+    extract_with_validation` called with that phase and `ollama_rescue.
+    _is_valid_qa_shape` as its validator, mirroring
+    `_extract_grilling_questions_via_parser_session`'s own one-line shape.
+
+    Deliberately its own phase string, `"qa_grilling_issues"`, NOT the
+    `"qa_grilling"` phase name `_maybe_extract_needs_input_qa`'s `handle_
+    turn_completed` call already uses to enqueue this exact same raw text
+    onto this project's separate needs-input queue
+    (`parser_session.enqueue_needs_input_turn`/`drain_needs_input_queue`).
+    That queue's own consumer (`parser_session._process_one_queued_item`)
+    expects the FLAT `{header, questions, footer}` shape for every phase it
+    handles, `"qa_grilling"` included (see `tests/test_parser_session.py`'s
+    `test_drain_respects_the_drain_then_clear_ceiling_mid_queue`, which
+    asserts a flat-shape result for a `"qa_grilling"`-phase queued item) --
+    reusing that same phase string here would have made the skill's own
+    `phase:` branching ambiguous for one identical phase name used by two
+    call sites wanting two different shapes. `"qa_grilling_issues"` is a new,
+    unambiguous phase string that only this call site ever sends.
+
+    `detect_mismatches=False`: issue #229's mismatch-detection/retry/tagging
+    logic is built entirely around the flat shape's own single `"questions"`
+    list and has not (yet) been generalized to this nested `issues[].
+    questions` structure -- see `extract_with_validation`'s own docstring for
+    why, and this PRD's report for why this is a deliberate, narrower scope
+    rather than an oversight.
+
+    Returns the parsed `{prd, issues, source: "parser_session"}` dict on a
+    successful, schema-valid parse. Returns `None` on any failure -- a
+    dead/missing parser session, a turn that produced no `result` event, or a
+    response that isn't valid JSON matching the expected shape -- exactly
+    like `_extract_questions_via_parser_session`'s own failure contract.
+    Callers must treat `None` as "extraction failed", not as "found
+    nothing"."""
+    return await parser_session.extract_with_validation(
+        project_id, text, phase="qa_grilling_issues", validator=_is_valid_qa_shape, detect_mismatches=False
+    )
+
+
 def _qa_result_is_suspicious(qa_parsed: dict, qa_file_text: str | None, terminal_text: str) -> bool:
-    """True when `parse_qa_response` (and, where attempted, the Ollama
-    rescue) came back with no issues, but either the QA question file's raw
-    content or the raw terminal text looks like the model was genuinely
-    trying to produce a QA-grilling round rather than this being some other,
-    unrelated turn -- i.e. `should_attempt_qa_rescue`'s own trigger check,
-    against *both* sources (issue #159 extends that check, which today only
-    ever looks at terminal text, to the file too) rather than just one. A
-    round with neither source showing this fingerprint is never retried --
-    that's the "no QA questions" case, indistinguishable from a genuine
-    wrap-up, so it's left exactly as before this existed."""
+    """True when extraction (`_extract_qa_issues_via_skill`) came
+    back with no issues, but either the QA question file's raw content or
+    the raw terminal text looks like the model was genuinely trying to
+    produce a QA-grilling round rather than this being some other, unrelated
+    turn -- `_looks_like_qa_attempt`'s trigger check, against *both* sources
+    (issue #159 extends that check, which today only ever looks at terminal
+    text, to the file too) rather than just one. A round with neither source
+    showing this fingerprint is never retried -- that's the "no QA
+    questions" case, indistinguishable from a genuine wrap-up, so it's left
+    exactly as before this existed."""
     if qa_parsed["issues"]:
         return False
-    if qa_file_text is not None and should_attempt_qa_rescue(qa_parsed, qa_file_text):
+    if qa_file_text is not None and _looks_like_qa_attempt(qa_file_text):
         return True
-    return should_attempt_qa_rescue(qa_parsed, terminal_text)
+    return _looks_like_qa_attempt(terminal_text)
 
 
 async def _fail_qa_corrective_retry(card_id: int, conn, row, cwd: str | None, message: str) -> None:
@@ -2294,7 +1719,7 @@ async def _fail_qa_corrective_retry(card_id: int, conn, row, cwd: str | None, me
     project's queued implement jobs -- the same shape every other
     `ClaudeCLIError` handler in this module already uses, since this
     implement session is ending here instead of handing off to QA."""
-    _close_engine(card_id)
+    _close_stream_json_engine(card_id)
     db.update_session(conn, card_id, error_text=message, needs_github_login=0)
     publish(
         card_id,
@@ -2315,19 +1740,21 @@ async def _maybe_extract_needs_input_qa(card_id: int, conn, row, text: str) -> d
     """Issue #178: the QA-grilling equivalent of
     `_maybe_extract_needs_input_grilling` -- the last-resort check run right
     before treating a QA round as genuinely having no more questions, after
-    the existing file/terminal-text/Ollama-rescue chain (and, where
-    attempted, the PRD #157-style corrective retry -- `_attempt_qa_corrective_retry`
-    here) has already concluded `text` carries no parseable issues.
+    the existing file/terminal-text/parser-session-extraction chain (and,
+    where attempted, the PRD #157-style corrective retry --
+    `_attempt_qa_corrective_retry` here) has already concluded `text` carries
+    no parseable issues.
 
     Asks the local Ollama needs-input classifier, via the shared
     `handle_turn_completed` hook (issue #191, phase `"qa_grilling"`), whether
     a human's input is actually still needed -- that hook also enqueues this
     turn onto the project's needs-input queue when it says yes. If so, makes
     one more attempt at structured extraction from the same `text` via
-    `rescue_qa_response` -- the same Ollama rescue extraction the existing
-    chain already uses.
+    `_extract_qa_issues_via_skill` -- the same parser-session/skill
+    extraction the rest of this chain uses (issue #230 retired the Ollama-
+    rescue extraction attempt this used to make here).
 
-    Returns the extracted `{prd, issues, source}` dict only when *both* the
+    Returns the extracted `{prd, issues}` dict only when *both* the
     classifier says input is needed *and* extraction actually produced at
     least one issue. Returns `None` in every other case, which callers
     treat exactly like a genuine "no more QA questions" conclusion,
@@ -2335,7 +1762,7 @@ async def _maybe_extract_needs_input_qa(card_id: int, conn, row, text: str) -> d
     classification = await handle_turn_completed(card_id, conn, row, text, "qa_grilling")
     if classification is None or not classification.get("needs_input"):
         return None
-    rescued = await asyncio.to_thread(rescue_qa_response, text)
+    rescued = await _extract_qa_issues_via_skill(row["project_id"], text)
     if rescued is None or not rescued["issues"]:
         return None
     return rescued
@@ -2346,12 +1773,14 @@ async def _attempt_qa_corrective_retry(
 ) -> tuple[dict, dict] | None:
     """One corrective follow-up turn (issue #159), run once a QA-grilling
     round's result looked like it was genuinely trying to contain questions
-    (`_qa_result_is_suspicious`) but failed to parse even after the
-    file/terminal/Ollama-rescue fallback chain. Hands the model its own
-    unparseable output back (`broken_text`) and asks it to rewrite that
-    round in the required format, then re-parses the retry turn's own
-    result the same way this module always does (file first, then terminal
-    text).
+    (`_qa_result_is_suspicious`) but failed to parse even via the
+    parser-session extraction pipeline (issue #230 -- `qa_parser.
+    parse_qa_response`/`ollama_rescue.rescue_qa_response` are gone; every
+    extraction attempt in this function goes through `_extract_qa_issues_
+    via_parser_session` instead). Hands the model its own unparseable output
+    back (`broken_text`) and asks it to rewrite that round in the required
+    format, then re-extracts the retry turn's own result the same way this
+    module always has (file first, then terminal text).
 
     Returns `(qa_parsed, qa_turn)` -- the freshly re-parsed dict (guaranteed
     to carry at least one issue) and the completed retry turn -- on success.
@@ -2360,14 +1789,15 @@ async def _attempt_qa_corrective_retry(
     function has already reported an explicit error and fully wound down
     this card (see `_fail_qa_corrective_retry`/`_route_crash_to_blocked`) --
     callers must treat a `None` return as fully handled and simply return,
-    exactly like every other `_run_turn`-wrapping call site in this module."""
+    exactly like every other `_run_stream_json_turn`-wrapping call site in
+    this module."""
     prompt = _QA_CORRECTIVE_RETRY_PROMPT_TEMPLATE.format(broken_text=broken_text)
 
     try:
-        retry_turn = await _run_turn(
+        retry_turn = await _run_stream_json_turn(
             card_id, prompt, session_id=session_id, cwd=cwd, model=model, effort=effort, phase="qa_grilling"
         )
-    except PtyEngineUnrecoverableError as e:
+    except StreamJsonEngineUnrecoverableError as e:
         await _route_crash_to_blocked(card_id, conn, e, phase="qa_grilling")
         return None
     except ClaudeCLIError as e:
@@ -2376,25 +1806,28 @@ async def _attempt_qa_corrective_retry(
 
     if retry_turn is None:
         # Issue #144/#149: a genuine turn for this card_id is already in
-        # flight -- `_run_turn` already published the duplicate-call error
+        # flight -- `_run_stream_json_turn` already published the duplicate-call error
         # itself; nothing more to do here.
         return None
 
     retry_file_text = read_question_file(cwd, _QA_QUESTION_FILE)
-    retry_parsed = parse_qa_response(retry_file_text) if retry_file_text is not None else None
-    if retry_file_text is not None and not retry_parsed["issues"]:
+    retry_parsed = await _extract_qa_issues_via_skill(row["project_id"], retry_file_text) if retry_file_text is not None else None
+    if retry_file_text is not None and (retry_parsed is None or not retry_parsed["issues"]):
         delete_question_file(cwd, _QA_QUESTION_FILE)
         retry_parsed = None
     if retry_parsed is None:
-        retry_parsed = parse_qa_response(retry_turn["result"])
+        retry_parsed = await _extract_qa_issues_via_skill(row["project_id"], retry_turn["full_text"])
+    if retry_parsed is None:
+        retry_parsed = {"prd": None, "issues": []}
 
     if not retry_parsed["issues"]:
         # Issue #178: the corrective retry also failed to produce anything
         # parseable via the existing chain -- before giving up, ask
         # Ollama's needs-input classifier whether this retry's own result
         # actually still needs a human's input and, if so, make one more
-        # attempt at structured extraction from it.
-        rescued_via_classifier = await _maybe_extract_needs_input_qa(card_id, conn, row, retry_turn["result"])
+        # parser-session extraction attempt on it (issue #230 -- no more
+        # Ollama rescue here either).
+        rescued_via_classifier = await _maybe_extract_needs_input_qa(card_id, conn, row, retry_turn["full_text"])
         if rescued_via_classifier is not None:
             return rescued_via_classifier, retry_turn
 
@@ -2413,7 +1846,7 @@ async def _attempt_qa_corrective_retry(
     return retry_parsed, retry_turn
 
 
-async def _extract_implementing_question(text: str) -> dict | None:
+async def _extract_implementing_question(project_id: int, text: str) -> dict | None:
     """Try to pull recognizable question/option content out of an
     implementing turn's rendered `text`, once `classify_needs_input` (issue
     #179, child of PRD #174) has already decided a human needs to read this
@@ -2423,23 +1856,25 @@ async def _extract_implementing_question(text: str) -> dict | None:
     grilling/QA-grilling, it never asks the model to write anything in the
     `Question N: "..."` protocol (its only structured output is the
     separate, pre-existing `implement_blocked` JSON marker, untouched by
-    this function). So this reuses grilling's own extraction chain wholesale
-    on the chance the model's prose still happens to fit that shape: first
-    `qa_parser.parse_grilling_response`'s regex parser, then (only if that
-    came back empty AND the text still looks like it was trying to ask a
-    question -- `should_attempt_grilling_rescue`'s own trigger check) the
-    same Ollama rescue call grilling falls back to.
+    this function). So this reuses the exact same parser-session extraction
+    pipeline grilling's own turn handling uses
+    (`_extract_questions_via_parser_session`, phase `"implementing"` --
+    matching this file's own established phase-name convention for implement
+    turns, e.g. `_turn_event(phase="implementing", ...)`/
+    `handle_turn_completed(..., "implementing")` elsewhere in this module) on
+    the chance the model's prose still happens to contain one. Issue #230
+    retired the `qa_parser.parse_grilling_response`-regex-then-Ollama-rescue
+    chain this used to try first -- there is no regex pre-check and no
+    Ollama-rescue fallback here anymore, identical to grilling's own
+    extraction.
 
     Returns the parsed `{header, questions, footer, ...}` dict only when it
-    actually carries at least one question -- `None` otherwise, so the
-    caller can fall back to the generic reply panel instead of rendering an
-    empty rich-question UI."""
-    parsed = parse_grilling_response(text)
-    if not parsed["questions"] and should_attempt_grilling_rescue(parsed, text):
-        rescued = await asyncio.to_thread(rescue_grilling_response, text)
-        if rescued is not None:
-            parsed = rescued
-    return parsed if parsed["questions"] else None
+    actually carries at least one question -- `None` otherwise (a dead/
+    missing parser session, an unparseable response, or a response with no
+    recognizable question at all), so the caller can fall back to the
+    generic reply panel instead of rendering an empty rich-question UI."""
+    parsed = await _extract_questions_via_parser_session(project_id, text, phase="implementing")
+    return parsed if parsed and parsed["questions"] else None
 
 
 async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: str | None, model, effort) -> None:
@@ -2450,7 +1885,7 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
     same "suspended, not finished" shape as a QA session awaiting Perfect),
     and otherwise run the existing tracker-file/QA-handoff/pooling logic
     exactly as before this function existed."""
-    console_text = row["console_text"] + "\n\n" + turn["result"] if row["console_text"] else turn["result"]
+    console_text = row["console_text"] + "\n\n" + turn["full_text"] if row["console_text"] else turn["full_text"]
     db.update_session(conn, card_id, console_text=console_text, context_pct=turn.get("context_pct"))
 
     file_text = read_question_file(cwd, _IMPLEMENT_BLOCKED_FILE)
@@ -2468,7 +1903,7 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
             # terminal-text scan below exactly as if it had never existed.
             delete_question_file(cwd, _IMPLEMENT_BLOCKED_FILE)
     if blocked is None:
-        blocked = _parse_implement_blocked_block(turn["result"])
+        blocked = _parse_implement_blocked_block(turn["full_text"])
     if blocked is not None:
         db.update_session(
             conn,
@@ -2511,10 +1946,10 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
     # first and only look at this turn's text. Classifying here first would
     # otherwise intercept a real QA handoff before that logic ever runs.
     classification = None
-    if _parse_qa_grilling_block(turn["result"]) is None:
-        classification = await handle_turn_completed(card_id, conn, row, turn["result"], "implementing")
+    if _parse_qa_grilling_block(turn["full_text"]) is None:
+        classification = await handle_turn_completed(card_id, conn, row, turn["full_text"], "implementing")
     if classification is not None and classification.get("needs_input"):
-        extracted = await _extract_implementing_question(turn["result"])
+        extracted = await _extract_implementing_question(row["project_id"], turn["full_text"])
         if extracted is not None:
             # Recognizable question/option content -- render it with the
             # exact same rich question UI grilling's own rounds use.
@@ -2572,11 +2007,12 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
         details_json=json.dumps(details) if details is not None else None,
     )
 
-    qa_data = _parse_qa_grilling_block(turn["result"])
+    qa_data = _parse_qa_grilling_block(turn["full_text"])
     if qa_data is not None:
-        # /implement Phase 5 ran /qa, which replied with the new nested
-        # "QA session for PRD N: ..." question format (see qa_parser.py) --
-        # the qa_grilling JSON block itself is now just a lightweight signal
+        # /implement Phase 5 ran /qa, which replied with the nested
+        # "QA session for PRD N: ..." question format (see the qa-grilling
+        # skill and `_extract_qa_issues_via_skill` above) -- the
+        # qa_grilling JSON block itself is now just a lightweight signal
         # ({phase, prd}) that this handoff happened; the actual issues/
         # questions are parsed from the turn's own free text.
         # Hand the session_id to the QA session instead of pooling it here
@@ -2584,33 +2020,37 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
         # fresh (reattached via --resume) on its own first turn.
         qa_prd = qa_data.get("prd")
         qa_file_text = read_question_file(cwd, _QA_QUESTION_FILE)
-        qa_parsed = parse_qa_response(qa_file_text) if qa_file_text is not None else None
-        if qa_file_text is not None and not qa_parsed["issues"]:
+        qa_parsed = (
+            await _extract_qa_issues_via_skill(row["project_id"], qa_file_text)
+            if qa_file_text is not None
+            else None
+        )
+        if qa_file_text is not None and (qa_parsed is None or not qa_parsed["issues"]):
             # Present but unparseable -- never let a corrupt file wedge
             # every future round; drop it and fall back to the terminal-text
             # path below exactly as if it had never been written.
             delete_question_file(cwd, _QA_QUESTION_FILE)
             qa_parsed = None
         if qa_parsed is None:
-            qa_parsed = parse_qa_response(turn["result"])
-        if should_attempt_qa_rescue(qa_parsed, turn["result"]) and not db.get_ollama_declined(conn):
-            # Same rescue path as grilling (issue #114) -- the regex parser
-            # found nothing despite text that looks like it was trying to
-            # be a QA session. Skipped when Ollama-assisted parsing has been
-            # declined (issue #119) -- falls back to the empty parsed result.
-            rescued = await asyncio.to_thread(rescue_qa_response, turn["result"])
-            if rescued is not None:
-                qa_parsed = rescued
+            qa_parsed = await _extract_qa_issues_via_skill(row["project_id"], turn["full_text"])
+        if qa_parsed is None:
+            # Issue #230: the parser-session extraction pipeline is the sole
+            # extraction mechanism now -- no regex pre-check, no Ollama-
+            # rescue fallback. A failed/empty extraction here is treated
+            # exactly like a genuine "no issues yet" result; the suspicious-
+            # result corrective retry right below is what decides whether
+            # this is worth one more attempt.
+            qa_parsed = {"prd": None, "issues": []}
 
         qa_turn = turn
-        if _qa_result_is_suspicious(qa_parsed, qa_file_text, turn["result"]):
+        if _qa_result_is_suspicious(qa_parsed, qa_file_text, turn["full_text"]):
             # Issue #159: this round looks like it was genuinely trying to
             # contain QA questions -- rather than silently treating this as
             # "no more QA questions" (indistinguishable from a genuine
             # wrap-up otherwise), give the model one corrective follow-up
             # turn with its own unparseable output before giving up for
             # real.
-            broken_text = qa_file_text if qa_file_text is not None else turn["result"]
+            broken_text = qa_file_text if qa_file_text is not None else turn["full_text"]
             retry_result = await _attempt_qa_corrective_retry(
                 card_id,
                 conn,
@@ -2627,14 +2067,14 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
                 # `_attempt_qa_corrective_retry`'s docstring.
                 return
             qa_parsed, qa_turn = retry_result
-            retried_console_text = console_text + "\n\n" + qa_turn["result"]
+            retried_console_text = console_text + "\n\n" + qa_turn["full_text"]
             db.update_session(conn, card_id, console_text=retried_console_text, context_pct=qa_turn.get("context_pct"))
         elif not qa_parsed["issues"]:
             # Issue #178: the chain concluded no QA questions without even
             # attempting the corrective retry above (not suspicious) -- same
             # last-resort Ollama needs-input check before treating this as a
             # genuine "no more QA questions" wrap-up.
-            rescued_via_classifier = await _maybe_extract_needs_input_qa(card_id, conn, row, turn["result"])
+            rescued_via_classifier = await _maybe_extract_needs_input_qa(card_id, conn, row, turn["full_text"])
             if rescued_via_classifier is not None:
                 qa_parsed = rescued_via_classifier
 
@@ -2649,7 +2089,7 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
             model=model,
             effort=effort,
         )
-        _close_engine(card_id)
+        _close_stream_json_engine(card_id)
         publish(card_id, {"type": "qa_started", "qa_card_id": qa_row_id})
         publish(card_id, _turn_event(phase="implemented", details=details))
         publish(card_id, {"type": "done"})
@@ -2691,15 +2131,15 @@ async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -
     publish(card_id, {"type": "phase", "phase": "implementing"})
 
     try:
-        turn = await _run_turn(
+        turn = await _run_stream_json_turn(
             card_id, reply, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort,
             phase="implementing",
         )
-    except PtyEngineUnrecoverableError as e:
+    except StreamJsonEngineUnrecoverableError as e:
         await _route_crash_to_blocked(card_id, conn, e, phase="implementing")
         return
     except ClaudeCLIError as e:
-        _close_engine(card_id)
+        _close_stream_json_engine(card_id)
         message = str(e)
         needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
@@ -2720,8 +2160,8 @@ async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -
 
     if turn is None:
         # Issue #144/#149: a genuine turn for this card_id is already in
-        # flight -- `_run_turn` already published the duplicate-call error
-        # itself; nothing more to do here.
+        # flight -- `_run_stream_json_turn` already published the
+        # duplicate-call error itself; nothing more to do here.
         return
 
     row = db.get_session(conn, card_id)
@@ -2732,9 +2172,9 @@ async def start_qa_job(card_id: int, prd: dict | None, issues: list[dict], *, cw
     """Publish the qa_grilling turn event for a QA session created by the
     /implement auto-handoff. `prd`/`issues` were already parsed from the
     implement turn's result (the qa_grilling JSON marker for `prd`,
-    `qa_parser.parse_qa_response` for the nested `issues`/`questions`); emit
-    them and leave the session suspended (no 'done') until POST
-    /api/session/qa-complete is called."""
+    `_extract_qa_issues_via_skill` for the nested `issues`/
+    `questions`); emit them and leave the session suspended (no 'done')
+    until POST /api/session/qa-complete is called."""
     publish(card_id, {"type": "phase", "phase": "qa_grilling"})
     publish(card_id, {
         "type": "turn",
@@ -2782,17 +2222,17 @@ async def continue_qa_job(card_id: int, answers: dict, extra_notes: str, *, cwd:
     )
 
     try:
-        turn = await _run_turn(
+        turn = await _run_stream_json_turn(
             card_id, prompt, session_id=row["claude_session_id"], cwd=cwd, model=model, effort=effort,
             phase="qa_closing",
         )
-    except PtyEngineUnrecoverableError as e:
+    except StreamJsonEngineUnrecoverableError as e:
         await _route_crash_to_blocked(card_id, conn, e, phase="qa_closing")
         return
     except ClaudeCLIError as e:
         # /qa's closing step calls `gh issue close`/`gh issue edit` directly,
         # so a genuine gh auth failure is possible here -- classify it.
-        _close_engine(card_id)
+        _close_stream_json_engine(card_id)
         message = str(e)
         needs_login = 1 if _is_gh_auth_failure(message) else 0
         db.update_session(conn, card_id, error_text=message, needs_github_login=needs_login)
@@ -2812,7 +2252,7 @@ async def continue_qa_job(card_id: int, answers: dict, extra_notes: str, *, cwd:
 
     if turn is None:
         # Issue #144/#149: a genuine turn for this card_id is already in
-        # flight -- `_run_turn` already published the duplicate-call error
+        # flight -- `_run_stream_json_turn` already published the duplicate-call error
         # itself; nothing more to do here.
         return
 
@@ -2831,9 +2271,11 @@ async def continue_qa_job(card_id: int, answers: dict, extra_notes: str, *, cwd:
         # engine to reuse as a standby (it just recycles this card's own
         # already-resident tab's id) -- ensure one gets warmed up separately.
         asyncio.create_task(
-            ensure_standby_engine(row["project_id"], cwd=cwd, model=db.get_model(conn), effort=db.DEFAULT_EFFORT)
+            ensure_standby_stream_json_engine(
+                row["project_id"], cwd=cwd, model=db.get_model(conn), effort=db.DEFAULT_EFFORT
+            )
         )
-    _close_engine(card_id)
+    _close_stream_json_engine(card_id)
 
     publish(card_id, _turn_event(phase="qa_closing"))
     publish(card_id, {"type": "done"})
@@ -2865,17 +2307,16 @@ async def retry_session_job(card_id: int, cwd: str | None) -> None:
         return
 
     if row["phase"] == "creating_prd":
+        # `advance_past_grilling` also closes this card's resident
+        # `StreamJsonEngine` first -- correct here too: a row stuck at
+        # `creating_prd` may still have a leftover grilling-phase engine
+        # resident (e.g. an app restart caught it before that close ever
+        # ran), and `_run_chain_step` always constructs its own fresh tab
+        # for the phase it's about to run regardless.
         await advance_past_grilling(card_id, cwd)
-    elif row["phase"] == "creating_issues":
-        ok, claude_session_id, last_result = await _run_chain_step(
-            card_id,
-            conn,
-            row,
-            phase="creating_issues",
-            prompt="/rhubarb:to-issues",
-            cwd=cwd,
-            model=row["model"],
-            effort=row["effort"],
+    elif row["phase"] in ("creating_issues", "publishing"):
+        default_prompt = dict(_CHAIN_PHASES)[row["phase"]]
+        await _run_chain_from(
+            card_id, conn, cwd, start_phase=row["phase"], start_prompt=default_prompt,
+            model=row["model"], effort=row["effort"],
         )
-        if ok:
-            await _finish_chain(card_id, conn, claude_session_id, cwd, summary=last_result)

@@ -174,14 +174,14 @@ def test_app_state_returns_engine_ground_truth_for_a_card_with_a_live_engine(cli
         model = "claude-sonnet-5"
         effort = "low"
 
-    session_runner._pty_engines[card_id] = _FakeEngine()
+    session_runner._stream_json_engines[card_id] = _FakeEngine()
     try:
         state = client.get(f"/api/app-state?card_id={card_id}").json()
         assert state["model"] == "claude-sonnet-5"
         assert state["effort"] == "low"
         assert state["session_model_effort_live"] is True
     finally:
-        session_runner._pty_engines.pop(card_id, None)
+        session_runner._stream_json_engines.pop(card_id, None)
 
 
 def test_app_state_falls_back_to_global_settings_when_card_has_no_live_engine(client, tmp_path):
@@ -195,7 +195,7 @@ def test_app_state_falls_back_to_global_settings_when_card_has_no_live_engine(cl
     # row's own field, since there's no live engine to be ground truth for.
     card_id = db.create_session(conn, project_id, model="claude-opus-4-8", effort="high")
 
-    assert card_id not in session_runner._pty_engines
+    assert card_id not in session_runner._stream_json_engines
     state = client.get(f"/api/app-state?card_id={card_id}").json()
     assert state["model"] == "claude-sonnet-4-6"
     assert state["effort"] == "auto"
@@ -217,14 +217,14 @@ def test_app_state_without_card_id_is_unaffected_by_a_live_engine_elsewhere(clie
         model = "claude-sonnet-5"
         effort = "low"
 
-    session_runner._pty_engines[card_id] = _FakeEngine()
+    session_runner._stream_json_engines[card_id] = _FakeEngine()
     try:
         state = client.get("/api/app-state").json()
         assert state["model"] == "claude-sonnet-4-6"
         assert state["effort"] == "auto"
         assert state["session_model_effort_live"] is False
     finally:
-        session_runner._pty_engines.pop(card_id, None)
+        session_runner._stream_json_engines.pop(card_id, None)
 
 
 def _open_project(client, tmp_path, name):
@@ -263,8 +263,8 @@ def test_pty_tab_count_lists_resident_and_standby_engines_with_model_effort(clie
         model = "claude-sonnet-4-6"
         effort = "auto"
 
-    session_runner._pty_engines[card_id] = _FakeEngine()
-    session_runner._standby_engines[project_id] = (_FakeStandbyEngine(), "claude-sonnet-4-6", "auto")
+    session_runner._stream_json_engines[card_id] = _FakeEngine()
+    session_runner._standby_stream_json_engines[project_id] = (_FakeStandbyEngine(), "claude-sonnet-4-6", "auto")
 
     data = client.get("/api/pty-tabs/count").json()
 
@@ -302,9 +302,9 @@ def test_list_live_engines_combines_resident_and_standby_across_projects(client,
             self.model = model
             self.effort = effort
 
-    session_runner._pty_engines[card_a] = _FakeEngine("claude-opus-4-8", "high")
-    session_runner._pty_engines[card_b] = _FakeEngine("claude-sonnet-5", "auto")
-    session_runner._standby_engines[project_id] = (_FakeEngine("claude-sonnet-4-6", "low"), "claude-sonnet-4-6", "low")
+    session_runner._stream_json_engines[card_a] = _FakeEngine("claude-opus-4-8", "high")
+    session_runner._stream_json_engines[card_b] = _FakeEngine("claude-sonnet-5", "auto")
+    session_runner._standby_stream_json_engines[project_id] = (_FakeEngine("claude-sonnet-4-6", "low"), "claude-sonnet-4-6", "low")
 
     engines = session_runner.list_live_engines()
 
@@ -522,10 +522,9 @@ def test_open_project_records_afk_activity(client, tmp_path, monkeypatch):
 
 
 def test_open_project_schedules_a_standby_prewarm(client, tmp_path, monkeypatch):
-    """Issue #184: a brand-new session always begins in the grilling phase,
-    which now runs on `StreamJsonEngine` -- so `open_project` pre-warms the
-    `StreamJsonEngine` standby (`ensure_standby_stream_json_engine`), not
-    the `PtyEngine` one."""
+    """A brand-new session always begins in the grilling phase, which runs
+    on `StreamJsonEngine` -- so `open_project` pre-warms the
+    `StreamJsonEngine` standby (`ensure_standby_stream_json_engine`)."""
     root = tmp_path / "root"
     root.mkdir()
     _init_repo(root / "repo1", "https://github.com/x/repo1.git")
@@ -547,39 +546,31 @@ def test_open_project_schedules_a_standby_prewarm(client, tmp_path, monkeypatch)
 
 
 def test_close_project_closes_its_standby(client, tmp_path, monkeypatch):
-    """Issue #184: `close_project` closes BOTH standby registries
-    unconditionally (harmless no-op on whichever one is actually empty) --
-    in practice only the `StreamJsonEngine` one is ever warm for a project
-    now (see `open_project`), but the `PtyEngine` one is still called too,
-    in case anything else ever warms it."""
+    """`close_project` closes the project's standby `StreamJsonEngine` --
+    the only engine transport since issue #225 removed `PtyEngine`."""
     root = tmp_path / "root"
     root.mkdir()
     _init_repo(root / "repo1", "https://github.com/x/repo1.git")
     client.post("/api/settings/root-dir", json={"root_dir": str(root)})
     project_id = client.get("/api/app-state").json()["projects"][0]["id"]
 
-    calls = []
     stream_json_calls = []
-    monkeypatch.setattr(app_module.session_runner, "close_standby_engine", lambda pid: calls.append(pid))
     monkeypatch.setattr(
         app_module.session_runner, "close_standby_stream_json_engine", lambda pid: stream_json_calls.append(pid)
     )
 
     client.post(f"/api/projects/{project_id}/close", json={})
 
-    assert calls == [project_id]
     assert stream_json_calls == [project_id]
 
 
 def test_session_start_claims_a_matching_standby_engine(client, tmp_path, monkeypatch):
-    """Issue #184: `/api/session/start` always begins a grilling-phase
-    session, which now claims the `StreamJsonEngine` standby
-    (`claim_standby_stream_json_engine`/`register_stream_json_engine`), not
-    the `PtyEngine` one. The claimed engine's session id is exposed as
-    `.session_id` (StreamJsonEngine's own attribute name), not
-    `.claude_session_id` (PtyEngine's) -- see `session_runner.py`'s
-    `start_session` docstring for why that's the correct "no resumable
-    session yet" value for a never-yet-turned standby."""
+    """`/api/session/start` always begins a grilling-phase session, which
+    claims the `StreamJsonEngine` standby (`claim_standby_stream_json_engine`/
+    `register_stream_json_engine`). The claimed engine's session id is
+    exposed as `.session_id` (StreamJsonEngine's own attribute name) -- see
+    `session_runner.py`'s `start_session` docstring for why that's the
+    correct "no resumable session yet" value for a never-yet-turned standby."""
     root = tmp_path / "root"
     root.mkdir()
     _init_repo(root / "repo1", "https://github.com/x/repo1.git")
@@ -1026,119 +1017,37 @@ def test_sessions_list_excludes_a_closed_session(client, tmp_path):
 
 # ---------------------------------------------------------------------------
 # Stall-reply endpoint (issue #169, child of PRD #168 "Recover from a
-# stalled turn instead of hanging the turn lock forever"): mirrors
-# `resize_session_pty` in shape -- a small, separate endpoint that looks up
-# a card's resident engine and forwards straight into its lock-protected
-# `PtyEngine.write()`, without going through `_run_turn`'s own prompt-write
-# machinery, starting a new turn, or touching the turn lock a second time.
+# stalled turn instead of hanging the turn lock forever"; issue #225 changed
+# every resume path to a genuinely new turn -- there is no raw keystroke
+# passthrough to write into under `StreamJsonEngine`'s headless
+# request/response transport, the only engine transport since `PtyEngine`
+# was removed): dispatches by the row's phase to either
+# `continue_implement_job` (implementing) or `continue_stalled_chain_step_job`
+# (creating_prd/creating_issues/publishing), each resuming as a fresh turn
+# reattached via the row's existing `claude_session_id`. A no-op
+# (`{"replied": False}`) for any other phase -- nothing paused there to
+# resume.
 # ---------------------------------------------------------------------------
 
 
-class _FakeWriteEngine:
-    """Minimal stand-in for a resident `PtyEngine` -- only `write()` is
-    exercised by the stall-reply endpoint, so that's all this fake needs to
-    implement. Records every call so a test can assert exactly what reached
-    it, and never touches any turn lock -- there is none here, since this
-    fake is registered directly into `session_runner._pty_engines` rather
-    than driven through `_run_turn`."""
-
-    def __init__(self):
-        self.writes = []
-
-    async def write(self, data):
-        self.writes.append(data)
-
-
-def test_stall_reply_endpoint_forwards_straight_into_the_cards_engine_write(client, tmp_path, monkeypatch):
+def test_stall_reply_endpoint_is_a_noop_for_a_card_not_in_a_resumable_phase(client, tmp_path):
     project_id = _open_project(client, tmp_path, "proj")
 
     conn = db.get_connection()
+    # A freshly-created row defaults to phase="grilling" -- not one of the
+    # phases this endpoint knows how to resume.
     card_id = db.create_session(conn, project_id)
-
-    engine = _FakeWriteEngine()
-    monkeypatch.setattr(session_runner, "_pty_engines", {card_id: engine})
-
-    resp = client.post(f"/api/sessions/{card_id}/stall-reply", json={"text": "please continue"})
-
-    assert resp.json() == {"replied": True}
-    assert engine.writes == ["please continue"]
-
-
-def test_stall_reply_endpoint_is_a_noop_for_a_card_with_no_live_engine(client, tmp_path):
-    project_id = _open_project(client, tmp_path, "proj")
-
-    conn = db.get_connection()
-    card_id = db.create_session(conn, project_id)
-    # No engine registered for this card_id at all.
 
     resp = client.post(f"/api/sessions/{card_id}/stall-reply", json={"text": "anything"})
 
     assert resp.json() == {"replied": False}
 
 
-def test_stall_reply_endpoint_never_touches_the_turn_lock_or_starts_a_new_turn(client, tmp_path, monkeypatch):
-    """The whole point of this endpoint: it must reach the engine's `write()`
-    directly, never `_run_turn` (which would try to acquire the per-card
-    turn lock a second time and start a brand-new turn on top of whatever's
-    already in flight)."""
-    project_id = _open_project(client, tmp_path, "proj")
-
-    conn = db.get_connection()
-    card_id = db.create_session(conn, project_id)
-
-    engine = _FakeWriteEngine()
-    monkeypatch.setattr(session_runner, "_pty_engines", {card_id: engine})
-
-    def _run_turn_must_not_be_called(*args, **kwargs):
-        raise AssertionError("stall-reply must not go through _run_turn")
-
-    monkeypatch.setattr(session_runner, "_run_turn", _run_turn_must_not_be_called)
-
-    # Hold the turn lock ourselves, exactly as a genuinely in-flight turn
-    # would -- the endpoint must still succeed, proving it never tries to
-    # acquire this same lock.
-    lock = session_runner._get_turn_lock(card_id)
-    assert not lock.locked()
-
-    resp = client.post(f"/api/sessions/{card_id}/stall-reply", json={"text": "nudge"})
-
-    assert resp.json() == {"replied": True}
-    assert engine.writes == ["nudge"]
-    # Still untouched -- the endpoint never acquired or released it.
-    assert not lock.locked()
-
-
-def test_stall_reply_endpoint_forwards_to_the_correct_cards_engine_only(client, tmp_path, monkeypatch):
-    """With two cards each carrying their own resident engine, a reply for
-    one card must never reach the other's."""
-    project_id = _open_project(client, tmp_path, "proj")
-
-    conn = db.get_connection()
-    card_id_a = db.create_session(conn, project_id)
-    card_id_b = db.create_session(conn, project_id)
-
-    engine_a = _FakeWriteEngine()
-    engine_b = _FakeWriteEngine()
-    monkeypatch.setattr(session_runner, "_pty_engines", {card_id_a: engine_a, card_id_b: engine_b})
-
-    resp = client.post(f"/api/sessions/{card_id_a}/stall-reply", json={"text": "for A"})
-
-    assert resp.json() == {"replied": True}
-    assert engine_a.writes == ["for A"]
-    assert engine_b.writes == []
-
-
-def test_stall_reply_endpoint_resumes_an_implement_session_via_a_new_turn_instead_of_raw_write(
-    client, tmp_path, monkeypatch
-):
+def test_stall_reply_endpoint_resumes_an_implement_session_via_a_new_turn(client, tmp_path, monkeypatch):
     """Issue #179: a card left in `phase: implementing` with `stalled_json`
     set by `_finish_implement_turn`'s needs-input fallback (see
-    tests/test_sessions.py) has ALREADY completed its turn -- nothing is
-    still reading its PTY, so a raw `engine.write()` (this endpoint's
-    original issue #169 behavior) would go nowhere. For that specific case
-    (session_type "implement", phase "implementing"), this endpoint must
-    resume through `continue_implement_job` -- a real new turn -- instead,
-    and must NOT touch the card's engine directly."""
+    tests/test_sessions.py) resumes through `continue_implement_job` -- a
+    real new turn."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -1149,9 +1058,6 @@ def test_stall_reply_endpoint_resumes_an_implement_session_via_a_new_turn_instea
     )
     db.update_session(conn, card_id, stalled_json=json.dumps({"phase": "implementing", "context": "Confirm?"}))
 
-    engine = _FakeWriteEngine()
-    monkeypatch.setattr(session_runner, "_pty_engines", {card_id: engine})
-
     calls = []
 
     async def fake_continue_implement_job(card_id_arg, reply, *, cwd):
@@ -1159,13 +1065,38 @@ def test_stall_reply_endpoint_resumes_an_implement_session_via_a_new_turn_instea
 
     monkeypatch.setattr(session_runner, "continue_implement_job", fake_continue_implement_job)
 
-    resp = client.post(f"/api/sessions/{card_id}/stall-reply", json={"text": "Yes, go ahead.\r"})
+    resp = client.post(f"/api/sessions/{card_id}/stall-reply", json={"text": "Yes, go ahead."})
 
     assert resp.json() == {"replied": True}
-    assert engine.writes == []
     assert len(calls) == 1
     assert calls[0][0] == card_id
     assert calls[0][1] == "Yes, go ahead."
+
+
+def test_stall_reply_endpoint_resumes_a_chain_step_via_a_new_turn(client, tmp_path, monkeypatch):
+    """Issue #225 (child of PRD #222): a card paused mid-chain (`creating_prd`/
+    `creating_issues`/`publishing`, `stalled_json` set by `_run_chain_step`'s
+    needs-input branch) resumes through `continue_stalled_chain_step_job`."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id, session_type="do", phase="creating_prd")
+    db.update_session(conn, card_id, stalled_json=json.dumps({"phase": "creating_prd", "context": "Scope unclear."}))
+
+    calls = []
+
+    async def fake_continue_stalled_chain_step_job(card_id_arg, reply, *, cwd):
+        calls.append((card_id_arg, reply, cwd))
+
+    monkeypatch.setattr(session_runner, "continue_stalled_chain_step_job", fake_continue_stalled_chain_step_job)
+
+    resp = client.post(f"/api/sessions/{card_id}/stall-reply", json={"text": "Use Postgres."})
+
+    assert resp.json() == {"replied": True}
+    assert len(calls) == 1
+    assert calls[0][0] == card_id
+    assert calls[0][1] == "Use Postgres."
 
 
 def _cwd_for(project_id):

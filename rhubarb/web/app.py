@@ -5,7 +5,7 @@ import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -15,8 +15,6 @@ from rhubarb.cli_client import ClaudeCLIError, get_auth_status, set_headroom_pro
 from rhubarb.folder_picker import pick_folder
 from rhubarb.prd_list import compute_prd_list
 from rhubarb.projects import scan_projects
-from rhubarb.pty_engine import PtyEngineError
-from rhubarb.qa_parser import parse_grilling_response
 from rhubarb.question_files import read_question_file
 from rhubarb.terminal import open_terminal_running
 
@@ -160,8 +158,8 @@ def prompt_page(request: Request):
 def app_state(card_id: int | None = None):
     """`card_id` is an optional hint (issue #139) naming the currently-open
     session card, if any -- the frontend's Model/Effort card passes its
-    `leftCardId` here so it can show that card's live `PtyEngine`'s actual
-    `(model, effort)` (ground truth for the process actually running)
+    `leftCardId` here so it can show that card's live `StreamJsonEngine`'s
+    actual `(model, effort)` (ground truth for the process actually running)
     instead of always showing the global "next new session" setting. Omitted
     (or naming a card with no live resident engine -- finished/pooled/never
     started) falls back to `db.get_model`/`db.get_effort` exactly as before
@@ -578,15 +576,12 @@ async def _warm_project_engines(project_id: int, *, cwd: str | None, model: str 
     footprint on the event loop as the original single-warm version was.
 
     - Standby `StreamJsonEngine` (issue #136, adapted to stream-json by
-      issue #184): so the first `/do` a user starts doesn't pay the "wait
+      issue #184, now the only engine transport since issue #225 removed
+      `PtyEngine`): so the first `/do` a user starts doesn't pay the "wait
       for claude to open" spawn cost inline. A brand-new session always
       begins in the grilling phase (`db.create_session`'s own
-      `phase="grilling"` default), and grilling now runs on
-      `StreamJsonEngine`, matching what `start_session` actually claims for
-      a fresh session's first turn. The old `ensure_standby_engine`
-      (PtyEngine) standby machinery is left completely intact for any other
-      caller -- it's simply not used for this purpose any more, since
-      nothing else ever starts a brand-new session.
+      `phase="grilling"` default), matching what `start_session` actually
+      claims for a fresh session's first turn.
     - Parser session (issue #189, lifecycle slice of PRD #187 -- `gh issue
       view 187`): lazily creates this project's persistent parser session
       on first open, reused (same subprocess, same session_id) on every
@@ -631,11 +626,6 @@ def close_project(project_id: int, body: dict):
     db.save_session_state(conn, project_id, body.get("session_state", {}))
     if _active_project_id == project_id:
         _active_project_id = None
-    # Issue #184: close whichever standby this project actually has warm --
-    # in practice this is always the `StreamJsonEngine` one now (see
-    # `open_project`), but `close_standby_engine` (PtyEngine) is also called
-    # unconditionally, harmlessly, in case anything else ever warms one.
-    session_runner.close_standby_engine(project_id)
     session_runner.close_standby_stream_json_engine(project_id)
     return {"closed": True}
 
@@ -713,12 +703,22 @@ def list_sessions(project_id: int):
 
 
 @app.get("/api/projects/{project_id}/rhubarb-question-file-preview")
-def preview_rhubarb_question_file(project_id: int):
+async def preview_rhubarb_question_file(project_id: int):
     """Debug tool (PRD #123 follow-up): read this project's pending
-    `.claude/rhubarb_question.md` right now, parse it exactly the way a real
-    grilling turn would, and hand back the resulting interview -- so the
-    parse/render path can be checked directly against the file, independent
-    of whether a live turn's own file-priority check is reaching it."""
+    `.claude/rhubarb_question.md` right now and extract its structured
+    interview via this project's own live parser session -- the exact same
+    parser-session pipeline (`parser_session._build_extraction_prompt`/
+    `stream_turn`/`_extract_json_object`) a real grilling turn now uses
+    (`session_runner._extract_grilling_questions_via_parser_session`).
+
+    Issue #230 fully retired `qa_parser.parse_grilling_response`'s regex
+    parser this endpoint used to call directly -- that module no longer
+    exists, so this now genuinely previews "exactly the way a real grilling
+    turn would" instead of a separate, dead extraction path. Returns
+    `{"found": False}` if no file is pending, or if this project has no live
+    parser session to extract with right now (mirrors a real turn's own
+    "nothing extractable" shape otherwise: `{"header": <raw file text>,
+    "questions": [], "footer": ""}`)."""
     conn = db.get_connection()
     project = db.get_project(conn, project_id)
     if project is None:
@@ -728,7 +728,21 @@ def preview_rhubarb_question_file(project_id: int):
     if file_text is None:
         return {"found": False}
 
-    return {"found": True, "interview": parse_grilling_response(file_text)}
+    engine = parser_session.get_parser_session(project_id)
+    if engine is None:
+        return {"found": False}
+
+    prompt = parser_session._build_extraction_prompt(phase="grilling", text=file_text)
+    result_text = None
+    async for event in parser_session.stream_turn(project_id, prompt):
+        if event.get("type") == "result":
+            result_text = event.get("result")
+
+    data = parser_session._extract_json_object(result_text) if result_text is not None else None
+    if data is None:
+        data = {"header": file_text, "questions": [], "footer": ""}
+
+    return {"found": True, "interview": data}
 
 
 @app.get("/api/projects/{project_id}/afk-notifications")
@@ -817,19 +831,18 @@ def get_usage():
 
 @app.get("/api/pty-tabs/count")
 def get_pty_tab_count():
-    """How many `PtyEngine` tabs are currently resident across every active
-    session (issue #88) -- backs the tab-count indicator next to the
+    """How many `StreamJsonEngine` tabs are currently resident across every
+    active session (issue #88) -- backs the tab-count indicator next to the
     "Sessions" label in the web UI. Polled rather than pushed over any one
     card's SSE stream since the count is global, not scoped to a card.
 
     `"engines"` (issue #140) is an additive per-engine listing alongside the
-    plain `"count"` -- one record per live entry across both resident
-    (`_pty_engines`) and pre-warmed standby (`_standby_engines`) engines,
-    each carrying its actual `(model, effort)` and a distinguishing
-    `card_id` (an int, or the literal string `"standby"`) -- see
-    `session_runner.list_live_engines`. Existing consumers that only read
-    `"count"` are unaffected."""
-    return {"count": session_runner.open_pty_tab_count(), "engines": session_runner.list_live_engines()}
+    plain `"count"` -- one record per live entry across both resident and
+    pre-warmed standby engines, each carrying its actual `(model, effort)`
+    and a distinguishing `card_id` (an int, or the literal string
+    `"standby"`) -- see `session_runner.list_live_engines`. Existing
+    consumers that only read `"count"` are unaffected."""
+    return {"count": session_runner.count_resident_engines(), "engines": session_runner.list_live_engines()}
 
 
 @app.get("/api/sessions/{card_id}/stream")
@@ -854,142 +867,42 @@ async def stream_session(card_id: int):
     return StreamingResponse(event_source(), media_type="text/event-stream")
 
 
-@app.websocket("/ws/sessions/{card_id}/pty")
-async def pty_passthrough(websocket: WebSocket, card_id: int):
-    """Raw interactive passthrough channel (issue #165, child of PRD #162
-    "Add raw interactive passthrough mode to the Live Terminal"): accepts a
-    WebSocket connection scoped to a single card's resident `PtyEngine` and
-    forwards every text frame received over the socket straight into that
-    engine's write path (`PtyEngine.write`), byte for byte, exactly as a
-    person typing directly into the terminal would.
-
-    This is purely an input channel, additive alongside the existing SSE
-    stream (`GET /api/sessions/{card_id}/stream` above) -- it carries no
-    output of its own and does not touch, replace, or change that stream's
-    behavior in any way; a frontend still reads `terminal_output`/`result`
-    events from the SSE stream exactly as before. Frontend wiring that
-    actually opens this socket from `prompt.html` is issue #167, out of
-    scope here.
-
-    `PtyEngine.write` is guarded by the same `asyncio.Lock` the automated-
-    turn write loop (`_stream_chunks_until_marker`) holds for its entire
-    paced prompt write, so a passthrough write forwarded here can never
-    physically interleave its bytes with an in-flight automated turn's
-    writes into the same PTY, in either direction.
-
-    Closes immediately with code 1008 (policy violation) if `card_id` names
-    no live resident engine -- there's nothing to forward to. Ends quietly
-    (no error) on a normal client disconnect, or if the engine dies/closes
-    out from under an open connection (`PtyEngineError` from `write`)."""
-    engine = session_runner.get_engine(card_id)
-    if engine is None:
-        await websocket.close(code=1008)
-        return
-
-    await websocket.accept()
-    try:
-        while True:
-            data = await websocket.receive_text()
-            try:
-                await engine.write(data)
-            except PtyEngineError:
-                break
-    except WebSocketDisconnect:
-        pass
-
-
-@app.post("/api/sessions/{card_id}/resize")
-def resize_session_pty(card_id: int, body: dict):
-    """Dynamic PTY resize (issue #166): the frontend's xterm.js fit-addon
-    calls this whenever it recomputes the live-terminal panel's actual
-    cols/rows (on load, and on every panel resize -- see `resizeTerminalToFit`
-    in `prompt.html`) so the REAL pseudoterminal backing this card's
-    resident `PtyEngine` is resized to match, not just the on-screen
-    xterm.js buffer.
-
-    A plain HTTP endpoint rather than piggybacking on the raw passthrough
-    WebSocket (`/ws/sessions/{card_id}/pty`, issue #165) on purpose: that
-    channel is documented and built as a byte-for-byte passthrough straight
-    into the PTY's stdin, with no control-plane framing of any kind --
-    every frame it receives is forwarded to `PtyEngine.write()` verbatim.
-    Overloading it with a second, structured message shape would mean
-    inventing an escaping/framing scheme to tell a resize control message
-    apart from literal keystroke bytes (which can be arbitrary), and would
-    contradict that endpoint's own docstring ("carries no output of its
-    own" / "byte for byte"). A separate small endpoint keeps that channel's
-    contract exactly as simple as it already is.
-
-    A no-op (not an error) if `card_id` names no live resident engine --
-    a session can be resized before its first turn ever creates one (or
-    after it's already closed); there's simply nothing to resize yet, and
-    the size a session eventually spawns at is seeded from `PtyEngine`'s
-    own default (`_PTY_ROWS`/`_PTY_COLUMNS`) until a later resize call
-    lands against a live engine."""
-    rows = body["rows"]
-    cols = body["cols"]
-
-    engine = session_runner.get_engine(card_id)
-    if engine is None:
-        return {"resized": False}
-
-    engine.resize(rows, cols)
-    return {"resized": True, "rows": rows, "cols": cols}
-
-
 @app.post("/api/sessions/{card_id}/stall-reply")
 async def reply_to_stalled_session(card_id: int, body: dict):
-    """Forward a reply straight into a card's live PTY process (issue #169,
-    child of PRD #168 "Recover from a stalled turn instead of hanging the
-    turn lock forever"): while `_stream_chunks_until_marker`'s read loop is
-    still waiting on the pending read for the completion marker -- surfaced
-    to this card's SSE stream as `turn` events carrying `stalled: true` (see
-    `session_runner._run_turn`) -- a human may want to nudge the live
-    process along (e.g. resend whatever input it seems to have missed)
-    without waiting indefinitely for that original turn to either resolve
-    on its own or the engine to be torn down.
+    """Resume a session paused because `session_runner.classify_needs_input`
+    found a completed turn needed a human's input before its phase/session
+    could usefully continue on its own (issue #177/#179) -- the generic
+    stall-reply panel (`stalled_json` on the row, `stalled`/`stalled_context`
+    on the `turn` event) rather than a rich question/options UI.
 
-    Mirrors `resize_session_pty` above in shape: a small, separate HTTP
-    endpoint (not piggybacked on the raw passthrough WebSocket) that looks
-    up this card's resident engine via `get_engine` and forwards straight
-    into its lock-protected `PtyEngine.write()` -- the exact same passthrough
-    path raw interactive typing already uses (issue #165). This does NOT go
-    through `_run_turn`'s own prompt-write machinery, does NOT start a new
-    turn, and does NOT touch the turn lock (`session_runner._get_turn_lock`)
-    a second time -- the original turn's marker-wait loop (still running
-    underneath, holding that lock) remains the single source of truth for
-    when the turn is actually done. This endpoint only ever writes bytes
-    into that same live process's stdin, exactly as a person typing directly
-    into the terminal would.
+    Dispatches by the row's own phase, since each resumes differently:
+    `session_type == "implement"` and `phase == "implementing"` (the state
+    `_finish_implement_turn` leaves such a session suspended in) resumes
+    through `continue_implement_job`; `phase` in `creating_prd`/
+    `creating_issues`/`publishing` (the state `_run_chain_step` leaves such
+    a session suspended in) resumes through `continue_stalled_chain_step_job`.
+    Both send the reply as a genuinely new turn, reattached via the row's
+    existing `claude_session_id` -- there is no raw keystroke passthrough to
+    write into under `StreamJsonEngine`'s headless request/response
+    transport (issue #225 removed `PtyEngine`, the only transport that ever
+    supported that).
 
-    A no-op (`{"replied": False}`, not an error) if `card_id` names no live
-    resident engine -- same "nothing to do" shape as `resize_session_pty`.
-
-    Issue #179: an implement-type session parked here because
-    `session_runner.classify_needs_input` found the turn needed a human's
-    input but nothing shaped like a rich question to extract (see
-    `_finish_implement_turn`) is different from this endpoint's original
-    mid-turn-nudge case -- that turn has already completed, so nothing is
-    still reading the PTY for it, and a raw write here would go nowhere.
-    For that case (`session_type == "implement"` and `phase ==
-    "implementing"`, the exact state `_finish_implement_turn` leaves such a
-    session suspended in), this resumes through `continue_implement_job` --
-    a real new turn, run the same way a genuine `implement_blocked` reply
-    already is -- instead of writing straight into the PTY."""
+    A no-op (`{"replied": False}`, not an error) for any other phase --
+    nothing paused there to resume."""
     text = body["text"]
 
     conn = db.get_connection()
     row = db.get_session(conn, card_id)
+    cwd = _active_project_cwd()
     if row is not None and row["session_type"] == "implement" and row["phase"] == "implementing":
-        cwd = _active_project_cwd()
-        asyncio.create_task(session_runner.continue_implement_job(card_id, text.rstrip("\r\n"), cwd=cwd))
+        asyncio.create_task(session_runner.continue_implement_job(card_id, text, cwd=cwd))
         return {"replied": True}
 
-    engine = session_runner.get_engine(card_id)
-    if engine is None:
-        return {"replied": False}
+    if row is not None and row["phase"] in ("creating_prd", "creating_issues", "publishing"):
+        asyncio.create_task(session_runner.continue_stalled_chain_step_job(card_id, text, cwd=cwd))
+        return {"replied": True}
 
-    await engine.write(text)
-    return {"replied": True}
+    return {"replied": False}
 
 
 @app.post("/api/session/start")
@@ -1067,11 +980,8 @@ async def continue_session(body: dict):
         return {"error": "Session not found"}
 
     cwd = _active_project_cwd()
-    confirm_advance = body.get("confirm_advance", False)
     asyncio.create_task(
-        session_runner.continue_session_job(
-            row["id"], body.get("reply", ""), cwd=cwd, confirm_advance=confirm_advance
-        )
+        session_runner.continue_session_job(row["id"], body.get("reply", ""), cwd=cwd)
     )
 
     return {"card_id": row["id"]}

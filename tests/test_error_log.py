@@ -171,8 +171,8 @@ def test_run_turn_lock_busy_logs_exactly_once(monkeypatch, tmp_path, _isolated_l
 
     async def _scenario():
         async with lock:
-            return await session_runner._run_turn(
-                card_id, "hello", session_id=None, cwd=None, phase="grilling"
+            return await session_runner._run_stream_json_turn(
+                card_id, "hello", session_id=None, cwd=None, model=None, effort=None, phase="grilling"
             )
 
     result = run(_scenario())
