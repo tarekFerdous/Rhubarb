@@ -78,11 +78,9 @@
     </div>
     <div class="card left">
       <button id="settings-gear" class="gear-btn" type="button" title="Settings">&#9881;</button>
-      <button id="preview-question-file-btn" class="gear-btn" type="button" title="Preview .claude/rhubarb_question.md">&#128269;</button>
       <!-- Manual test hook (issue #188): raises a sample toast, alternating
            normal/failure, so the component is independently verifiable
-           before any real trigger exists. Same disposable debug-button
-           convention as preview-question-file-btn above. -->
+           before any real trigger exists. -->
       <button id="toast-debug-btn" class="gear-btn" type="button" title="Raise test toast (issue #188 debug)">&#128276;</button>
       <h1 class="brand" id="brand-heading">What are we doing?</h1>
       <p class="user-line">{{ email }}</p>
@@ -583,17 +581,20 @@
   <!-- Do-finished modal: shown when a /do session reaches the `details`
        pause point (PRD + issues published). Displays the session summary
        (PRD and issue numbers) and offers two actions:
-       - Continue → starts a fresh /do grilling round on the same session
-         (context preserved, prompt box shown for a new prompt).
-       - Close session → ends this session; next /do will start with a blank
-         context (equivalent to /clear). -->
+       - Implement right away → closes the modal and immediately starts an
+         implement session for the just-created PRD, via the same
+         `startImplementSession` flow the "To be implemented" list's
+         per-PRD button already triggers.
+       - Later → ends this session (identical to the old "Close the
+         session" behavior); the PRD already appears in the "To be
+         implemented" list via loadPrdList()'s existing refresh. -->
   <div id="do-finished-modal" class="modal-overlay" hidden>
     <div class="modal">
       <h2 class="modal-heading">Done!</h2>
       <p id="do-finished-summary" class="modal-text md-prose"></p>
       <div class="ready-to-proceed-actions">
-        <button id="do-finished-continue-btn" class="glass-btn" type="button">Continue in the same session</button>
-        <button id="do-finished-close-session-btn" class="glass-btn" type="button">Close the session</button>
+        <button id="do-finished-implement-btn" class="glass-btn" type="button">Implement right away</button>
+        <button id="do-finished-later-btn" class="glass-btn" type="button">Later</button>
       </div>
     </div>
   </div>
@@ -654,8 +655,8 @@
     const implementingBannerProceedBtn = document.getElementById("implementing-banner-proceed-btn");
     const doFinishedModalEl = document.getElementById("do-finished-modal");
     const doFinishedSummaryEl = document.getElementById("do-finished-summary");
-    const doFinishedContinueBtnEl = document.getElementById("do-finished-continue-btn");
-    const doFinishedCloseSessionBtnEl = document.getElementById("do-finished-close-session-btn");
+    const doFinishedImplementBtnEl = document.getElementById("do-finished-implement-btn");
+    const doFinishedLaterBtnEl = document.getElementById("do-finished-later-btn");
     const activeProjectLineEl = document.getElementById("active-project-line");
     const activeProjectNameEl = document.getElementById("active-project-name");
     const settingsModalEl = document.getElementById("settings-modal");
@@ -2700,22 +2701,6 @@
     }
 
     document.getElementById("settings-gear").addEventListener("click", openSettingsModal);
-    document.getElementById("preview-question-file-btn").addEventListener("click", async () => {
-      // Debug tool (PRD #123 follow-up): render the project's current
-      // .claude/rhubarb_question.md directly through the real renderInterview
-      // path, independent of a live turn -- isolates "the file doesn't parse/
-      // render right" from "a live turn isn't reaching the file."
-      if (!activeProject) return;
-      const res = await fetch(`/api/projects/${activeProject.id}/rhubarb-question-file-preview`);
-      const data = await res.json();
-      if (!data.found) {
-        alert("No .claude/rhubarb_question.md found for this project right now.");
-        return;
-      }
-      showOnly(mainFlowEl);
-      setHeading("Preview: rhubarb_question.md");
-      renderInterview(data.interview);
-    });
     document.getElementById("toast-debug-btn").addEventListener("click", () => {
       const variant = toastIdCounter % 2 === 0 ? "normal" : "failure";
       const identifier = leftCardId !== null ? leftCardId : `debug-${Date.now()}`;
@@ -4200,9 +4185,10 @@
     closeSessionCancelBtnEl.addEventListener("click", dismissCloseSessionModal);
     closeSessionConfirmBtnEl.addEventListener("click", confirmCloseSession);
 
-    // Close session button on the do-finished modal -- direct close, no
+    // Later button on the do-finished modal -- direct close, no
     // confirmation dialog (the user has already made a deliberate choice).
-    doFinishedCloseSessionBtnEl.addEventListener("click", async () => {
+    // Identical to the old "Close the session" behavior.
+    doFinishedLaterBtnEl.addEventListener("click", async () => {
       const cardId = leftCardId;
       doFinishedModalEl.hidden = true;
       if (cardId === null) return;
@@ -4230,22 +4216,20 @@
       renderQueue();
     });
 
-    // Continue button -- dismiss the modal, then show the prompt box so the
-    // user can type a new prompt; form submission detects the do-details state
-    // and routes to the continue-do endpoint instead of creating a new session.
-    doFinishedContinueBtnEl.addEventListener("click", () => {
+    // Implement right away button -- dismiss the modal and immediately start
+    // an implement session for the PRD this /do session just created, via
+    // the same startImplementSession flow the "To be implemented" list's
+    // per-PRD button already triggers -- no extra click to find it there.
+    doFinishedImplementBtnEl.addEventListener("click", () => {
+      const prd = currentLeftSession?.details?.prd;
       doFinishedModalEl.hidden = true;
       resetPromptBox();
       startForm.style.display = "";
-      showOnly(sessionStatusEl);
-      // Keep session-status visible (shows the details list above the form)
-      // but also show the form itself -- form is inside main-flow, so switch
-      // to main-flow and show everything, then make the form visible.
       interviewEl.innerHTML = "";
       interviewEl.scrollTop = 0;
-      showOnly(mainFlowEl);
       setHeading("What are we doing?");
-      startForm.querySelector("textarea").focus();
+      showOnly(mainFlowEl);
+      if (prd) startImplementSession(prd, null);
     });
 
     function focusCard(cardId) {
@@ -4343,7 +4327,6 @@
         turnInFlight = true;
         currentLeftSession = { card_id: leftCardId, phase: "grilling", interview: { header: "", questions: [], footer: "" } };
         refreshModelEffortCard();
-        lastRenderedQuestionFileContent = null;
         startForm.style.display = "none";
         setHeading(headingForPhase("grilling"));
         renderInterview({ header: "", questions: [], footer: "" });
@@ -4367,7 +4350,6 @@
       turnInFlight = true;
       currentLeftSession = { card_id: data.card_id, phase: "grilling", interview: { header: "", questions: [], footer: "" } };
       refreshModelEffortCard();
-      lastRenderedQuestionFileContent = null;
       startForm.style.display = "none";
       setHeading(headingForPhase("grilling"));
       renderInterview({ header: "", questions: [], footer: "" });
@@ -4414,41 +4396,7 @@
     let usageIntervalId = null;
     let sessionQueueIntervalId = null;
     let ptyTabCountIntervalId = null;
-    let questionFileIntervalId = null;
     let parsedResultsIntervalId = null;
-    // Content of the last `.claude/rhubarb_question.md` round actually
-    // rendered from the poll below -- `null` whenever no file is currently
-    // showing (reset the moment a poll tick finds none, e.g. right after the
-    // user answers and the backend deletes it). Compared by content, not by
-    // round number, so a tick that finds the SAME still-pending round is a
-    // no-op instead of rebuilding the DOM under the user's in-progress
-    // selections every second.
-    let lastRenderedQuestionFileContent = null;
-
-    async function pollQuestionFileTick() {
-      // PRD #123 follow-up: polls the question file directly, independent
-      // of turn completion, so a round shows the moment the skill writes it
-      // rather than waiting for the turn to fully resolve. Only active
-      // while the focused left card is actually in the grilling phase -- a
-      // no-op otherwise. (Grilling has run exclusively on `StreamJsonEngine`
-      // since issue #184, which never writes this file -- see
-      // `session_runner._run_grilling_turn_stream_json`'s docstring -- so
-      // this poll is currently always a no-op; left as a harmless dead
-      // fallback rather than removed outright.)
-      if (!activeProject || leftCardId === null || !currentLeftSession || currentLeftSession.phase !== "grilling") {
-        return;
-      }
-      const res = await fetch(`/api/projects/${activeProject.id}/rhubarb-question-file-preview`);
-      const data = await res.json();
-      if (!data.found) {
-        lastRenderedQuestionFileContent = null;
-        return;
-      }
-      const content = JSON.stringify(data.interview);
-      if (content === lastRenderedQuestionFileContent) return;
-      lastRenderedQuestionFileContent = content;
-      renderInterview(data.interview);
-    }
 
     function pollsShouldRun() {
       return Boolean(activeProject) && document.visibilityState === "visible";
@@ -4462,8 +4410,6 @@
       sessionQueueIntervalId = setInterval(pollSessionQueueFreshness, 4000);
       refreshPtyTabCount();
       ptyTabCountIntervalId = setInterval(refreshPtyTabCount, 3000);
-      pollQuestionFileTick();
-      questionFileIntervalId = setInterval(pollQuestionFileTick, 1000);
       // Issue #193: poll for new parser-session results (issue #192) and
       // route each one to the focused card or a toast -- see
       // `pollParsedResultsTick`/`routeParsedResult` further down this
@@ -4485,10 +4431,6 @@
       if (ptyTabCountIntervalId) {
         clearInterval(ptyTabCountIntervalId);
         ptyTabCountIntervalId = null;
-      }
-      if (questionFileIntervalId) {
-        clearInterval(questionFileIntervalId);
-        questionFileIntervalId = null;
       }
       if (parsedResultsIntervalId) {
         clearInterval(parsedResultsIntervalId);
@@ -4680,8 +4622,8 @@
     // docstring on "Output schema") and shows it on the currently-focused
     // left card, through `renderInterview` itself -- the same function
     // every other parsed-question surface (grilling, implementing-needs-
-    // input, the rhubarb_question.md preview) already renders through, so
-    // this is not a second, parallel rendering mechanism.
+    // input) already renders through, so this is not a second, parallel
+    // rendering mechanism.
     function showParsedResultOnFocusedCard(result) {
       const interview = { header: result.header, questions: result.questions, footer: result.footer };
       // Grilling's own reply path (`sendReply`, `/api/session/continue`) is

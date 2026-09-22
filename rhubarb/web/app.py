@@ -15,7 +15,6 @@ from rhubarb.cli_client import ClaudeCLIError, get_auth_status, set_headroom_pro
 from rhubarb.folder_picker import pick_folder
 from rhubarb.prd_list import compute_prd_list
 from rhubarb.projects import scan_projects
-from rhubarb.question_files import read_question_file
 from rhubarb.terminal import open_terminal_running
 
 BASE_DIR = Path(__file__).parent
@@ -826,49 +825,6 @@ def _session_to_dict(row) -> dict:
 def list_sessions(project_id: int):
     conn = db.get_connection()
     return {"sessions": [_session_to_dict(r) for r in db.list_sessions_for_project(conn, project_id)]}
-
-
-@app.get("/api/projects/{project_id}/rhubarb-question-file-preview")
-async def preview_rhubarb_question_file(project_id: int):
-    """Debug tool (PRD #123 follow-up): read this project's pending
-    `.claude/rhubarb_question.md` right now and extract its structured
-    interview via this project's own live parser session -- the exact same
-    parser-session pipeline (`parser_session._build_extraction_prompt`/
-    `stream_turn`/`_extract_json_object`) a real grilling turn now uses
-    (`session_runner._extract_grilling_questions_via_parser_session`).
-
-    Issue #230 fully retired `qa_parser.parse_grilling_response`'s regex
-    parser this endpoint used to call directly -- that module no longer
-    exists, so this now genuinely previews "exactly the way a real grilling
-    turn would" instead of a separate, dead extraction path. Returns
-    `{"found": False}` if no file is pending, or if this project has no live
-    parser session to extract with right now (mirrors a real turn's own
-    "nothing extractable" shape otherwise: `{"header": <raw file text>,
-    "questions": [], "footer": ""}`)."""
-    conn = db.get_connection()
-    project = db.get_project(conn, project_id)
-    if project is None:
-        return {"found": False}
-
-    file_text = read_question_file(project["path"], "rhubarb_question.md")
-    if file_text is None:
-        return {"found": False}
-
-    engine = parser_session.get_parser_session(project_id)
-    if engine is None:
-        return {"found": False}
-
-    prompt = parser_session._build_extraction_prompt(phase="grilling", text=file_text)
-    result_text = None
-    async for event in parser_session.stream_turn(project_id, prompt):
-        if event.get("type") == "result":
-            result_text = event.get("result")
-
-    data = parser_session._extract_json_object(result_text) if result_text is not None else None
-    if data is None:
-        data = {"header": file_text, "questions": [], "footer": ""}
-
-    return {"found": True, "interview": data}
 
 
 @app.get("/api/projects/{project_id}/afk-notifications")

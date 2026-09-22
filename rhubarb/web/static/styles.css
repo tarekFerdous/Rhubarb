@@ -297,11 +297,6 @@ textarea.prompt-box:focus {
   border-color: var(--glass-border);
 }
 
-#preview-question-file-btn {
-  right: 68px;
-  font-size: 0.95rem;
-}
-
 .active-project-line {
   display: flex;
   align-items: center;
@@ -1261,10 +1256,9 @@ textarea.prompt-box:focus {
   padding: 8px 14px;
 }
 
-/* Manual test hook button (issue #188 debug) -- third button in the same
-   top-right row as #settings-gear (right: 24px) and
-   #preview-question-file-btn (right: 68px). */
+/* Manual test hook button (issue #188 debug) -- second button in the same
+   top-right row as #settings-gear (right: 24px). */
 #toast-debug-btn {
-  right: 112px;
+  right: 68px;
   font-size: 0.95rem;
 }

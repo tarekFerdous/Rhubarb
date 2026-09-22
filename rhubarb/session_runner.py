@@ -669,13 +669,26 @@ async def _run_grilling_turn_stream_json(
     holding state for it to gate into).
 
     Issue #223 (child of PRD #222): once the frontier comes back empty (no
-    parsed questions, and the turn wasn't already routed to `_finish_chain`
-    by the issue #219 fast path above), this now calls `advance_past_grilling`
-    itself before returning -- no "Yes, proceed" confirmation click required
-    anymore. The empty-questions `turn` event is still published first (when
+    parsed questions), this now calls `advance_past_grilling` itself before
+    returning -- no "Yes, proceed" confirmation click required anymore. The
+    empty-questions `turn` event is still published first (when
     `publish_when_empty`), so the frontend briefly sees the wrap-up header
     exactly as before; it's the very next thing on this same stream that now
     differs (a `creating_prd` phase event instead of silence).
+
+    Issue #239 (child of PRD #237): the earlier issue #219 fast path here --
+    a loose regex check for a PRD/Issue number mentioned anywhere in the
+    turn's text, routing straight to `_finish_chain` without ever parsing
+    for questions -- is removed. It had turned "the grilling model
+    self-answered its own questions and free-ran the whole /do chain in one
+    turn" into a silently-accepted, first-class outcome instead of a bug.
+    Now every turn's text is parsed for questions exactly the same way
+    regardless of whether it happens to mention a PRD/issue number; the
+    grilling skill itself is tightened (see its SKILL.md) to never
+    self-answer and to always end its turn and wait for a real reply, so a
+    turn that still tries to free-run the chain surfaces as a visibly wrong
+    state (an unparsed/odd interview shown to the user) instead of being
+    absorbed here.
 
     Issue #225 (child of PRD #222): a `StreamJsonEngineUnrecoverableError`
     (this engine's own crash-retry-once already gave up) now routes into
@@ -723,34 +736,6 @@ async def _run_grilling_turn_stream_json(
     # before a trailing tool call/closing remark is never silently dropped.
     full_text = turn["full_text"]
     console_text = row["console_text"] + "\n\n" + full_text if row["console_text"] else full_text
-
-    # Issue #219: when the grilling skill auto-advances through the full /do
-    # chain (PRD + issues) in one turn, no questions come back but the result
-    # mentions a PRD/issue number. Use a loose presence check (not the strict
-    # title-extracting _DETAIL_RE, which requires ": " or "- " after the number
-    # and fails against natural-language summaries like "Created PRD #N and its
-    # issue #M") to detect this. This chain-completion guard runs BEFORE the
-    # issue #221 parser-session dispatch below -- a turn that already
-    # completed the chain never needs question extraction. (Issue #230: this
-    # used to also require the now-removed regex parser to have found zero
-    # questions, but that regex never matched the grilling skill's real
-    # output, so the extra condition was always true in practice and is
-    # dropped along with the dead parse call.)
-    if re.search(r"\b(?:PRD|Issue)\s*#\d+", console_text, re.IGNORECASE):
-        db.update_session(
-            conn,
-            card_id,
-            model=model,
-            effort=effort,
-            claude_session_id=turn["session_id"],
-            console_text=console_text,
-            interview_json=json.dumps({"header": full_text, "questions": [], "footer": "", "source": None}),
-            context_pct=turn.get("context_pct"),
-        )
-        # _finish_chain re-reads console_text from DB (already persisted
-        # above) and uses summary= for the modal display text.
-        await _finish_chain(card_id, conn, turn["session_id"], cwd, summary=turn["result"])
-        return None
 
     # Issue #221 (child of PRD #187/#220), simplified by issue #230: go
     # straight to this project's live parser session -- the SAME

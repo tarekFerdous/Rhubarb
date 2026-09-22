@@ -802,11 +802,13 @@ def test_continue_session_job_with_no_more_questions_auto_advances(client, tmp_p
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
-    # Issue #221: the second turn's reply has no regex-recognizable
-    # questions, so it falls through to the parser-session extraction pass
-    # -- scripted here to also find none, matching this test's original
-    # "genuine wrap-up" expectation.
-    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="Thanks, that's everything I need.")
+    # Issue #239: a fixed-payload parser-session mock would return the SAME
+    # (empty) question list for every extraction call, including the FIRST
+    # grilling turn -- masking this test's actual scenario (first turn has
+    # a genuine open question; only the reply comes back empty). Use the
+    # content-aware autoextract fake instead so each turn's own text drives
+    # its own extraction result, same as a real parser-session pass would.
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
@@ -1023,31 +1025,50 @@ def test_stream_json_grilling_turn_retries_mismatched_extraction_and_flags_incom
     assert turn_events[0]["interview"]["questions"][0]["extraction_incomplete"] is True
 
 
-def test_stream_json_grilling_turn_with_prd_in_output_auto_transitions_to_details(
+def test_stream_json_grilling_turn_mentioning_prd_number_is_parsed_like_any_other_turn(
     client, tmp_path, monkeypatch
 ):
-    """Issue #219: when the grilling skill completes the full /do chain in one
-    stream-json turn (no Question N: lines, but PRD and issue markers in the
-    result), the session must transition to phase=details and publish a
-    `turn` event with that phase -- without going through advance_past_grilling
-    or the confirm_advance signal."""
+    """Issue #239 (child of PRD #237): the old issue #219 fast path used to
+    treat a turn whose text merely *mentioned* a PRD/issue number (no
+    structured `❓ **Qn**` questions) as "the chain already completed in one
+    turn" and route straight to `_finish_chain`, skipping question
+    extraction entirely -- turning the grilling model self-answering and
+    free-running the whole /do chain into a silently-accepted outcome. That
+    shortcut is removed: such a turn is now parsed for questions exactly
+    like any other turn (via the parser-session extraction pass), finds
+    none, and proceeds through the normal empty-frontier chain
+    (`advance_past_grilling` -> to-prd -> to-issues -> publish-to-github),
+    landing on phase=details only once that real chain actually completes --
+    not via the removed shortcut."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
+    seen_prompts = []
+
     def handler(prompt, **kw):
         if prompt == "/rhubarb:grilling a feature":
-            # Natural-language format the real /do skill emits -- no ": " separator
-            # after the number, so _DETAIL_RE won't match but the loose re.search
-            # for PRD/Issue #N still triggers _finish_chain.
-            return iter(
-                [_result_event("Done. Created PRD #10 and its 2 issues: Issue #11 and Issue #12.")]
-            )
-        raise AssertionError(f"unexpected prompt {prompt!r} -- chain must not re-run")
+            # Natural-language format the real /do skill might emit if it
+            # (wrongly) mentions a PRD number without asking anything --
+            # must not be mistaken for a completed chain any more.
+            return iter([_result_event("Thinking out loud about PRD #10 for a moment.")])
+        seen_prompts.append(prompt)
+        if prompt == "/rhubarb:to-prd":
+            return iter([_result_event("PRD Draft: My PRD")])
+        if prompt == "/rhubarb:to-issues":
+            return iter([_result_event("Issue Draft S1: Child one")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #5: My PRD\nIssue #6: Child one")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="Thinking out loud about PRD #10 for a moment.")
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    # The grilling turn's text was parsed for questions (found none) and the
+    # chain ran for real -- not skipped via the removed shortcut.
+    assert seen_prompts == ["/rhubarb:to-prd", "/rhubarb:to-issues", "/rhubarb:publish-to-github"]
 
     row = db.get_session(conn, row_id)
     assert row["phase"] == "details"
@@ -1055,17 +1076,12 @@ def test_stream_json_grilling_turn_with_prd_in_output_auto_transitions_to_detail
     assert row["available_for_reuse"] == 0
 
     details = json.loads(row["details_json"])
-    # _DETAIL_RE needs ": " or "- " after the number, so structured prd/issues
-    # may not parse from natural-language output -- but summary carries the full text.
-    assert "PRD #10" in details["summary"]
+    assert details["prd"] == {"number": 5, "title": "My PRD"}
+    assert details["issues"] == [{"number": 6, "title": "Child one"}]
 
     events = live_stream._buffers.get(row_id, [])
-    turn_events = [e for e in events if e["type"] == "turn"]
-    assert any(e["phase"] == "details" for e in turn_events), "must publish a details turn"
-    assert not any(e["phase"] == "grilling" for e in turn_events), "must not publish a grilling turn"
-    # The do-finished modal condition: session_type=do and phase=details -- no
-    # confirm_advance or advance_past_grilling involved.
-    assert not any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
+    assert any(e == {"type": "phase", "phase": "creating_prd"} for e in events), "must run the real chain"
+    assert any(e.get("type") == "turn" and e.get("phase") == "details" for e in events)
 
 
 # ---------------------------------------------------------------------------
