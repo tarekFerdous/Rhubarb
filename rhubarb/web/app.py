@@ -969,6 +969,16 @@ async def reply_to_stalled_session(card_id: int, body: dict):
     transport (issue #225 removed `PtyEngine`, the only transport that ever
     supported that).
 
+    Issue #242 (child of PRD #241): `phase == "grilling"` (the state a
+    negative grilling-completion verdict leaves a session suspended in, see
+    `session_runner._grilling_completion_verdict`) resumes through
+    `continue_session_job` -- grilling's own existing reply path, NOT the
+    chain-phase resume above -- running another grilling turn with the
+    reply as its prompt. That resumed turn goes through the exact same
+    extraction + completion-verdict check as any fresh turn, so it can
+    stall again, advance, or surface new questions, exactly like a fresh
+    turn would.
+
     A no-op (`{"replied": False}`, not an error) for any other phase --
     nothing paused there to resume."""
     text = body["text"]
@@ -982,6 +992,10 @@ async def reply_to_stalled_session(card_id: int, body: dict):
 
     if row is not None and row["phase"] in ("creating_prd", "creating_issues", "publishing"):
         asyncio.create_task(session_runner.continue_stalled_chain_step_job(card_id, text, cwd=cwd))
+        return {"replied": True}
+
+    if row is not None and row["phase"] == "grilling":
+        asyncio.create_task(session_runner.continue_session_job(card_id, text, cwd=cwd))
         return {"replied": True}
 
     return {"replied": False}

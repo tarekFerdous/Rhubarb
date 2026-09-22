@@ -852,7 +852,20 @@ async def extract_with_validation(
             project_id, {"phase": phase, "text": text}, data, mismatches, validator=validator
         )
 
-    return {"header": data["header"], "questions": data["questions"], "footer": data["footer"], "source": "parser_session"}
+    result = {
+        "header": data["header"],
+        "questions": data["questions"],
+        "footer": data["footer"],
+        "source": "parser_session",
+    }
+    # Issue #242 (child of PRD #241): the grilling-only completion verdict
+    # the skill attaches when it finds zero open questions -- passed through
+    # verbatim (never validated/interpreted here) so `session_runner._run_
+    # grilling_turn_stream_json` can read it; every other phase's response
+    # simply never carries this key, per the skill's own instructions.
+    if "completion" in data:
+        result["completion"] = data["completion"]
+    return result
 
 
 def _tagged_success(item: dict, data: dict) -> dict:

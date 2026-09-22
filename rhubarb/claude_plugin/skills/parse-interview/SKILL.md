@@ -35,6 +35,21 @@ Use `"single"` for a pick-one choice, `"multi"` for a pick-several choice, and `
 
 If the text genuinely contains no question at all (this should be rare, since it was already flagged as needing input), return `"questions": []` with the whole text as `"header"` and `""` as `"footer"`.
 
+## Grilling completion verdict (`phase: grilling` only)
+
+This section applies ONLY when `phase: grilling` AND your extraction above came back with `"questions": []` (the turn looks like a wrap-up, with nothing left to ask). In that case, add one more top-level field to your JSON object, alongside `header`/`questions`/`footer`:
+
+```
+"completion": {"done": <true or false>, "reason": <short string>}
+```
+
+A turn with zero questions is not automatically "done" — read the FULL grilling transcript text you were given (not just this turn's own closing remark) and judge for yourself: has this interview actually reached a stable, complete shared understanding that a PRD could be drafted from right now? Every open branch resolved, nothing the transcript itself still flags as unresolved?
+
+- `"done": true` — the understanding is genuinely stable and complete. This should be the common case whenever a wrap-up turn truly has nothing left to ask.
+- `"done": false` — something is still unresolved even though this turn's own text didn't pose an explicit follow-up question (e.g. the model glossed over an earlier open branch, or its closing remark doesn't actually match what the rest of the transcript still leaves undecided). Set `"reason"` to a short, specific, human-readable explanation of what's still missing — this is shown directly to the person waiting on this session.
+
+For every phase OTHER than `grilling`, and for `grilling` whenever `"questions"` is non-empty, omit `"completion"` entirely — do not include it at all.
+
 ## CRITICAL SPLITTING RULE
 
 If the text contains multiple distinct questions, each question MUST be a separate object in the `"questions"` array — never combine two or more questions into a single entry. A question is distinct if it asks about a different topic, offers a different set of options, or calls for a separate recommendation. Use these signals to find question boundaries:

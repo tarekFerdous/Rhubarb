@@ -628,6 +628,31 @@ async def _extract_grilling_questions_via_parser_session(project_id: int, text: 
     return await _extract_questions_via_parser_session(project_id, text, phase="grilling")
 
 
+def _grilling_completion_verdict(parsed: dict) -> tuple[bool, str]:
+    """Read the grilling-only completion verdict `_extract_grilling_
+    questions_via_parser_session` may attach to a zero-question extraction
+    (`parsed["completion"] = {"done": bool, "reason": str}`, per the
+    `/rhubarb:parse-interview` skill's own grilling-specific instructions).
+
+    Issue #242 (child of PRD #241): fails safe on anything less than a
+    genuinely well-formed positive verdict -- a missing `"completion"` key
+    (no live parser session, or a phase/shape that never carries one), a
+    non-dict value, a non-bool `"done"`, or a missing/blank `"reason"` all
+    return `(False, ...)` with a generic explanation, never `(True, ...)`.
+    A model that omits or corrupts this field is itself a reason not to
+    trust "no more questions" as genuine completion -- this is never called
+    when `parsed["questions"]` is non-empty, only on the empty-frontier path
+    right before it would otherwise auto-advance into PRD drafting."""
+    completion = parsed.get("completion")
+    if not isinstance(completion, dict):
+        return False, "The grilling completion check didn't return a verdict for this turn."
+    done = completion.get("done")
+    reason = completion.get("reason")
+    if not isinstance(done, bool) or not isinstance(reason, str) or not reason.strip():
+        return False, "The grilling completion check's response was malformed."
+    return done, reason
+
+
 async def _run_grilling_turn_stream_json(
     card_id: int,
     conn,
@@ -675,6 +700,16 @@ async def _run_grilling_turn_stream_json(
     `publish_when_empty`), so the frontend briefly sees the wrap-up header
     exactly as before; it's the very next thing on this same stream that now
     differs (a `creating_prd` phase event instead of silence).
+
+    Issue #242 (child of PRD #241): an empty frontier alone no longer
+    triggers `advance_past_grilling` -- see `_grilling_completion_verdict`
+    and the check right before that call below. Only a positive completion
+    verdict (folded into this same parser-session extraction pass) still
+    advances silently, exactly as issue #223 above describes. A negative or
+    missing/malformed verdict persists/publishes a stalled turn instead
+    (the same generic stall mechanism `_run_chain_step` uses later in the
+    chain), holding the session open for a human reply rather than treating
+    a generically-worded wrap-up as permission to start drafting a PRD.
 
     Issue #239 (child of PRD #237): the earlier issue #219 fast path here --
     a loose regex check for a PRD/Issue number mentioned anywhere in the
@@ -766,6 +801,31 @@ async def _run_grilling_turn_stream_json(
 
     if parsed["questions"]:
         return parsed
+
+    # Issue #242 (child of PRD #241): an empty frontier is no longer taken
+    # at face value -- the parser session's own completion verdict (folded
+    # into this same extraction call above, see `_grilling_completion_
+    # verdict`'s docstring) must also say "done" before advancing. A
+    # positive verdict preserves today's behavior exactly (silent,
+    # immediate advance). A negative or missing/malformed verdict (fails
+    # safe -- never silently treated as complete) instead persists/publishes
+    # a stalled turn, reusing the exact same generic stall mechanism
+    # `_run_chain_step` already uses for creating_prd/creating_issues/
+    # publishing -- a deliberate, narrow exception to grilling's usual "no
+    # needs-input holding state" design, added only for this one signal.
+    # `POST /api/sessions/{card_id}/stall-reply` resumes a grilling stall by
+    # dispatching to `continue_session_job`, running another grilling turn
+    # (the human's reply as its prompt) through this exact same extraction
+    # + completion-verdict check.
+    done, reason = _grilling_completion_verdict(parsed)
+    if not done:
+        db.update_session(
+            conn,
+            card_id,
+            stalled_json=json.dumps({"phase": "grilling", "context": reason}),
+        )
+        publish(card_id, _turn_event(phase="grilling", stalled=True, stalled_context=reason))
+        return None
 
     await advance_past_grilling(card_id, cwd)
     return None
@@ -1190,8 +1250,10 @@ async def _finish_chain(card_id: int, conn, claude_session_id: str, cwd: str | N
     grilling round on the same card.
 
     `summary` is Claude's own closing paragraph from the final chain step
-    (the `creating_issues` turn result). Stored in `details` so the
-    do-finished modal can display it verbatim without an extra fetch."""
+    (the `creating_issues` turn result), stored in `details` for whatever
+    future reader wants Claude's own prose. Issue #243 (child of PRD #241):
+    the do-finished modal itself no longer displays this field verbatim --
+    it renders a plain itemized `prd`/`issues` list instead."""
     row = db.get_session(conn, card_id)
     details = parse_details(row["console_text"])
     if summary:

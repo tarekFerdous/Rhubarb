@@ -222,7 +222,9 @@ def _mock_engine(monkeypatch, handler, *, fresh_ids=None, reply_handler=None):
     return fake_class
 
 
-def _mock_parser_session_extraction(monkeypatch, project_id, cwd, *, header="", questions=None, footer=""):
+def _mock_parser_session_extraction(
+    monkeypatch, project_id, cwd, *, header="", questions=None, footer="", completion="__default__"
+):
     """Issue #221, simplified by issue #230: register a live, fake parser
     session for `project_id` whose every turn replies with the given
     `{header, questions, footer}` payload as JSON -- for tests exercising
@@ -234,8 +236,24 @@ def _mock_parser_session_extraction(monkeypatch, project_id, cwd, *, header="", 
     `ensure_parser_session` call so the session is registered and ready
     *before* the test drives any grilling turn -- `open_project`'s own
     pre-warm of this is fire-and-forget and racy, so tests that need this
-    path deterministic can't rely on it."""
-    payload = json.dumps({"header": header, "questions": questions or [], "footer": footer})
+    path deterministic can't rely on it.
+
+    Issue #242 (child of PRD #241): when `questions` comes back empty,
+    the payload also carries a `"completion"` verdict, since grilling's own
+    empty-frontier auto-advance now requires one -- defaulting to a
+    positive verdict (`completion="__default__"`, this function's own
+    sentinel default) keeps every existing caller of this helper (none of
+    which are testing the completion gate itself) behaving exactly as
+    before. A caller exercising the gate directly passes its own
+    `completion=` (a dict, or `None` to omit the field entirely and exercise
+    the missing-verdict fail-safe path)."""
+    payload_dict = {"header": header, "questions": questions or [], "footer": footer}
+    if not payload_dict["questions"]:
+        if completion == "__default__":
+            payload_dict["completion"] = {"done": True, "reason": "Fake extraction: nothing left to ask."}
+        elif completion is not None:
+            payload_dict["completion"] = completion
+    payload = json.dumps(payload_dict)
 
     class FakeParserEngine:
         def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
@@ -303,7 +321,14 @@ def _fake_autoextract_grilling_shape(prompt: str) -> dict:
     check the extracted `options`/`recommended` survive the round trip. A
     prompt with no quoted `Question N:` text (a genuine wrap-up turn) yields
     zero questions, exactly like a real extraction of prose with nothing
-    left to ask would."""
+    left to ask would.
+
+    Issue #242 (child of PRD #241): a `phase: grilling` prompt (see
+    `_build_extraction_prompt`) whose frontier comes back empty also gets a
+    fake positive completion verdict, mirroring the real `/rhubarb:parse-
+    interview` skill's own grilling-specific instructions -- these fixtures
+    are always genuine wrap-ups, never the "still not actually done" case a
+    dedicated negative-verdict test exercises directly instead."""
     matches = list(_QUESTION_QUOTE_RE.finditer(prompt))
     questions = []
     for i, match in enumerate(matches):
@@ -322,7 +347,10 @@ def _fake_autoextract_grilling_shape(prompt: str) -> dict:
                 "recommended_text": None,
             }
         )
-    return {"header": "", "questions": questions, "footer": ""}
+    data = {"header": "", "questions": questions, "footer": ""}
+    if not questions and "phase: grilling" in prompt:
+        data["completion"] = {"done": True, "reason": "Fake autoextract: nothing left to ask."}
+    return data
 
 
 def _fake_autoextract_qa_shape(prompt: str) -> dict:
@@ -1164,6 +1192,184 @@ def test_start_session_job_with_empty_frontier_auto_advances_through_chain(clien
     assert details["issues"] == [{"number": 6, "title": "Child one"}]
     assert row["available_for_reuse"] == 0
 
+
+# ---------------------------------------------------------------------------
+# Issue #242 (child of PRD #241): an empty frontier alone no longer
+# auto-advances grilling into PRD drafting -- the parser session's own
+# completion verdict (folded into the same extraction call) must also say
+# "done". A negative or missing/malformed verdict stalls instead, reusing
+# the generic stall mechanism `_run_chain_step` already uses later in the
+# chain.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "parsed, expected_reason_substring",
+    [
+        ({"questions": []}, "didn't return a verdict"),
+        ({"questions": [], "completion": "not a dict"}, "didn't return a verdict"),
+        ({"questions": [], "completion": {"reason": "Missing done."}}, "malformed"),
+        ({"questions": [], "completion": {"done": "yes", "reason": "Not a bool."}}, "malformed"),
+        ({"questions": [], "completion": {"done": True}}, "malformed"),
+        ({"questions": [], "completion": {"done": True, "reason": "   "}}, "malformed"),
+    ],
+)
+def test_grilling_completion_verdict_fails_safe_on_malformed_or_missing_input(parsed, expected_reason_substring):
+    """Issue #242 acceptance criterion: a malformed or missing completion-
+    verdict field is treated as "not done" -- never silently treated as
+    complete, regardless of which part of the expected shape is wrong."""
+    done, reason = session_runner._grilling_completion_verdict(parsed)
+    assert done is False
+    assert expected_reason_substring in reason
+
+
+def test_grilling_completion_verdict_true_only_for_a_wellformed_positive_verdict():
+    done, reason = session_runner._grilling_completion_verdict(
+        {"questions": [], "completion": {"done": True, "reason": "Every open branch was resolved."}}
+    )
+    assert done is True
+    assert reason == "Every open branch was resolved."
+
+    done, reason = session_runner._grilling_completion_verdict(
+        {"questions": [], "completion": {"done": False, "reason": "Retry backoff is still undecided."}}
+    )
+    assert done is False
+    assert reason == "Retry backoff is still undecided."
+
+
+def test_start_session_job_negative_completion_verdict_stalls_instead_of_advancing(client, tmp_path, monkeypatch):
+    """A turn whose frontier comes back empty but whose completion verdict
+    says `"done": false` must NOT advance into `/rhubarb:to-prd` -- it
+    stalls in `grilling` instead, using the same generic stall mechanism
+    (`stalled_json`, `stalled`/`stalled_context` on the `turn` event) the
+    chain phases already use, exactly the acceptance criteria this
+    completion gate exists for."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def handler(prompt, **kw):
+        if prompt == "/rhubarb:grilling a feature":
+            return iter([_result_event("Sounds like we've covered the basics.")])
+        raise AssertionError(f"the chain must not run while grilling is still unresolved, got {prompt!r}")
+
+    _mock_engine(monkeypatch, handler)
+    _mock_parser_session_extraction(
+        monkeypatch,
+        project_id,
+        cwd,
+        header="Sounds like we've covered the basics.",
+        completion={"done": False, "reason": "The retry-backoff strategy is still undecided."},
+    )
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "grilling"
+    assert row["stalled_json"] is not None
+    assert json.loads(row["stalled_json"]) == {
+        "phase": "grilling",
+        "context": "The retry-backoff strategy is still undecided.",
+    }
+
+    events = live_stream._buffers.get(row_id, [])
+    stalled_events = [e for e in events if e.get("type") == "turn" and e.get("stalled")]
+    assert len(stalled_events) == 1
+    assert stalled_events[0]["phase"] == "grilling"
+    assert stalled_events[0]["stalled_context"] == "The retry-backoff strategy is still undecided."
+    assert not any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
+
+
+def test_grilling_stall_reply_resumes_grilling_and_can_then_advance(client, tmp_path, monkeypatch):
+    """A reply to a grilling-phase stall resumes grilling itself via
+    `continue_session_job` (see `test_stall_reply_endpoint_resumes_a_
+    grilling_session_via_a_new_turn` in tests/test_app.py for the HTTP
+    endpoint's own dispatch to that function) -- not the chain-phase resume
+    path used by creating_prd/creating_issues/publishing. The resumed turn
+    goes through the exact same extraction + completion-verdict check as
+    any fresh turn, so once it comes back with a positive verdict, the
+    chain advances exactly like a fresh run would."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    def handler(prompt, **kw):
+        if prompt == "/rhubarb:grilling a feature":
+            return iter([_result_event("Sounds like we've covered the basics.")])
+        if prompt == "Actually, it only needs to cover web for now.":
+            return iter([_result_event("Got it, that resolves the last open branch.")])
+        if prompt == "/rhubarb:to-prd":
+            return iter([_result_event("PRD Draft: My PRD")])
+        if prompt == "/rhubarb:to-issues":
+            return iter([_result_event("Issue Draft S1: Child one")])
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #5: My PRD\nIssue #6: Child one")])
+        raise AssertionError(f"unexpected prompt {prompt!r}")
+
+    _mock_engine(monkeypatch, handler)
+
+    class FakeParserEngine:
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+            self.session_id = resume_session_id or "parser-session-fake"
+            self._alive = False
+
+        def start(self):
+            self._alive = True
+            return self
+
+        def close(self):
+            self._alive = False
+
+        def isalive(self):
+            return self._alive
+
+        async def stream_turn(self, prompt):
+            if "Got it, that resolves the last open branch." in prompt:
+                data = {
+                    "header": "",
+                    "questions": [],
+                    "footer": "",
+                    "completion": {"done": True, "reason": "The last open branch was resolved."},
+                }
+            else:
+                data = {
+                    "header": "",
+                    "questions": [],
+                    "footer": "",
+                    "completion": {"done": False, "reason": "Scope isn't settled yet."},
+                }
+            yield {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": json.dumps(data),
+                "session_id": self.session_id,
+            }
+
+    monkeypatch.setattr(parser_session, "StreamJsonEngine", FakeParserEngine)
+    parser_session._parser_sessions.pop(project_id, None)
+    asyncio.run(parser_session.ensure_parser_session(project_id, cwd=cwd))
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "grilling"
+    assert row["stalled_json"] is not None
+
+    # Resumes via `continue_session_job` -- the same function the
+    # stall-reply endpoint's grilling branch dispatches to.
+    asyncio.run(
+        session_runner.continue_session_job(row_id, "Actually, it only needs to cover web for now.", cwd=cwd)
+    )
+
+    row = db.get_session(conn, row_id)
+    assert row["phase"] == "details"
+    assert row["stalled_json"] is None
+    details = json.loads(row["details_json"])
+    assert details["prd"] == {"number": 5, "title": "My PRD"}
+
     events = live_stream._buffers.get(row_id, [])
     assert not any(e.get("type") == "done" for e in events)
     assert any(e == {"type": "phase", "phase": "creating_prd"} for e in events)
@@ -1475,13 +1681,16 @@ def test_chain_publishes_directly_and_details_reflect_issue_numbers(client, tmp_
         return iter([_result_event("Implemented.")])
 
     _mock_engine(monkeypatch, handler)
+    # Issue #223: the first turn's frontier already comes back empty (the
+    # emoji-format text isn't regex-parseable). Issue #242: the empty
+    # frontier alone isn't enough anymore -- a positive completion verdict
+    # is also required before the chain auto-advances, so this test's fake
+    # extraction supplies one (this test is about publish-to-github issue
+    # number parsing, not the completion gate itself).
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="❓ **Q1** - **Scope**: Only question?")
 
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
-    # Issue #223: the first turn's frontier already comes back empty (the
-    # emoji-format text isn't regex-parseable, and the default no-op parser
-    # session finds nothing either) -- the chain auto-advances straight
-    # through to details from this single call, no confirmation needed.
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
 
     row = db.get_session(conn, row_id)
@@ -1558,6 +1767,10 @@ def test_publishing_gh_auth_failure_sets_needs_github_login(client, tmp_path, mo
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
+    # Issue #242: a positive completion verdict is required for the empty
+    # frontier to auto-advance -- this test is about publishing's own
+    # gh-auth-failure handling, not the completion gate.
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="❓ **Q1** - **Scope**: Only question?")
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     # Issue #223: the first turn's empty frontier auto-advances straight
@@ -1601,6 +1814,10 @@ def test_retry_after_login_completes_the_failed_phase(client, tmp_path, monkeypa
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
+    # Issue #242: a positive completion verdict is required for the empty
+    # frontier to auto-advance -- this test is about publishing retry
+    # mechanics, not the completion gate.
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="❓ **Q1** - **Scope**: Only question?")
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
@@ -1737,6 +1954,10 @@ def test_retry_on_creating_prd_phase_is_unaffected_by_implement_branch(client, t
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
+    # Issue #242: a positive completion verdict is required for the empty
+    # frontier to auto-advance -- this test is about the creating_prd retry
+    # path, not the completion gate.
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="❓ **Q1** - **Scope**: Only question?")
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
@@ -4173,6 +4394,10 @@ def test_finish_chain_pauses_at_details_instead_of_starting_implementing(client,
         raise AssertionError(f"unexpected prompt {prompt!r} -- must not auto-implement")
 
     _mock_engine(monkeypatch, handler)
+    # Issue #242: a positive completion verdict is required for the empty
+    # frontier to auto-advance -- this test is about the details pause
+    # point, not the completion gate.
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="❓ **Q1** - **Scope**: Only question?")
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
@@ -4210,6 +4435,10 @@ def test_finish_chain_pauses_at_details_even_when_no_prd_was_parsed(client, tmp_
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
+    # Issue #242: a positive completion verdict is required for the empty
+    # frontier to auto-advance -- this test is about the details pause
+    # point, not the completion gate.
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="❓ **Q1** - **Scope**: Only question?")
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
     asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
@@ -4634,6 +4863,11 @@ def test_creating_prd_turn_is_classified_before_creating_issues_starts(client, t
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
+    # Issue #242: a positive completion verdict is required for the empty
+    # frontier to auto-advance -- this test is about the creating_prd/
+    # creating_issues classify-before-continuing ordering, not the
+    # completion gate.
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="❓ **Q1** - **Scope**: Only question?")
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
 
@@ -4709,6 +4943,10 @@ def test_creating_prd_positive_classification_shows_generic_stall_panel_not_rich
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
+    # Issue #242: a positive completion verdict is required for the empty
+    # frontier to auto-advance -- this test is about creating_prd's own
+    # generic stall panel, not the completion gate.
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="❓ **Q1** - **Scope**: Only question?")
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
 
@@ -4778,6 +5016,10 @@ def test_creating_prd_negative_classification_does_not_pause_the_chain(client, t
         raise AssertionError(f"unexpected prompt {prompt!r}")
 
     _mock_engine(monkeypatch, handler)
+    # Issue #242: a positive completion verdict is required for the empty
+    # frontier to auto-advance -- this test is about creating_prd's negative
+    # classification path, not the completion gate.
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="❓ **Q1** - **Scope**: Only question?")
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
 
@@ -5369,9 +5611,15 @@ def test_grilling_turn_under_new_engine_skips_ollama_rescue_entirely(client, tmp
     extraction now goes straight to the parser session, with no Ollama
     rescue fallback at this call site at all). This test now just confirms
     a malformed-for-extraction turn under the new engine still resolves
-    cleanly (empty questions, chain auto-advances) with Ollama assistance
-    NOT declined -- proving there's nothing left that WOULD have called a
-    rescue function even if one still existed."""
+    cleanly (empty questions, no crash) with Ollama assistance NOT declined
+    -- proving there's nothing left that WOULD have called a rescue function
+    even if one still existed.
+
+    Issue #242 (child of PRD #241): a missing parser session means a
+    missing completion verdict too, which fails safe as "not done" -- this
+    turn's empty frontier no longer auto-advances the chain on its own; it
+    stalls in `grilling` instead, waiting on a human reply, exactly like any
+    other malformed/missing completion verdict would."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -5379,7 +5627,8 @@ def test_grilling_turn_under_new_engine_skips_ollama_rescue_entirely(client, tmp
     _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(malformed_text)]))
     # No parser session mocked -- `_extract_grilling_questions_via_parser_
     # session` fails closed (`LookupError`, no live session registered) and
-    # this turn's frontier comes back genuinely empty.
+    # this turn's frontier comes back genuinely empty, with no completion
+    # verdict at all.
 
     conn = db.get_connection()
     db.set_ollama_declined(conn, False)
@@ -5388,10 +5637,16 @@ def test_grilling_turn_under_new_engine_skips_ollama_rescue_entirely(client, tmp
 
     row = db.get_session(conn, row_id)
     interview = json.loads(row["interview_json"])
-    # No rescue was attempted, and no questions survived -- this turn's
-    # wrap-up auto-advanced the chain (issue #223), which "grilling" here
-    # completes with nothing left to build a PRD/issues from.
+    # No rescue was attempted, and no questions survived, but the missing
+    # completion verdict fails safe: the session stalls in grilling rather
+    # than auto-advancing into a PRD it never confirmed was ready.
     assert interview["questions"] == []
+    assert row["phase"] == "grilling"
+    assert row["stalled_json"] is not None
+    events = live_stream._buffers.get(row_id, [])
+    stalled_events = [e for e in events if e.get("type") == "turn" and e.get("stalled")]
+    assert len(stalled_events) == 1
+    assert stalled_events[0]["phase"] == "grilling"
 
 
 def test_grilling_multiline_composed_reply_under_new_engine_completes_as_a_single_turn(client, tmp_path, monkeypatch):
@@ -5733,6 +5988,10 @@ def test_creating_prd_needs_input_classification_enqueues_onto_project_queue(cli
         return [_result_event("Understood, using Postgres for scope.")]
 
     _mock_engine(monkeypatch, handler, reply_handler=reply_handler)
+    # Issue #242: a positive completion verdict is required for the empty
+    # frontier to auto-advance -- this test is about creating_prd's own
+    # needs-input enqueue behavior, not the completion gate.
+    _mock_parser_session_extraction(monkeypatch, project_id, cwd, header="❓ **Q1** - **Scope**: Only question?")
     conn = db.get_connection()
     row_id = db.create_session(conn, project_id)
 

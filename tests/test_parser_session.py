@@ -1849,6 +1849,37 @@ def test_extract_with_validation_clean_response_returns_data_with_no_retry(monke
     assert result["source"] == "parser_session"
     assert result["questions"][0]["options"] == ["Python", "Node"]
     assert "extraction_incomplete" not in result["questions"][0]
+    # A response with real open questions never carries a completion verdict
+    # -- the skill only attaches one for a grilling turn with zero questions
+    # (issue #242, child of PRD #241).
+    assert "completion" not in result
+
+
+def test_extract_with_validation_passes_through_a_grilling_completion_verdict(monkeypatch):
+    """Issue #242 (child of PRD #241): a `phase: grilling` response with
+    `"questions": []` may carry an additional top-level `"completion"`
+    field (`{"done": bool, "reason": str}`) -- `extract_with_validation`
+    must pass it through verbatim to its caller (`session_runner._run_
+    grilling_turn_stream_json`), not silently drop it the way the flat
+    `{header, questions, footer, source}` return used to before this
+    field existed."""
+    payload = {
+        "header": "Sounds like we've covered everything.",
+        "questions": [],
+        "footer": "",
+        "completion": {"done": True, "reason": "Every open branch was resolved."},
+    }
+    backend = FakeStreamJsonBackend([_extraction_result_line("session-abc", payload)], eof_after=False)
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(3015, cwd="/repo"))
+
+    result = run(
+        parser_session.extract_with_validation(3015, "Sounds like we've covered everything.", phase="grilling")
+    )
+
+    assert result["questions"] == []
+    assert result["completion"] == {"done": True, "reason": "Every open branch was resolved."}
 
 
 def test_extract_with_validation_retries_once_on_mismatch_and_returns_corrected_data(monkeypatch):

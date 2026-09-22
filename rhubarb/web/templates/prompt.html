@@ -578,23 +578,26 @@
     </div>
   </div>
 
-  <!-- Do-finished modal: shown when a /do session reaches the `details`
-       pause point (PRD + issues published). Displays the session summary
-       (PRD and issue numbers) and offers two actions:
-       - Implement right away → closes the modal and immediately starts an
-         implement session for the just-created PRD, via the same
-         `startImplementSession` flow the "To be implemented" list's
-         per-PRD button already triggers.
-       - Later → ends this session (identical to the old "Close the
-         session" behavior); the PRD already appears in the "To be
-         implemented" list via loadPrdList()'s existing refresh. -->
+  <!-- Do-finished modal (issue #243, child of PRD #241): shown when a /do
+       session reaches the `details` pause point -- the entire chain
+       (grilling -> PRD -> issues -> publish) has finished, not just one
+       phase of it. Body is a plain itemized list of exactly what got
+       published (PRD number/title, each issue's number/title), reusing
+       `renderDetailsList` -- the same rendering the left card's own details
+       view and the session queue badge already use for this identical
+       `session.details` data -- instead of a free-text closing paragraph.
+       The only action ends this session (identical to the old "Close the
+       session"/"Later" behavior); starting implementation happens from the
+       existing "To be implemented" list, which already refreshes
+       automatically once this pause point is reached (loadPrdList(), fired
+       from applyTurn on the `details` turn event) -- there is no second,
+       separate shortcut into that here. -->
   <div id="do-finished-modal" class="modal-overlay" hidden>
     <div class="modal">
-      <h2 class="modal-heading">Done!</h2>
-      <p id="do-finished-summary" class="modal-text md-prose"></p>
+      <h2 class="modal-heading">All done — PRD and issues published to GitHub</h2>
+      <div id="do-finished-details" class="modal-text"></div>
       <div class="ready-to-proceed-actions">
-        <button id="do-finished-implement-btn" class="glass-btn" type="button">Implement right away</button>
-        <button id="do-finished-later-btn" class="glass-btn" type="button">Later</button>
+        <button id="do-finished-close-btn" class="glass-btn" type="button">Close</button>
       </div>
     </div>
   </div>
@@ -654,9 +657,8 @@
     const implementingBannerTextEl = document.getElementById("implementing-banner-text");
     const implementingBannerProceedBtn = document.getElementById("implementing-banner-proceed-btn");
     const doFinishedModalEl = document.getElementById("do-finished-modal");
-    const doFinishedSummaryEl = document.getElementById("do-finished-summary");
-    const doFinishedImplementBtnEl = document.getElementById("do-finished-implement-btn");
-    const doFinishedLaterBtnEl = document.getElementById("do-finished-later-btn");
+    const doFinishedDetailsEl = document.getElementById("do-finished-details");
+    const doFinishedCloseBtnEl = document.getElementById("do-finished-close-btn");
     const activeProjectLineEl = document.getElementById("active-project-line");
     const activeProjectNameEl = document.getElementById("active-project-name");
     const settingsModalEl = document.getElementById("settings-modal");
@@ -3935,33 +3937,21 @@
 
       // Show the do-finished modal when a /do session is sitting at the
       // `details` pause point -- derived from session_type/phase so it
-      // re-appears correctly on reload/reconnect. The summary line is built
-      // from `session.details` (PRD + issues) so no separate storage field
-      // is needed.
+      // re-appears correctly on reload/reconnect. Issue #243 (child of
+      // PRD #241): the body is the same itemized `renderDetailsList`
+      // rendering the left card's own details view already uses for this
+      // identical `session.details` data, not a free-text summary.
       const showDoFinished = session && !session.error &&
         session.session_type === "do" && session.phase === "details";
       if (showDoFinished) {
-        // Prefer Claude's own closing paragraph (stored as details.summary by
-        // the backend once the blocker issue lands). Fall back to a computed
-        // string from the structured details for sessions created before that
-        // change, so existing paused sessions still render something useful.
-        let summary = session.details?.summary || "";
-        if (!summary) {
-          const prd = session.details?.prd;
-          const issues = session.details?.issues || [];
-          if (prd) {
-            summary = `PRD #${prd.number}: ${prd.title}`;
-            if (issues.length > 0) {
-              const nums = issues.map(i => `#${i.number}`).join(", ");
-              summary += ` and ${issues.length} issue${issues.length > 1 ? "s" : ""} (${nums}) are ready to implement.`;
-            } else {
-              summary += " is ready to implement.";
-            }
-          } else {
-            summary = "Publishing complete.";
-          }
+        doFinishedDetailsEl.innerHTML = "";
+        const list = renderDetailsList(session.details);
+        if (list.children.length === 0) {
+          const p = document.createElement("p");
+          p.textContent = "Publishing complete.";
+          list.appendChild(p);
         }
-        doFinishedSummaryEl.innerHTML = marked.parse(summary);
+        doFinishedDetailsEl.appendChild(list);
         doFinishedModalEl.hidden = false;
       } else {
         doFinishedModalEl.hidden = true;
@@ -4185,10 +4175,12 @@
     closeSessionCancelBtnEl.addEventListener("click", dismissCloseSessionModal);
     closeSessionConfirmBtnEl.addEventListener("click", confirmCloseSession);
 
-    // Later button on the do-finished modal -- direct close, no
-    // confirmation dialog (the user has already made a deliberate choice).
-    // Identical to the old "Close the session" behavior.
-    doFinishedLaterBtnEl.addEventListener("click", async () => {
+    // Close button on the do-finished modal (issue #243, child of PRD #241)
+    // -- the modal's one action, ending this session. Identical to the old
+    // "Later"/"Close the session" behavior; the removed "Implement right
+    // away" shortcut is superseded by the "To be implemented" list, which
+    // already refreshes automatically once this pause point is reached.
+    doFinishedCloseBtnEl.addEventListener("click", async () => {
       const cardId = leftCardId;
       doFinishedModalEl.hidden = true;
       if (cardId === null) return;
@@ -4214,22 +4206,6 @@
       setHeading("What are we doing?");
       showOnly(mainFlowEl);
       renderQueue();
-    });
-
-    // Implement right away button -- dismiss the modal and immediately start
-    // an implement session for the PRD this /do session just created, via
-    // the same startImplementSession flow the "To be implemented" list's
-    // per-PRD button already triggers -- no extra click to find it there.
-    doFinishedImplementBtnEl.addEventListener("click", () => {
-      const prd = currentLeftSession?.details?.prd;
-      doFinishedModalEl.hidden = true;
-      resetPromptBox();
-      startForm.style.display = "";
-      interviewEl.innerHTML = "";
-      interviewEl.scrollTop = 0;
-      setHeading("What are we doing?");
-      showOnly(mainFlowEl);
-      if (prd) startImplementSession(prd, null);
     });
 
     function focusCard(cardId) {

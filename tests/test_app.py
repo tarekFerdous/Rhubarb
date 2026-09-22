@@ -1021,9 +1021,10 @@ def test_sessions_list_excludes_a_closed_session(client, tmp_path):
 # every resume path to a genuinely new turn -- there is no raw keystroke
 # passthrough to write into under `StreamJsonEngine`'s headless
 # request/response transport, the only engine transport since `PtyEngine`
-# was removed): dispatches by the row's phase to either
-# `continue_implement_job` (implementing) or `continue_stalled_chain_step_job`
-# (creating_prd/creating_issues/publishing), each resuming as a fresh turn
+# was removed): dispatches by the row's phase to `continue_implement_job`
+# (implementing), `continue_stalled_chain_step_job` (creating_prd/
+# creating_issues/publishing), or (issue #242, child of PRD #241)
+# `continue_session_job` (grilling), each resuming as a fresh turn
 # reattached via the row's existing `claude_session_id`. A no-op
 # (`{"replied": False}`) for any other phase -- nothing paused there to
 # resume.
@@ -1034,9 +1035,10 @@ def test_stall_reply_endpoint_is_a_noop_for_a_card_not_in_a_resumable_phase(clie
     project_id = _open_project(client, tmp_path, "proj")
 
     conn = db.get_connection()
-    # A freshly-created row defaults to phase="grilling" -- not one of the
-    # phases this endpoint knows how to resume.
-    card_id = db.create_session(conn, project_id)
+    # `details` is a genuine dead end for this endpoint -- the do-finished
+    # pause point, not one of the phases it knows how to resume (unlike
+    # `grilling`, which issue #242 made resumable via `continue_session_job`).
+    card_id = db.create_session(conn, project_id, session_type="do", phase="details")
 
     resp = client.post(f"/api/sessions/{card_id}/stall-reply", json={"text": "anything"})
 
@@ -1097,6 +1099,36 @@ def test_stall_reply_endpoint_resumes_a_chain_step_via_a_new_turn(client, tmp_pa
     assert len(calls) == 1
     assert calls[0][0] == card_id
     assert calls[0][1] == "Use Postgres."
+
+
+def test_stall_reply_endpoint_resumes_a_grilling_session_via_a_new_turn(client, tmp_path, monkeypatch):
+    """Issue #242 (child of PRD #241): a card paused in `phase="grilling"`
+    with `stalled_json` set by a negative grilling-completion verdict (see
+    `session_runner._grilling_completion_verdict`/`_run_grilling_turn_
+    stream_json`) resumes through `continue_session_job` -- grilling's own
+    existing reply path, NOT `continue_stalled_chain_step_job` (that's for
+    creating_prd/creating_issues/publishing only)."""
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id, session_type="do", phase="grilling")
+    db.update_session(
+        conn, card_id, stalled_json=json.dumps({"phase": "grilling", "context": "Scope is still ambiguous."})
+    )
+
+    calls = []
+
+    async def fake_continue_session_job(card_id_arg, reply, *, cwd):
+        calls.append((card_id_arg, reply, cwd))
+
+    monkeypatch.setattr(session_runner, "continue_session_job", fake_continue_session_job)
+
+    resp = client.post(f"/api/sessions/{card_id}/stall-reply", json={"text": "It only needs to cover web."})
+
+    assert resp.json() == {"replied": True}
+    assert len(calls) == 1
+    assert calls[0][0] == card_id
+    assert calls[0][1] == "It only needs to cover web."
 
 
 def _cwd_for(project_id):
