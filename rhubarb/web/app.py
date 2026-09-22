@@ -10,8 +10,8 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from rhubarb import afk_loop, caveman_installer, db, error_log, headroom_installer, live_stream, ollama_installer, parser_session, session_runner
-from rhubarb.cli_client import ClaudeCLIError, get_auth_status, set_headroom_proxy_active
+from rhubarb import afk_loop, caveman_installer, db, error_log, headroom_installer, lean_ctx_installer, live_stream, ollama_installer, parser_session, session_runner
+from rhubarb.cli_client import ClaudeCLIError, get_auth_status, set_headroom_proxy_active, set_lean_ctx_enabled
 from rhubarb.folder_picker import pick_folder
 from rhubarb.prd_list import compute_prd_list
 from rhubarb.projects import scan_projects
@@ -63,6 +63,22 @@ def _stop_headroom_proxy() -> None:
         _headroom_proxy = None
 
 
+# --- lean-ctx enable/disable (issue #233, child of PRD #232) -----------------
+# Unlike Headroom, there's no persistent proxy process to start/stop --
+# "enabling" means regenerating the two Rhubarb-owned scoped config files
+# and flipping `cli_client._lean_ctx_enabled` so newly spawned `claude`
+# subprocesses pick up `--mcp-config`/`--settings`.
+
+
+def _enable_lean_ctx() -> None:
+    lean_ctx_installer.generate_scoped_config()
+    set_lean_ctx_enabled(True)
+
+
+def _disable_lean_ctx() -> None:
+    set_lean_ctx_enabled(False)
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     live_stream.set_loop(asyncio.get_running_loop())
@@ -73,6 +89,11 @@ async def _lifespan(app: FastAPI):
     _conn = db.get_connection()
     if not db.get_headroom_declined(_conn) and headroom_installer.check_headroom_presence() == headroom_installer.PRESENCE_PRESENT:
         _start_headroom_proxy()
+    # Issue #233: same startup eligibility check as Headroom above, for
+    # lean-ctx -- no toggle round-trip needed when it's already installed
+    # and not declined.
+    if not db.get_lean_ctx_declined(_conn) and lean_ctx_installer.check_lean_ctx_presence() == lean_ctx_installer.PRESENCE_PRESENT:
+        _enable_lean_ctx()
     afk_task = asyncio.create_task(
         afk_loop.run_forever(
             get_active_project_id=lambda: _active_project_id,
@@ -375,30 +396,29 @@ def _run_headroom_savings_command() -> str:
     return result.stdout
 
 
-def _headroom_savings_has_data(data) -> bool:
-    """Headroom's own docs (checked directly -- `savings.mdx` shows only
-    the human-readable summary, no published `--json` schema) don't
-    document an explicit empty-ledger flag in the JSON output, so this
-    recursively scans the parsed payload for any numeric field whose key
-    looks like a "tokens saved" count (matched loosely on "saved" in the
-    key name, e.g. `tokens_saved`) that's greater than zero. Deliberately
-    not keyed to one exact field name/path -- issue #204 asks for
-    defensive parsing that tolerates the real output's field names
+def _savings_payload_has_data(data) -> bool:
+    """Shared emptiness check for both Headroom's and lean-ctx's `--json`
+    savings payloads (issue #204, reused by issue #234's lean-ctx
+    endpoint rather than duplicated) -- neither tool publishes a formal
+    `--json` schema with an explicit empty-ledger flag, so this recursively
+    scans the parsed payload for any numeric field whose key looks like a
+    "tokens saved" count (matched loosely on "saved" in the key name, e.g.
+    `tokens_saved`) that's greater than zero. Deliberately not keyed to one
+    exact field name/path -- tolerates the real output's field names
     differing slightly from any guess made here, rather than hardcoding a
     schema no one has confirmed byte-for-byte. A payload with no such
-    field anywhere (including a missing/empty `windows` breakdown
-    entirely) is treated as an empty ledger, matching #204's guidance to
-    treat "ran fine, parsed fine, every window shows zero" as the empty
-    signal."""
+    field anywhere (including a missing/empty breakdown entirely) is
+    treated as an empty ledger, matching #204's guidance to treat "ran
+    fine, parsed fine, every window shows zero" as the empty signal."""
     if isinstance(data, dict):
         for key, value in data.items():
             if isinstance(value, (int, float)) and not isinstance(value, bool) and "saved" in key.lower() and value > 0:
                 return True
-            if _headroom_savings_has_data(value):
+            if _savings_payload_has_data(value):
                 return True
     elif isinstance(data, list):
         for item in data:
-            if _headroom_savings_has_data(item):
+            if _savings_payload_has_data(item):
                 return True
     return False
 
@@ -438,7 +458,7 @@ def headroom_savings():
             return {"available": False}
     except Exception:
         return {"available": False}
-    if not _headroom_savings_has_data(data):
+    if not _savings_payload_has_data(data):
         return {"available": True, "empty": True}
     return {"available": True, "empty": False, **data}
 
@@ -567,6 +587,112 @@ def set_caveman_declined_endpoint(body: dict):
         except Exception:
             pass
     return {"caveman_declined": declined}
+
+
+@app.get("/api/lean-ctx-status")
+def lean_ctx_status():
+    """Polled by the first-run gate (and the Settings toggle) to decide
+    whether to show the lean-ctx install prompt. Plain `def` route so
+    FastAPI runs it in a worker thread -- `check_lean_ctx_presence`'s
+    blocking subprocess call never blocks the event loop."""
+    conn = db.get_connection()
+    return {
+        "presence": lean_ctx_installer.check_lean_ctx_presence(),
+        "declined": db.get_lean_ctx_declined(conn),
+    }
+
+
+def _run_lean_ctx_savings_command() -> str:
+    """Runs `lean-ctx gain --json` and returns its raw stdout. Split out
+    from `lean_ctx_savings()` below as a single injectable call point,
+    mirroring `_run_headroom_savings_command`'s "monkeypatch the one
+    function that actually shells out" pattern -- no real subprocess is
+    spawned in tests.
+
+    `resolve_lean_ctx_command()`, not a bare `"lean-ctx"` -- same
+    `.cmd`-shim caveat as `check_lean_ctx_presence`/`install_for_platform`."""
+    result = subprocess.run(
+        [lean_ctx_installer.resolve_lean_ctx_command(), "gain", "--json"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
+
+
+@app.get("/api/lean-ctx-savings")
+def lean_ctx_savings():
+    """Backend for the Settings token-savings widget/modal (issue #234,
+    part of PRD #232) -- same three-shape contract as `headroom_savings()`
+    above, reusing `_savings_payload_has_data` for the empty-ledger check
+    rather than duplicating it:
+    - `{"available": False}` -- the command failed to run at all (not
+      installed, non-zero exit, or output that isn't valid JSON).
+    - `{"available": True, "empty": True}` -- ran fine, produced valid
+      JSON, but no compressions recorded yet.
+    - `{"available": True, "empty": False, **data}` -- ran fine with real
+      data. `data` is `lean-ctx gain --json`'s own parsed payload, merged
+      through as-is (expected shape per PRD #232: a today/7-day/30-day
+      window breakdown, a per-command breakdown, and an MCP-vs-Shell-Hook
+      breakdown) rather than a guess at exact field names the future
+      widget/modal issues would otherwise be briefed against incorrectly."""
+    try:
+        raw_output = _run_lean_ctx_savings_command()
+        data = json.loads(raw_output)
+        if not isinstance(data, dict):
+            return {"available": False}
+    except Exception:
+        return {"available": False}
+    if not _savings_payload_has_data(data):
+        return {"available": True, "empty": True}
+    return {"available": True, "empty": False, **data}
+
+
+# Same live-output pattern as `_headroom_install_lines`/`_caveman_install_lines`
+# above, for the `npm install -g lean-ctx-bin` install -- reset at the start
+# of each install, appended live via `lean_ctx_installer.run_streaming`,
+# polled by `/api/lean-ctx-install-status`.
+_lean_ctx_install_lines: list[str] = []
+
+
+def _lean_ctx_install_run(argv: list[str]) -> None:
+    lean_ctx_installer.run_streaming(argv, on_line=_lean_ctx_install_lines.append)
+
+
+@app.get("/api/lean-ctx-install-status")
+def lean_ctx_install_status():
+    return {"lines": _lean_ctx_install_lines}
+
+
+@app.post("/api/lean-ctx-install")
+def start_lean_ctx_install():
+    """Runs the install to completion and returns the result. Plain `def`
+    route (worker thread) -- never blocks the event loop or concurrent
+    sessions. On success, regenerates the scoped config files and enables
+    lean-ctx immediately so new sessions pick up `--mcp-config`/`--settings`
+    without a restart (mirrors `start_headroom_install`'s "install then
+    activate" shape)."""
+    _lean_ctx_install_lines.clear()
+    try:
+        presence = lean_ctx_installer.check_lean_ctx_presence()
+        if presence == lean_ctx_installer.PRESENCE_NOT_PRESENT:
+            lean_ctx_installer.install_for_platform(run=_lean_ctx_install_run)
+        _enable_lean_ctx()
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/settings/lean-ctx-declined")
+def set_lean_ctx_declined_endpoint(body: dict):
+    conn = db.get_connection()
+    declined = bool(body["lean_ctx_declined"])
+    db.set_lean_ctx_declined(conn, declined)
+    if declined:
+        _disable_lean_ctx()
+    elif lean_ctx_installer.check_lean_ctx_presence() == lean_ctx_installer.PRESENCE_PRESENT:
+        _enable_lean_ctx()
+    return {"lean_ctx_declined": declined}
 
 
 async def _warm_project_engines(project_id: int, *, cwd: str | None, model: str | None, effort: str | None) -> None:

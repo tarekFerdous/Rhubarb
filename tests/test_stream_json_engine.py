@@ -130,6 +130,38 @@ def test_start_passes_the_plugin_dir_argument():
     assert captured["argv"][idx + 1] == stream_json_engine._plugin_args()[1]
 
 
+def test_start_omits_lean_ctx_args_when_disabled():
+    from rhubarb import cli_client
+
+    backend = FakeStreamJsonBackend([])
+    factory, captured = _fake_factory(backend)
+    cli_client.set_lean_ctx_enabled(False)
+
+    StreamJsonEngine(process_factory=factory).start()
+
+    assert "--mcp-config" not in captured["argv"]
+    assert "--settings" not in captured["argv"]
+
+
+def test_start_passes_lean_ctx_args_when_enabled():
+    from rhubarb import cli_client
+    from rhubarb.lean_ctx_installer import LEAN_CTX_HOOKS_SETTINGS_PATH, LEAN_CTX_MCP_CONFIG_PATH
+
+    backend = FakeStreamJsonBackend([])
+    factory, captured = _fake_factory(backend)
+    cli_client.set_lean_ctx_enabled(True)
+    try:
+        StreamJsonEngine(process_factory=factory).start()
+    finally:
+        cli_client.set_lean_ctx_enabled(False)
+
+    argv = captured["argv"]
+    assert "--mcp-config" in argv
+    assert argv[argv.index("--mcp-config") + 1] == str(LEAN_CTX_MCP_CONFIG_PATH)
+    assert "--settings" in argv
+    assert argv[argv.index("--settings") + 1] == str(LEAN_CTX_HOOKS_SETTINGS_PATH)
+
+
 def test_start_strips_api_key_and_auth_token_from_child_env(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-be-inherited")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok-should-not-be-inherited")

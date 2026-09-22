@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 
 from rhubarb.headroom_installer import HEADROOM_BASE_URL as _HEADROOM_BASE_URL
+from rhubarb.lean_ctx_installer import LEAN_CTX_HOOKS_SETTINGS_PATH, LEAN_CTX_MCP_CONFIG_PATH
 
 
 class ClaudeCLIError(RuntimeError):
@@ -38,6 +39,35 @@ def _effort_args(effort: str | None) -> list[str]:
     if not effort or effort == "auto":
         return []
     return ["--effort", effort]
+
+
+# Set to True by app.py when lean-ctx is enabled and present (issue #233,
+# child of PRD #232). No proxy process to start/stop, unlike Headroom --
+# this flag alone gates whether `_lean_ctx_args()` points a spawned
+# `claude` subprocess at the Rhubarb-owned scoped config files
+# `lean_ctx_installer.generate_scoped_config()` writes.
+_lean_ctx_enabled: bool = False
+
+
+def set_lean_ctx_enabled(enabled: bool) -> None:
+    """Called by app.py when lean-ctx is enabled/disabled (install success,
+    Settings toggle, or a declined/undeclined transition). Only affects
+    subsequently spawned subprocesses -- an already-running `claude`
+    process never sees this change."""
+    global _lean_ctx_enabled
+    _lean_ctx_enabled = enabled
+
+
+def _lean_ctx_args() -> list[str]:
+    """Mirrors `_plugin_args()`'s shape: a fixed pair of flags pointing at
+    Rhubarb's own generated config files when lean-ctx is enabled, else no
+    flags at all. Both `run_prompt()` below and `stream_json_engine.py`'s
+    `_build_args()` call this -- the two places Rhubarb ever spawns
+    `claude` -- so enabling lean-ctx actually reaches every subprocess
+    Rhubarb drives, not just one of the two spawn paths."""
+    if not _lean_ctx_enabled:
+        return []
+    return ["--mcp-config", str(LEAN_CTX_MCP_CONFIG_PATH), "--settings", str(LEAN_CTX_HOOKS_SETTINGS_PATH)]
 
 
 # Set to True by app.py when a Headroom proxy is running and claude
@@ -113,6 +143,7 @@ def run_prompt(
 
     args = ["claude", "-p", "--output-format", "json", "--dangerously-skip-permissions"]
     args += _plugin_args()
+    args += _lean_ctx_args()
     if session_id:
         args += ["--resume", session_id]
     if model:

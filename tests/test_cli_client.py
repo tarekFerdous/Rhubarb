@@ -4,6 +4,7 @@ import pytest
 
 from rhubarb import cli_client
 from rhubarb.headroom_installer import HEADROOM_BASE_URL, HEADROOM_PROXY_PORT
+from rhubarb.lean_ctx_installer import LEAN_CTX_HOOKS_SETTINGS_PATH, LEAN_CTX_MCP_CONFIG_PATH
 
 
 def test_run_prompt_skips_permission_checks(monkeypatch):
@@ -148,3 +149,75 @@ def test_run_prompt_sets_anthropic_base_url_to_the_shared_port_when_headroom_act
         cli_client.set_headroom_proxy_active(False)
 
     assert captured["env"]["ANTHROPIC_BASE_URL"] == "http://localhost:8787"
+
+
+# ---------------------------------------------------------------------------
+# lean-ctx args (issue #233, child of PRD #232)
+# ---------------------------------------------------------------------------
+
+
+def test_lean_ctx_args_is_empty_when_disabled():
+    cli_client.set_lean_ctx_enabled(False)
+
+    assert cli_client._lean_ctx_args() == []
+
+
+def test_lean_ctx_args_points_at_the_generated_config_files_when_enabled():
+    cli_client.set_lean_ctx_enabled(True)
+    try:
+        args = cli_client._lean_ctx_args()
+    finally:
+        cli_client.set_lean_ctx_enabled(False)
+
+    assert args == [
+        "--mcp-config",
+        str(LEAN_CTX_MCP_CONFIG_PATH),
+        "--settings",
+        str(LEAN_CTX_HOOKS_SETTINGS_PATH),
+    ]
+
+
+def test_run_prompt_passes_lean_ctx_args_when_enabled(monkeypatch):
+    captured = {}
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"session_id": "abc"})
+        stderr = ""
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        return FakeResult()
+
+    monkeypatch.setattr(cli_client.subprocess, "run", fake_run)
+    cli_client.set_lean_ctx_enabled(True)
+    try:
+        cli_client.run_prompt("hello")
+    finally:
+        cli_client.set_lean_ctx_enabled(False)
+
+    assert "--mcp-config" in captured["args"]
+    assert captured["args"][captured["args"].index("--mcp-config") + 1] == str(LEAN_CTX_MCP_CONFIG_PATH)
+    assert "--settings" in captured["args"]
+    assert captured["args"][captured["args"].index("--settings") + 1] == str(LEAN_CTX_HOOKS_SETTINGS_PATH)
+
+
+def test_run_prompt_omits_lean_ctx_args_when_disabled(monkeypatch):
+    captured = {}
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"session_id": "abc"})
+        stderr = ""
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        return FakeResult()
+
+    monkeypatch.setattr(cli_client.subprocess, "run", fake_run)
+    cli_client.set_lean_ctx_enabled(False)
+
+    cli_client.run_prompt("hello")
+
+    assert "--mcp-config" not in captured["args"]
+    assert "--settings" not in captured["args"]

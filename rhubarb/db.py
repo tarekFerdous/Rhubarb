@@ -105,6 +105,10 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
         conn.execute(
             "ALTER TABLE settings ADD COLUMN caveman_declined INTEGER NOT NULL DEFAULT 0"
         )
+    if "lean_ctx_declined" not in existing_columns:
+        conn.execute(
+            "ALTER TABLE settings ADD COLUMN lean_ctx_declined INTEGER NOT NULL DEFAULT 0"
+        )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS projects (
@@ -284,6 +288,28 @@ def set_caveman_declined(conn: sqlite3.Connection, value: bool) -> None:
         """
         INSERT INTO settings (id, caveman_declined) VALUES (1, ?)
         ON CONFLICT(id) DO UPDATE SET caveman_declined = excluded.caveman_declined
+        """,
+        (1 if value else 0,),
+    )
+    conn.commit()
+
+
+def get_lean_ctx_declined(conn: sqlite3.Connection) -> bool:
+    """True once the user has explicitly declined the lean-ctx install
+    (the first-run gate, or later turning the Settings toggle off) -- see
+    issue #233. While true, the install gate is never shown again and
+    lean-ctx's `--mcp-config`/`--settings` args are never passed to a
+    spawned `claude` subprocess, even if lean-ctx happens to already be
+    installed."""
+    row = conn.execute("SELECT lean_ctx_declined FROM settings WHERE id = 1").fetchone()
+    return bool(row["lean_ctx_declined"]) if row else False
+
+
+def set_lean_ctx_declined(conn: sqlite3.Connection, value: bool) -> None:
+    conn.execute(
+        """
+        INSERT INTO settings (id, lean_ctx_declined) VALUES (1, ?)
+        ON CONFLICT(id) DO UPDATE SET lean_ctx_declined = excluded.lean_ctx_declined
         """,
         (1 if value else 0,),
     )

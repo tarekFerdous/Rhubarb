@@ -225,6 +225,30 @@
       </label>
       <p id="caveman-toggle-error" class="modal-warning-text" hidden></p>
 
+      <label class="modal-checkbox-label">
+        <input id="lean-ctx-enabled-toggle" type="checkbox" class="modal-checkbox-input" />
+        Enable lean-ctx
+      </label>
+      <p id="lean-ctx-toggle-error" class="modal-warning-text" hidden></p>
+
+      <!-- lean-ctx token-savings widget (issue #235, part of PRD #232).
+           Same shape/visibility contract as `#headroom-savings-widget`
+           above (reuses its CSS classes rather than duplicating them):
+           fetched once per Settings-panel open from GET /api/lean-ctx-savings
+           (issue #234) -- never polled. Hidden by default, unhidden only by
+           `renderLeanCtxSavingsWidget()` once `available: true` comes back,
+           independent of `#lean-ctx-enabled-toggle`'s checked state above --
+           a user who disabled lean-ctx still sees historical savings. -->
+      <button
+        type="button"
+        id="lean-ctx-savings-widget"
+        class="headroom-savings-widget"
+        hidden
+      >
+        <span id="lean-ctx-savings-today-line" class="headroom-savings-line"></span>
+        <span id="lean-ctx-savings-30day-line" class="headroom-savings-line"></span>
+      </button>
+
       <label for="model-select-settings" class="modal-field-label">Model</label>
       <select id="model-select-settings" class="modal-select-input">
         <optgroup label="Sonnet">
@@ -294,6 +318,52 @@
       </div>
 
       <button id="headroom-savings-modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
+    </div>
+  </div>
+
+  <!-- lean-ctx savings modal (issue #236, part of PRD #232): opened by
+       clicking the Settings widget from #235 (see the widget's click
+       listener near the bottom of this file, wired to
+       `openLeanCtxSavingsModal()` below). Fetches GET /api/lean-ctx-savings
+       FRESH on every open -- never reuses `refreshLeanCtxSavingsWidget()`'s
+       earlier response, since the modal can be opened well after the widget
+       loaded (e.g. lean-ctx could have been uninstalled in between,
+       flipping `available` to false). No polling: exactly one fetch per
+       open. Same manually-toggled `.modal-overlay`/`hidden` convention as
+       every other modal in this file -- no <dialog>, no separate "open" CSS
+       class. Reuses `#headroom-savings-modal-content`'s CSS and
+       `buildHeadroomBarChartSvg()`/`buildHeadroomStackedBarChartSvg()`'s
+       chart rendering rather than duplicating either -- no new charting
+       library, per PRD #232. -->
+  <div id="lean-ctx-savings-modal" class="modal-overlay" hidden>
+    <div class="modal headroom-savings-modal-content">
+      <h2 class="modal-heading">lean-ctx Savings</h2>
+
+      <p id="lean-ctx-savings-modal-unavailable" class="headroom-savings-modal-unavailable-text" hidden>
+        lean-ctx savings are no longer available.
+      </p>
+
+      <div id="lean-ctx-savings-modal-body">
+        <section class="headroom-savings-modal-section">
+          <h3 class="headroom-savings-modal-section-heading">Today / 7-day / 30-day</h3>
+          <p id="lean-ctx-savings-modal-windows-empty" class="headroom-savings-modal-empty-text" hidden>No savings recorded yet</p>
+          <div id="lean-ctx-savings-modal-windows-chart" class="headroom-savings-modal-chart"></div>
+        </section>
+
+        <section class="headroom-savings-modal-section">
+          <h3 class="headroom-savings-modal-section-heading">Savings per command</h3>
+          <p id="lean-ctx-savings-modal-command-empty" class="headroom-savings-modal-empty-text" hidden>No savings recorded yet</p>
+          <div id="lean-ctx-savings-modal-command-chart" class="headroom-savings-modal-chart"></div>
+        </section>
+
+        <section class="headroom-savings-modal-section">
+          <h3 class="headroom-savings-modal-section-heading">MCP vs Shell Hook</h3>
+          <p id="lean-ctx-savings-modal-source-empty" class="headroom-savings-modal-empty-text" hidden>No savings recorded yet</p>
+          <div id="lean-ctx-savings-modal-source-chart" class="headroom-savings-modal-chart"></div>
+        </section>
+      </div>
+
+      <button id="lean-ctx-savings-modal-close-btn" class="glass-btn modal-dismiss" type="button">Close</button>
     </div>
   </div>
 
@@ -482,6 +552,34 @@
     </div>
   </div>
 
+  <!-- First-run lean-ctx consent/install gate (issue #233): blocks the whole
+       app -- no dismiss-by-clicking-away, no [x] -- until the user installs,
+       declines, or (after a failure) explicitly skips for this session.
+       Sequenced as the 4th and final link in the Ollama -> Headroom ->
+       Caveman gate chain, triggered once the Caveman gate resolves. -->
+  <div id="lean-ctx-gate-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 class="modal-heading">Compress Claude Code's context with lean-ctx</h2>
+      <p class="modal-text">
+        Rhubarb can install lean-ctx, a local, open-source, MIT-licensed tool that
+        compresses file reads, searches, and shell output for every Claude Code
+        session Rhubarb itself spawns. It only affects sessions Rhubarb spawns --
+        your own global Claude Code setup is never touched.
+      </p>
+      <p id="lean-ctx-gate-error" class="modal-warning-text" hidden></p>
+      <div id="lean-ctx-gate-actions" class="ready-to-proceed-actions">
+        <button id="lean-ctx-gate-install-btn" class="glass-btn" type="button">Install</button>
+        <button id="lean-ctx-gate-decline-btn" class="glass-btn" type="button">No thanks</button>
+      </div>
+      <p id="lean-ctx-gate-progress-text" class="modal-text" hidden>Installing…</p>
+      <pre id="lean-ctx-gate-output-log" class="install-output-log" hidden></pre>
+      <div id="lean-ctx-gate-retry-actions" class="ready-to-proceed-actions" hidden>
+        <button id="lean-ctx-gate-retry-btn" class="glass-btn" type="button">Retry</button>
+        <button id="lean-ctx-gate-skip-btn" class="glass-btn" type="button">Skip for now</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Do-finished modal: shown when a /do session reaches the `details`
        pause point (PRD + issues published). Displays the session summary
        (PRD and issue numbers) and offers two actions:
@@ -615,6 +713,31 @@
     const cavemanGateRetryActionsEl = document.getElementById("caveman-gate-retry-actions");
     const cavemanGateRetryBtnEl = document.getElementById("caveman-gate-retry-btn");
     const cavemanGateSkipBtnEl = document.getElementById("caveman-gate-skip-btn");
+    const leanCtxEnabledToggleEl = document.getElementById("lean-ctx-enabled-toggle");
+    const leanCtxToggleErrorEl = document.getElementById("lean-ctx-toggle-error");
+    const leanCtxSavingsWidgetEl = document.getElementById("lean-ctx-savings-widget");
+    const leanCtxSavingsTodayLineEl = document.getElementById("lean-ctx-savings-today-line");
+    const leanCtxSavings30DayLineEl = document.getElementById("lean-ctx-savings-30day-line");
+    const leanCtxSavingsModalEl = document.getElementById("lean-ctx-savings-modal");
+    const leanCtxSavingsModalUnavailableEl = document.getElementById("lean-ctx-savings-modal-unavailable");
+    const leanCtxSavingsModalBodyEl = document.getElementById("lean-ctx-savings-modal-body");
+    const leanCtxSavingsModalWindowsEmptyEl = document.getElementById("lean-ctx-savings-modal-windows-empty");
+    const leanCtxSavingsModalWindowsChartEl = document.getElementById("lean-ctx-savings-modal-windows-chart");
+    const leanCtxSavingsModalCommandEmptyEl = document.getElementById("lean-ctx-savings-modal-command-empty");
+    const leanCtxSavingsModalCommandChartEl = document.getElementById("lean-ctx-savings-modal-command-chart");
+    const leanCtxSavingsModalSourceEmptyEl = document.getElementById("lean-ctx-savings-modal-source-empty");
+    const leanCtxSavingsModalSourceChartEl = document.getElementById("lean-ctx-savings-modal-source-chart");
+    const leanCtxSavingsModalCloseBtnEl = document.getElementById("lean-ctx-savings-modal-close-btn");
+    const leanCtxGateModalEl = document.getElementById("lean-ctx-gate-modal");
+    const leanCtxGateErrorEl = document.getElementById("lean-ctx-gate-error");
+    const leanCtxGateActionsEl = document.getElementById("lean-ctx-gate-actions");
+    const leanCtxGateInstallBtnEl = document.getElementById("lean-ctx-gate-install-btn");
+    const leanCtxGateDeclineBtnEl = document.getElementById("lean-ctx-gate-decline-btn");
+    const leanCtxGateProgressTextEl = document.getElementById("lean-ctx-gate-progress-text");
+    const leanCtxGateOutputLogEl = document.getElementById("lean-ctx-gate-output-log");
+    const leanCtxGateRetryActionsEl = document.getElementById("lean-ctx-gate-retry-actions");
+    const leanCtxGateRetryBtnEl = document.getElementById("lean-ctx-gate-retry-btn");
+    const leanCtxGateSkipBtnEl = document.getElementById("lean-ctx-gate-skip-btn");
     const closeSessionModalEl = document.getElementById("close-session-modal");
     const closeSessionLabelEl = document.getElementById("close-session-label");
     const closeSessionCancelBtnEl = document.getElementById("close-session-cancel-btn");
@@ -674,6 +797,7 @@
     let knownOllamaDeclined = false;
     let knownHeadroomDeclined = false;
     let knownCavemanDeclined = false;
+    let knownLeanCtxDeclined = false;
     let knownModel = null;
     let knownEffort = null;
     // card_id's that have received at least one turn -- gates whether
@@ -1204,6 +1328,8 @@
       headroomToggleErrorEl.hidden = true;
       cavemanEnabledToggleEl.checked = !knownCavemanDeclined;
       cavemanToggleErrorEl.hidden = true;
+      leanCtxEnabledToggleEl.checked = !knownLeanCtxDeclined;
+      leanCtxToggleErrorEl.hidden = true;
       modelSelectSettingsEl.value = knownModel ?? "claude-sonnet-4-6";
       effortSelectSettingsEl.value = knownEffort ?? "auto";
       settingsModalEl.hidden = false;
@@ -1213,6 +1339,11 @@
       // reports, so historical savings stay visible even with Headroom
       // currently toggled off.
       refreshHeadroomSavingsWidget();
+      // Issue #235: same "one fetch per panel open, never polled" contract
+      // as Headroom's widget above, deliberately NOT gated on
+      // `leanCtxEnabledToggleEl.checked` -- historical savings stay
+      // visible even with lean-ctx currently toggled off.
+      refreshLeanCtxSavingsWidget();
     }
 
     function closeSettingsModal() {
@@ -1644,6 +1775,156 @@
     headroomSavingsWidgetEl.addEventListener("click", openHeadroomSavingsModal);
     headroomSavingsModalCloseBtnEl.addEventListener("click", closeHeadroomSavingsModal);
 
+    // --- lean-ctx token-savings widget (issue #235, part of PRD #232) ------
+    // Reuses `pickHeadroomSavingsWindow`/`formatHeadroomTokenCount`/
+    // `pickHeadroomSavingsPercent` from the Headroom widget above rather
+    // than duplicating them -- both endpoints defensively parse an
+    // undocumented `--json` schema the exact same way.
+
+    function renderLeanCtxSavingsWidget(data) {
+      if (!data || data.available !== true) {
+        leanCtxSavingsWidgetEl.hidden = true;
+        return;
+      }
+      if (data.empty) {
+        leanCtxSavingsTodayLineEl.textContent = "No savings recorded yet";
+        leanCtxSavings30DayLineEl.hidden = true;
+        leanCtxSavingsWidgetEl.hidden = false;
+        return;
+      }
+
+      const today = pickHeadroomSavingsWindow(data.windows, ["today"]);
+      const last30 = pickHeadroomSavingsWindow(data.windows, [
+        "last_30_days",
+        "last_30d",
+        "last30Days",
+        "thirty_days",
+        "30_day",
+      ]);
+
+      const todayPercent = pickHeadroomSavingsPercent(today);
+      const todayTokens = formatHeadroomTokenCount(today.tokens_saved);
+      if (todayPercent !== null && todayTokens !== null) {
+        leanCtxSavingsTodayLineEl.textContent = `${todayPercent}% saved (${todayTokens} tokens)`;
+      } else {
+        leanCtxSavingsTodayLineEl.textContent = "No savings recorded yet";
+      }
+
+      const last30Tokens = formatHeadroomTokenCount(last30.tokens_saved);
+      if (last30Tokens !== null) {
+        leanCtxSavings30DayLineEl.hidden = false;
+        leanCtxSavings30DayLineEl.textContent = `${last30Tokens} tokens saved in the last 30 days`;
+      } else {
+        leanCtxSavings30DayLineEl.hidden = true;
+      }
+
+      leanCtxSavingsWidgetEl.hidden = false;
+    }
+
+    async function refreshLeanCtxSavingsWidget() {
+      try {
+        const res = await fetch("/api/lean-ctx-savings");
+        const data = await res.json();
+        renderLeanCtxSavingsWidget(data);
+      } catch (err) {
+        leanCtxSavingsWidgetEl.hidden = true;
+      }
+    }
+
+    // --- lean-ctx savings modal (issue #236, part of PRD #232) -------------
+    // Reuses `renderHeadroomChartSection`/`extractHeadroomBreakdown`/
+    // `sumHeadroomEntryValues`/`buildHeadroomBarChartSvg`/
+    // `buildHeadroomStackedBarChartSvg` from the Headroom modal above
+    // rather than duplicating any of them -- no new charting library, per
+    // PRD #232.
+
+    function renderLeanCtxSavingsModalWindows(data) {
+      const windowDefs = [
+        { label: "Today", keys: ["today"] },
+        { label: "7-day", keys: ["last_7_days", "last_7d", "last7Days", "seven_days", "7_day"] },
+        { label: "30-day", keys: ["last_30_days", "last_30d", "last30Days", "thirty_days", "30_day"] },
+      ];
+      const entries = [];
+      windowDefs.forEach((def) => {
+        const windowData = pickHeadroomSavingsWindow(data.windows, def.keys);
+        const percent = pickHeadroomSavingsPercent(windowData);
+        if (percent !== null && percent >= 0) entries.push({ label: def.label, value: percent, valueText: `${percent}%` });
+      });
+      renderHeadroomChartSection(leanCtxSavingsModalWindowsChartEl, leanCtxSavingsModalWindowsEmptyEl, entries, 100);
+    }
+
+    function renderLeanCtxSavingsModalByCommand(data) {
+      const raw = extractHeadroomBreakdown(
+        data.by_command ?? data.per_command ?? data.commands,
+        ["command", "name"],
+        ["tokens_saved", "tokens"]
+      );
+      const entries = raw.map((e) => ({ ...e, valueText: formatHeadroomTokenCount(e.value) ?? String(e.value) }));
+      renderHeadroomChartSection(
+        leanCtxSavingsModalCommandChartEl,
+        leanCtxSavingsModalCommandEmptyEl,
+        entries,
+        sumHeadroomEntryValues(entries),
+        buildHeadroomStackedBarChartSvg
+      );
+    }
+
+    function renderLeanCtxSavingsModalBySource(data) {
+      const raw = extractHeadroomBreakdown(
+        data.by_source ?? data.mcp_vs_shell_hook ?? data.sources,
+        ["source", "name"],
+        ["tokens_saved", "tokens"]
+      );
+      const entries = raw.map((e) => ({ ...e, valueText: formatHeadroomTokenCount(e.value) ?? String(e.value) }));
+      renderHeadroomChartSection(
+        leanCtxSavingsModalSourceChartEl,
+        leanCtxSavingsModalSourceEmptyEl,
+        entries,
+        sumHeadroomEntryValues(entries),
+        buildHeadroomStackedBarChartSvg
+      );
+    }
+
+    function renderLeanCtxSavingsModal(data) {
+      if (!data || data.available !== true) {
+        leanCtxSavingsModalUnavailableEl.hidden = false;
+        leanCtxSavingsModalBodyEl.hidden = true;
+        return;
+      }
+      leanCtxSavingsModalUnavailableEl.hidden = true;
+      leanCtxSavingsModalBodyEl.hidden = false;
+      if (data.empty) {
+        renderHeadroomChartSection(leanCtxSavingsModalWindowsChartEl, leanCtxSavingsModalWindowsEmptyEl, []);
+        renderHeadroomChartSection(leanCtxSavingsModalCommandChartEl, leanCtxSavingsModalCommandEmptyEl, []);
+        renderHeadroomChartSection(leanCtxSavingsModalSourceChartEl, leanCtxSavingsModalSourceEmptyEl, []);
+        return;
+      }
+      renderLeanCtxSavingsModalWindows(data);
+      renderLeanCtxSavingsModalByCommand(data);
+      renderLeanCtxSavingsModalBySource(data);
+    }
+
+    // Wired to the Settings widget's click listener below. Deliberately
+    // `async` and re-fetches every call -- no caching, no polling, one
+    // fetch per open, per issue #236's acceptance criteria.
+    async function openLeanCtxSavingsModal() {
+      leanCtxSavingsModalEl.hidden = false;
+      try {
+        const res = await fetch("/api/lean-ctx-savings");
+        const data = await res.json();
+        renderLeanCtxSavingsModal(data);
+      } catch (err) {
+        renderLeanCtxSavingsModal({ available: false });
+      }
+    }
+
+    function closeLeanCtxSavingsModal() {
+      leanCtxSavingsModalEl.hidden = true;
+    }
+
+    leanCtxSavingsWidgetEl.addEventListener("click", openLeanCtxSavingsModal);
+    leanCtxSavingsModalCloseBtnEl.addEventListener("click", closeLeanCtxSavingsModal);
+
     // --- Error Logs modal (issue #156) ------------------------------------
     // Opened/closed the same way as the Settings modal above (plain
     // `.hidden` boolean toggling on the `.modal-overlay`, no `<dialog>`, no
@@ -1991,6 +2272,17 @@
     // --- Caveman consent/install gate (issue #201) ------------------------
     // Sequenced after the Headroom gate: `_afterHeadroomGate()` triggers
     // `checkCavemanGate()` once the Headroom gate is fully resolved.
+    // `_afterCavemanGate()` is the same kind of choke point as
+    // `_afterHeadroomGate()` above -- called whenever the Caveman gate is
+    // fully resolved (no modal needed, or the user acted), it triggers the
+    // lean-ctx gate check (issue #233), the 4th and final link in the chain.
+
+    let _cavemanGateDone = false;
+    function _afterCavemanGate() {
+      if (_cavemanGateDone) return;
+      _cavemanGateDone = true;
+      checkLeanCtxGate();
+    }
 
     async function checkCavemanGate() {
       const res = await fetch("/api/caveman-status");
@@ -2002,6 +2294,11 @@
         cavemanGateProgressTextEl.hidden = true;
         cavemanGateRetryActionsEl.hidden = true;
         cavemanGateModalEl.hidden = false;
+        // _afterCavemanGate is called by the button handlers below once
+        // the user acts (install/decline/skip).
+      } else {
+        // No modal needed -- proceed to the lean-ctx gate immediately.
+        _afterCavemanGate();
       }
     }
 
@@ -2032,6 +2329,7 @@
       cavemanGateProgressTextEl.hidden = true;
       if (data.ok) {
         cavemanGateModalEl.hidden = true;
+        _afterCavemanGate();
       } else {
         cavemanGateErrorEl.textContent = `Install failed: ${data.error || "unknown error"}`;
         cavemanGateErrorEl.hidden = false;
@@ -2047,6 +2345,7 @@
       });
       knownCavemanDeclined = true;
       cavemanGateModalEl.hidden = true;
+      _afterCavemanGate();
     });
 
     cavemanGateRetryBtnEl.addEventListener("click", async () => {
@@ -2059,6 +2358,7 @@
       cavemanGateProgressTextEl.hidden = true;
       if (data.ok) {
         cavemanGateModalEl.hidden = true;
+        _afterCavemanGate();
       } else {
         cavemanGateErrorEl.textContent = `Install failed: ${data.error || "unknown error"}`;
         cavemanGateErrorEl.hidden = false;
@@ -2070,6 +2370,7 @@
       // Deliberately NOT persisted -- "skip for now", not decline: the gate
       // reappears on the next app startup.
       cavemanGateModalEl.hidden = true;
+      _afterCavemanGate();
     });
 
     cavemanEnabledToggleEl.addEventListener("change", async () => {
@@ -2097,6 +2398,120 @@
         cavemanEnabledToggleEl.checked = false;
         cavemanToggleErrorEl.textContent = `Install failed: ${data.error || "unknown error"}. Caveman skill not active.`;
         cavemanToggleErrorEl.hidden = false;
+        // Left as not-declined so the next startup's gate check offers to try
+        // again rather than treating a transient install failure as a permanent no.
+      }
+    });
+
+    // --- lean-ctx consent/install gate (issue #233) -----------------------
+    // Sequenced after the Caveman gate: `_afterCavemanGate()` (above)
+    // triggers `checkLeanCtxGate()` once the Caveman gate is fully
+    // resolved -- the 4th and final link in the Ollama -> Headroom ->
+    // Caveman -> lean-ctx chain.
+
+    async function checkLeanCtxGate() {
+      const res = await fetch("/api/lean-ctx-status");
+      const status = await res.json();
+      knownLeanCtxDeclined = status.declined;
+      if (!status.declined && status.presence !== "present") {
+        leanCtxGateActionsEl.hidden = false;
+        leanCtxGateErrorEl.hidden = true;
+        leanCtxGateProgressTextEl.hidden = true;
+        leanCtxGateRetryActionsEl.hidden = true;
+        leanCtxGateModalEl.hidden = false;
+      }
+      // Already present-and-not-declined, or declined: nothing further to
+      // do -- this is the last link in the chain, no further gate to chain into.
+    }
+
+    const LEAN_CTX_INSTALL_DEFAULT_PROGRESS_TEXT = "Installing…";
+
+    async function runLeanCtxInstallWithLiveProgress(progressTextEl) {
+      return runInstallWithLiveProgress({
+        installUrl: "/api/lean-ctx-install",
+        statusUrl: "/api/lean-ctx-install-status",
+        progressTextEl,
+        outputLogEl: leanCtxGateOutputLogEl,
+        defaultProgressText: LEAN_CTX_INSTALL_DEFAULT_PROGRESS_TEXT,
+      });
+    }
+
+    leanCtxGateInstallBtnEl.addEventListener("click", async () => {
+      leanCtxGateActionsEl.hidden = true;
+      leanCtxGateErrorEl.hidden = true;
+      leanCtxGateProgressTextEl.hidden = false;
+
+      const data = await runLeanCtxInstallWithLiveProgress(leanCtxGateProgressTextEl);
+
+      leanCtxGateProgressTextEl.hidden = true;
+      if (data.ok) {
+        leanCtxGateModalEl.hidden = true;
+      } else {
+        leanCtxGateErrorEl.textContent = `Install failed: ${data.error || "unknown error"}`;
+        leanCtxGateErrorEl.hidden = false;
+        leanCtxGateRetryActionsEl.hidden = false;
+      }
+    });
+
+    leanCtxGateDeclineBtnEl.addEventListener("click", async () => {
+      await fetch("/api/settings/lean-ctx-declined", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lean_ctx_declined: true }),
+      });
+      knownLeanCtxDeclined = true;
+      leanCtxGateModalEl.hidden = true;
+    });
+
+    leanCtxGateRetryBtnEl.addEventListener("click", async () => {
+      leanCtxGateRetryActionsEl.hidden = true;
+      leanCtxGateErrorEl.hidden = true;
+      leanCtxGateProgressTextEl.hidden = false;
+
+      const data = await runLeanCtxInstallWithLiveProgress(leanCtxGateProgressTextEl);
+
+      leanCtxGateProgressTextEl.hidden = true;
+      if (data.ok) {
+        leanCtxGateModalEl.hidden = true;
+      } else {
+        leanCtxGateErrorEl.textContent = `Install failed: ${data.error || "unknown error"}`;
+        leanCtxGateErrorEl.hidden = false;
+        leanCtxGateRetryActionsEl.hidden = false;
+      }
+    });
+
+    leanCtxGateSkipBtnEl.addEventListener("click", () => {
+      // Deliberately NOT persisted -- "skip for now", not decline: the gate
+      // reappears on the next app startup.
+      leanCtxGateModalEl.hidden = true;
+    });
+
+    leanCtxEnabledToggleEl.addEventListener("change", async () => {
+      const enabled = leanCtxEnabledToggleEl.checked;
+      leanCtxToggleErrorEl.hidden = true;
+
+      await fetch("/api/settings/lean-ctx-declined", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ lean_ctx_declined: !enabled }),
+      });
+      knownLeanCtxDeclined = !enabled;
+
+      if (!enabled) return;
+
+      const statusRes = await fetch("/api/lean-ctx-status");
+      const status = await statusRes.json();
+      if (status.presence === "present") return;
+
+      leanCtxEnabledToggleEl.disabled = true;
+      const installRes = await fetch("/api/lean-ctx-install", { method: "POST" });
+      const data = await installRes.json();
+      leanCtxEnabledToggleEl.disabled = false;
+
+      if (!data.ok) {
+        leanCtxEnabledToggleEl.checked = false;
+        leanCtxToggleErrorEl.textContent = `Install failed: ${data.error || "unknown error"}. lean-ctx not active.`;
+        leanCtxToggleErrorEl.hidden = false;
         // Left as not-declined so the next startup's gate check offers to try
         // again rather than treating a transient install failure as a permanent no.
       }

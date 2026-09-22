@@ -1,7 +1,7 @@
 import json
 import subprocess
 
-from rhubarb import afk_loop, caveman_installer, cli_client, db, error_log, headroom_installer, ollama_installer, session_runner
+from rhubarb import afk_loop, caveman_installer, cli_client, db, error_log, headroom_installer, lean_ctx_installer, ollama_installer, session_runner
 from rhubarb.web import app as app_module
 
 
@@ -1456,3 +1456,320 @@ def test_caveman_declined_disable_failure_is_silent(client, monkeypatch):
     assert resp.json() == {"caveman_declined": True}
     conn = db.get_connection()
     assert db.get_caveman_declined(conn) is True
+
+
+# ---------------------------------------------------------------------------
+# lean-ctx consent/install gate and Settings toggle (issue #233, child of
+# PRD #232)
+# ---------------------------------------------------------------------------
+
+
+def test_enable_lean_ctx_generates_config_and_sets_enabled_flag(monkeypatch):
+    """`_enable_lean_ctx()` -- the shared helper called on startup, on a
+    successful install, and when the Settings toggle turns on -- must
+    regenerate the scoped config files AND flip the runtime flag, in that
+    order, every time (never merely check whether the files already
+    exist)."""
+    calls = []
+    monkeypatch.setattr(lean_ctx_installer, "generate_scoped_config", lambda: calls.append("config"))
+    monkeypatch.setattr(app_module, "set_lean_ctx_enabled", lambda v: calls.append(("enabled", v)))
+
+    app_module._enable_lean_ctx()
+
+    assert calls == ["config", ("enabled", True)]
+
+
+def test_disable_lean_ctx_clears_enabled_flag(monkeypatch):
+    calls = []
+    monkeypatch.setattr(app_module, "set_lean_ctx_enabled", lambda v: calls.append(v))
+
+    app_module._disable_lean_ctx()
+
+    assert calls == [False]
+
+
+def test_lean_ctx_status_reports_presence_and_declined_state(client, monkeypatch):
+    monkeypatch.setattr(lean_ctx_installer, "check_lean_ctx_presence", lambda: lean_ctx_installer.PRESENCE_NOT_PRESENT)
+
+    data = client.get("/api/lean-ctx-status").json()
+
+    assert data == {"presence": "not_present", "declined": False}
+
+
+def test_set_lean_ctx_declined_persists_and_reflects_in_status(client, monkeypatch):
+    monkeypatch.setattr(lean_ctx_installer, "check_lean_ctx_presence", lambda: lean_ctx_installer.PRESENCE_PRESENT)
+    # Declining/undeclining calls _disable_lean_ctx/_enable_lean_ctx; stub
+    # both out so this test never touches the real filesystem or the real
+    # cli_client module-level flag.
+    monkeypatch.setattr(app_module, "_disable_lean_ctx", lambda: None)
+    monkeypatch.setattr(app_module, "_enable_lean_ctx", lambda: None)
+
+    resp = client.post("/api/settings/lean-ctx-declined", json={"lean_ctx_declined": True})
+    assert resp.json() == {"lean_ctx_declined": True}
+    assert client.get("/api/lean-ctx-status").json()["declined"] is True
+
+    resp = client.post("/api/settings/lean-ctx-declined", json={"lean_ctx_declined": False})
+    assert resp.json() == {"lean_ctx_declined": False}
+    assert client.get("/api/lean-ctx-status").json()["declined"] is False
+
+
+def test_lean_ctx_declined_calls_disable_lean_ctx(client, monkeypatch):
+    """Turning off the toggle (lean_ctx_declined=True) must clear the
+    runtime-enabled flag so subsequently spawned subprocesses stop
+    receiving `--mcp-config`/`--settings`."""
+    calls = []
+    monkeypatch.setattr(lean_ctx_installer, "check_lean_ctx_presence", lambda: lean_ctx_installer.PRESENCE_PRESENT)
+    monkeypatch.setattr(app_module, "_disable_lean_ctx", lambda: calls.append("disable"))
+
+    client.post("/api/settings/lean-ctx-declined", json={"lean_ctx_declined": True})
+
+    assert calls == ["disable"]
+
+
+def test_lean_ctx_undeclined_reenables_it_when_already_present(client, monkeypatch):
+    """Turning the toggle back on (lean_ctx_declined=False) must re-enable
+    immediately when lean-ctx is already installed -- no separate install
+    round-trip needed, mirroring `set_headroom_declined_endpoint`'s elif
+    branch."""
+    calls = []
+    monkeypatch.setattr(lean_ctx_installer, "check_lean_ctx_presence", lambda: lean_ctx_installer.PRESENCE_PRESENT)
+    monkeypatch.setattr(app_module, "_enable_lean_ctx", lambda: calls.append("enable"))
+
+    client.post("/api/settings/lean-ctx-declined", json={"lean_ctx_declined": False})
+
+    assert calls == ["enable"]
+
+
+def test_lean_ctx_undeclined_does_not_enable_when_not_present(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(lean_ctx_installer, "check_lean_ctx_presence", lambda: lean_ctx_installer.PRESENCE_NOT_PRESENT)
+    monkeypatch.setattr(app_module, "_enable_lean_ctx", lambda: calls.append("enable"))
+
+    client.post("/api/settings/lean-ctx-declined", json={"lean_ctx_declined": False})
+
+    assert calls == []
+
+
+def test_lean_ctx_install_is_a_noop_and_ok_when_already_present(client, monkeypatch):
+    monkeypatch.setattr(lean_ctx_installer, "check_lean_ctx_presence", lambda: lean_ctx_installer.PRESENCE_PRESENT)
+    monkeypatch.setattr(
+        lean_ctx_installer,
+        "install_for_platform",
+        lambda **kw: (_ for _ in ()).throw(AssertionError("should not install")),
+    )
+    monkeypatch.setattr(app_module, "_enable_lean_ctx", lambda: None)
+
+    resp = client.post("/api/lean-ctx-install")
+
+    assert resp.json() == {"ok": True}
+
+
+def test_lean_ctx_install_runs_install_when_not_present(client, monkeypatch):
+    calls = []
+    monkeypatch.setattr(lean_ctx_installer, "check_lean_ctx_presence", lambda: lean_ctx_installer.PRESENCE_NOT_PRESENT)
+    monkeypatch.setattr(lean_ctx_installer, "install_for_platform", lambda run=None: calls.append("install"))
+    monkeypatch.setattr(app_module, "_enable_lean_ctx", lambda: None)
+
+    resp = client.post("/api/lean-ctx-install")
+
+    assert resp.json() == {"ok": True}
+    assert calls == ["install"]
+
+
+def test_lean_ctx_install_enables_lean_ctx_on_success(client, monkeypatch):
+    """A successful install must call `_enable_lean_ctx()` (regenerating
+    the scoped config and flipping the runtime flag) immediately, so new
+    sessions pick up `--mcp-config`/`--settings` without a restart --
+    mirrors `start_headroom_install`'s "install then activate" shape."""
+    calls = []
+    monkeypatch.setattr(lean_ctx_installer, "check_lean_ctx_presence", lambda: lean_ctx_installer.PRESENCE_PRESENT)
+    monkeypatch.setattr(app_module, "_enable_lean_ctx", lambda: calls.append("enable"))
+
+    resp = client.post("/api/lean-ctx-install")
+
+    assert resp.json() == {"ok": True}
+    assert calls == ["enable"]
+
+
+def test_lean_ctx_install_reports_the_error_on_failure_instead_of_raising(client, monkeypatch):
+    monkeypatch.setattr(lean_ctx_installer, "check_lean_ctx_presence", lambda: lean_ctx_installer.PRESENCE_NOT_PRESENT)
+
+    def failing_install(run=None):
+        raise RuntimeError("npm not found")
+
+    monkeypatch.setattr(lean_ctx_installer, "install_for_platform", failing_install)
+
+    resp = client.post("/api/lean-ctx-install")
+
+    assert resp.json() == {"ok": False, "error": "npm not found"}
+
+
+def test_lean_ctx_install_status_reflects_live_output_lines(client, monkeypatch):
+    """The install endpoint routes `lean_ctx_installer.install_for_platform`
+    through a `run` that streams live subprocess output into
+    `_lean_ctx_install_lines` -- `/api/lean-ctx-install-status` must expose
+    exactly what got streamed, so the UI can show real npm output instead
+    of a static "please wait" message."""
+    monkeypatch.setattr(lean_ctx_installer, "check_lean_ctx_presence", lambda: lean_ctx_installer.PRESENCE_NOT_PRESENT)
+    monkeypatch.setattr(app_module, "_enable_lean_ctx", lambda: None)
+
+    def fake_run_streaming(argv, *, on_line=None, popen_factory=None):
+        on_line("npm warn deprecated ...")
+        on_line("added 8 packages in 3s")
+
+    monkeypatch.setattr(lean_ctx_installer, "run_streaming", fake_run_streaming)
+
+    resp = client.post("/api/lean-ctx-install")
+    assert resp.json() == {"ok": True}
+
+    status = client.get("/api/lean-ctx-install-status").json()
+    assert status["lines"] == ["npm warn deprecated ...", "added 8 packages in 3s"]
+
+
+def test_lean_ctx_install_status_lines_reset_on_a_new_install(client, monkeypatch):
+    """A fresh install call must start from an empty log, not append onto
+    whatever a previous (possibly failed) install left behind."""
+    monkeypatch.setattr(lean_ctx_installer, "check_lean_ctx_presence", lambda: lean_ctx_installer.PRESENCE_NOT_PRESENT)
+    monkeypatch.setattr(app_module, "_enable_lean_ctx", lambda: None)
+
+    calls = {"n": 0}
+
+    def fake_run_streaming(argv, *, on_line=None, popen_factory=None):
+        calls["n"] += 1
+        on_line(f"run {calls['n']}")
+
+    monkeypatch.setattr(lean_ctx_installer, "run_streaming", fake_run_streaming)
+
+    client.post("/api/lean-ctx-install")
+    client.post("/api/lean-ctx-install")
+
+    status = client.get("/api/lean-ctx-install-status").json()
+    assert status["lines"] == ["run 2"]
+
+
+# ---------------------------------------------------------------------------
+# lean-ctx savings widget/modal backend (issue #234, part of PRD #232)
+# ---------------------------------------------------------------------------
+
+
+def test_lean_ctx_savings_returns_data_shape_when_command_succeeds_with_data(client, monkeypatch):
+    """A successful `lean-ctx gain --json` run with real data is passed
+    through as `{"available": True, "empty": False, **parsed_json}` --
+    the frontend (issues #235/#236) consumes lean-ctx's own field names
+    as-is rather than a reshaped guess, same contract as `headroom_savings`."""
+    payload = {
+        "windows": {
+            "today": {"tokens_saved": 12000, "tokens_total": 20000, "percent": 60.0},
+            "last_7_days": {"tokens_saved": 40000, "tokens_total": 65000, "percent": 61.5},
+            "last_30_days": {"tokens_saved": 90000, "tokens_total": 150000, "percent": 60.0},
+        },
+        "by_command": [
+            {"command": "ctx_read", "tokens_saved": 30000},
+            {"command": "ctx_search", "tokens_saved": 15000},
+        ],
+        "by_source": [
+            {"source": "mcp", "tokens_saved": 35000},
+            {"source": "shell_hook", "tokens_saved": 10000},
+        ],
+    }
+    monkeypatch.setattr(app_module, "_run_lean_ctx_savings_command", lambda: json.dumps(payload))
+
+    data = client.get("/api/lean-ctx-savings").json()
+
+    assert data == {"available": True, "empty": False, **payload}
+
+
+def test_lean_ctx_savings_reports_distinct_empty_shape_when_ledger_has_no_data(client, monkeypatch):
+    """A fresh install with no compressions recorded yet must be reported
+    as `{"available": True, "empty": True}` -- distinct from both a
+    working dashboard and a broken/missing command."""
+    payload = {
+        "windows": {
+            "today": {"tokens_saved": 0, "tokens_total": 0, "percent": 0},
+            "last_7_days": {"tokens_saved": 0, "tokens_total": 0, "percent": 0},
+            "last_30_days": {"tokens_saved": 0, "tokens_total": 0, "percent": 0},
+        },
+        "by_command": [],
+        "by_source": [],
+    }
+    monkeypatch.setattr(app_module, "_run_lean_ctx_savings_command", lambda: json.dumps(payload))
+
+    data = client.get("/api/lean-ctx-savings").json()
+
+    assert data == {"available": True, "empty": True}
+
+
+def test_lean_ctx_savings_reports_empty_when_windows_breakdown_is_entirely_absent(client, monkeypatch):
+    """Defensive parsing: even if the payload doesn't carry a `windows` key
+    at all, a payload with no "tokens saved"-shaped field anywhere is still
+    treated as empty, not as unavailable or as a crash."""
+    monkeypatch.setattr(app_module, "_run_lean_ctx_savings_command", lambda: json.dumps({}))
+
+    data = client.get("/api/lean-ctx-savings").json()
+
+    assert data == {"available": True, "empty": True}
+
+
+def test_lean_ctx_savings_reports_unavailable_when_command_fails_to_run(client, monkeypatch):
+    """lean-ctx not installed (or genuinely broken) must surface as a
+    distinct `{"available": False}` shape -- never a 500 or an unhandled
+    exception bubbling out of the route."""
+
+    def fake_run():
+        raise FileNotFoundError("lean-ctx not found")
+
+    monkeypatch.setattr(app_module, "_run_lean_ctx_savings_command", fake_run)
+
+    resp = client.get("/api/lean-ctx-savings")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"available": False}
+
+
+def test_lean_ctx_savings_reports_unavailable_when_command_exits_nonzero(client, monkeypatch):
+    """A non-zero exit (lean-ctx installed but erroring) is the same
+    "unavailable" shape as not-installed."""
+
+    def fake_run():
+        raise subprocess.CalledProcessError(1, ["lean-ctx", "gain", "--json"])
+
+    monkeypatch.setattr(app_module, "_run_lean_ctx_savings_command", fake_run)
+
+    data = client.get("/api/lean-ctx-savings").json()
+
+    assert data == {"available": False}
+
+
+def test_lean_ctx_savings_reports_unavailable_when_output_is_not_valid_json(client, monkeypatch):
+    """Garbled/unparseable stdout must also degrade to "unavailable" rather
+    than raising out of the route."""
+    monkeypatch.setattr(app_module, "_run_lean_ctx_savings_command", lambda: "not json")
+
+    data = client.get("/api/lean-ctx-savings").json()
+
+    assert data == {"available": False}
+
+
+def test_lean_ctx_savings_runs_via_resolve_lean_ctx_command(monkeypatch):
+    """`_run_lean_ctx_savings_command` must resolve the CLI the same
+    PATH-safe way as the other lean-ctx call sites (`resolve_lean_ctx_
+    command()`), not a bare `"lean-ctx"`, and invoke `gain --json`."""
+    monkeypatch.setattr(lean_ctx_installer, "resolve_lean_ctx_command", lambda: "C:/fake/lean-ctx.CMD")
+
+    captured = {}
+
+    class FakeCompletedProcess:
+        stdout = '{"windows": {}}'
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return FakeCompletedProcess()
+
+    monkeypatch.setattr(app_module.subprocess, "run", fake_run)
+
+    result = app_module._run_lean_ctx_savings_command()
+
+    assert captured["argv"] == ["C:/fake/lean-ctx.CMD", "gain", "--json"]
+    assert captured["kwargs"]["check"] is True
+    assert result == '{"windows": {}}'

@@ -94,7 +94,7 @@ import subprocess
 from collections.abc import AsyncIterator
 from typing import Protocol
 
-from rhubarb.cli_client import _clean_env, _effort_args, _isolated_process_group, _plugin_args
+from rhubarb.cli_client import _clean_env, _effort_args, _isolated_process_group, _lean_ctx_args, _plugin_args
 
 
 class StreamJsonEngineError(RuntimeError):
@@ -263,6 +263,7 @@ class StreamJsonEngine:
             "--dangerously-skip-permissions",
         ]
         args += _plugin_args()
+        args += _lean_ctx_args()
         if self._is_resume and self.session_id:
             args += ["--resume", self.session_id]
         if self.model:
