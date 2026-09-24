@@ -1453,8 +1453,9 @@ async def continue_session_job(card_id: int, reply: str, *, cwd: str | None) -> 
 
 def _parse_qa_grilling_block(text: str) -> dict | None:
     """Extract the first JSON code block with phase=='qa_grilling' from a
-    CLI turn result, as emitted by the /qa skill Phase 2. Returns None when
-    no such block is found (normal /implement run without the /qa auto-handoff).
+    CLI turn result, as emitted by the /qa skill Phase 2. Called on the
+    result of `start_move_to_qa_job`'s own /rhubarb:qa turn to pull out the
+    {phase, prd} signal; returns None when no such block is found.
 
     Each candidate is run through `_rejoin_wrapped_json_strings` before
     `json.loads` -- see that function's docstring -- so a block that a
@@ -1518,14 +1519,25 @@ def _read_tracker_file(cwd: str | None) -> dict | None:
         return None
 
 
-def _launch_implement(conn, project_id: int, number: int, title: str, cwd: str | None) -> int:
+def _launch_implement(
+    conn, project_id: int, number: int, title: str, cwd: str | None, *, auto_start: bool = True
+) -> int:
     """Claim a pooled session (if any), create the session row, and fire the
-    background `/implement` job -- the shared plumbing behind both an
-    immediate PRD click and a queued PRD's turn coming up in serial mode.
+    background `/implement` job -- the shared plumbing behind an immediate
+    PRD click, a queued PRD's turn coming up in serial mode, an AFK fire, and
+    a post-error retry.
 
     A fresh implement session begins here -- read the currently configured
     model once, now, and record it on the new row so `start_implement_job`
-    (and any later retry of *this* row) uses it for the row's lifetime."""
+    (and any later retry of *this* row) uses it for the row's lifetime.
+
+    `auto_start=False` (used only by a manual "To be implemented" PRD click,
+    see `start_implementing` in app.py) creates the row in `awaiting_proceed`
+    instead of firing the job immediately -- the actual turn only starts once
+    the user clicks Proceed on the left card's banner (`start_pending_
+    implement`). Every other caller (queue drain, AFK, retry) keeps
+    `auto_start=True`'s original immediate-start behavior, since none of them
+    have a user present to click anything."""
     reused = db.claim_available_session(conn, project_id)
     resume_id = reused["claude_session_id"] if reused is not None else None
     model = db.get_model(conn)
@@ -1536,19 +1548,33 @@ def _launch_implement(conn, project_id: int, number: int, title: str, cwd: str |
         project_id,
         claude_session_id=resume_id,
         session_type="implement",
-        phase="implementing",
+        phase="implementing" if auto_start else "awaiting_proceed",
         details={"prd": {"number": number, "title": title}},
         model=model,
         effort=effort,
     )
 
-    asyncio.create_task(start_implement_job(row_id, number, cwd=cwd))
+    if auto_start:
+        asyncio.create_task(start_implement_job(row_id, number, cwd=cwd))
 
     return row_id
 
 
+async def start_pending_implement(card_id: int, *, cwd: str | None) -> None:
+    """Called from `POST .../start-implementing` once the user clicks
+    Proceed on a manually-clicked PRD sitting in `awaiting_proceed` --
+    flips the row to `implementing` and actually kicks off the `/implement`
+    turn that `_launch_implement(auto_start=False)` deferred."""
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    details = json.loads(row["details_json"]) if row["details_json"] else {}
+    prd_number = details["prd"]["number"]
+    db.update_session(conn, card_id, phase="implementing")
+    await start_implement_job(card_id, prd_number, cwd=cwd)
+
+
 async def start_or_queue_implement(
-    project_id: int, number: int, title: str, cwd: str | None, *, allow_queue: bool = True
+    project_id: int, number: int, title: str, cwd: str | None, *, allow_queue: bool = True, auto_start: bool = True
 ) -> dict:
     """Decide whether a clicked PRD starts implementing right away or, in
     serial mode with another implement session already live for this
@@ -1561,6 +1587,12 @@ async def start_or_queue_implement(
     up. A manually-clicked PRD (the default, `allow_queue=True`) is
     unaffected -- it still queues and drains as soon as the running session
     finishes.
+
+    `auto_start=False` passes through to `_launch_implement` -- see its
+    docstring. A queued PRD's eventual drain (`_drain_implement_queue`)
+    always uses the default `auto_start=True`, so once a manually-clicked
+    PRD's turn comes up from behind another running session, it starts
+    immediately rather than reintroducing a second Proceed step.
 
     `db.get_parallel_implementation`/`_implement_queues` remain the only
     concurrency policy: with it on, every PRD (this one included) starts
@@ -1578,7 +1610,7 @@ async def start_or_queue_implement(
         _enqueue_implement(project_id, number, title)
         return {"queued": True}
 
-    card_id = _launch_implement(conn, project_id, number, title, cwd)
+    card_id = _launch_implement(conn, project_id, number, title, cwd, auto_start=auto_start)
     return {"card_id": card_id}
 
 
@@ -1649,7 +1681,7 @@ async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None)
         # duplicate-call error itself; nothing more to do here.
         return
 
-    await _finish_implement_turn(card_id, conn, row, turn, cwd=cwd, model=model, effort=effort)
+    await _finish_implement_turn(card_id, conn, row, turn, cwd=cwd)
 
 
 # Issue #159: mirrors grilling's own corrective-retry prompt (see the
@@ -1924,7 +1956,7 @@ async def _extract_implementing_question(project_id: int, text: str) -> dict | N
     return parsed if parsed and parsed["questions"] else None
 
 
-async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: str | None, model, effort) -> None:
+async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: str | None) -> None:
     """Shared tail for both `start_implement_job`'s first turn and
     `continue_implement_job`'s resume turn: persist the turn's console
     text/context usage, check for the `implement_blocked` marker (leaving
@@ -1983,18 +2015,7 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
     # its enqueue) also covers the parallel per-issue implementation
     # sessions `/implement` can run concurrently -- they run through this
     # exact `_finish_implement_turn` tail, just N at once.
-    #
-    # Also skipped entirely when this turn's result carries a `qa_grilling`
-    # handoff marker (`_parse_qa_grilling_block`, checked below at its own
-    # existing call site) -- that marker is itself a legitimate, already-
-    # structured signal, and the QA-handoff logic further down (its own
-    # regex/rescue/corrective-retry chain, including issue #178's own
-    # `classify_needs_input` call on a genuine QA wrap-up) must get the
-    # first and only look at this turn's text. Classifying here first would
-    # otherwise intercept a real QA handoff before that logic ever runs.
-    classification = None
-    if _parse_qa_grilling_block(turn["full_text"]) is None:
-        classification = await handle_turn_completed(card_id, conn, row, turn["full_text"], "implementing")
+    classification = await handle_turn_completed(card_id, conn, row, turn["full_text"], "implementing")
     if classification is not None and classification.get("needs_input"):
         extracted = await _extract_implementing_question(row["project_id"], turn["full_text"])
         if extracted is not None:
@@ -2054,105 +2075,24 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
         details_json=json.dumps(details) if details is not None else None,
     )
 
-    qa_data = _parse_qa_grilling_block(turn["full_text"])
-    if qa_data is not None:
-        # /implement Phase 5 ran /qa, which replied with the nested
-        # "QA session for PRD N: ..." question format (see the qa-grilling
-        # skill and `_extract_qa_issues_via_skill` above) -- the
-        # qa_grilling JSON block itself is now just a lightweight signal
-        # ({phase, prd}) that this handoff happened; the actual issues/
-        # questions are parsed from the turn's own free text.
-        # Hand the session_id to the QA session instead of pooling it here
-        # -- this card's own tab is done; the new QA row's own tab starts
-        # fresh (reattached via --resume) on its own first turn.
-        qa_prd = qa_data.get("prd")
-        qa_file_text = read_question_file(cwd, _QA_QUESTION_FILE)
-        qa_parsed = (
-            await _extract_qa_issues_via_skill(row["project_id"], qa_file_text)
-            if qa_file_text is not None
-            else None
-        )
-        if qa_file_text is not None and (qa_parsed is None or not qa_parsed["issues"]):
-            # Present but unparseable -- never let a corrupt file wedge
-            # every future round; drop it and fall back to the terminal-text
-            # path below exactly as if it had never been written.
-            delete_question_file(cwd, _QA_QUESTION_FILE)
-            qa_parsed = None
-        if qa_parsed is None:
-            qa_parsed = await _extract_qa_issues_via_skill(row["project_id"], turn["full_text"])
-        if qa_parsed is None:
-            # Issue #230: the parser-session extraction pipeline is the sole
-            # extraction mechanism now -- no regex pre-check, no Ollama-
-            # rescue fallback. A failed/empty extraction here is treated
-            # exactly like a genuine "no issues yet" result; the suspicious-
-            # result corrective retry right below is what decides whether
-            # this is worth one more attempt.
-            qa_parsed = {"prd": None, "issues": []}
-
-        qa_turn = turn
-        if _qa_result_is_suspicious(qa_parsed, qa_file_text, turn["full_text"]):
-            # Issue #159: this round looks like it was genuinely trying to
-            # contain QA questions -- rather than silently treating this as
-            # "no more QA questions" (indistinguishable from a genuine
-            # wrap-up otherwise), give the model one corrective follow-up
-            # turn with its own unparseable output before giving up for
-            # real.
-            broken_text = qa_file_text if qa_file_text is not None else turn["full_text"]
-            retry_result = await _attempt_qa_corrective_retry(
-                card_id,
-                conn,
-                row,
-                broken_text=broken_text,
-                session_id=turn["session_id"],
-                cwd=cwd,
-                model=model,
-                effort=effort,
-            )
-            if retry_result is None:
-                # Already fully handled (explicit error published/persisted,
-                # engine closed, queue drained) -- see
-                # `_attempt_qa_corrective_retry`'s docstring.
-                return
-            qa_parsed, qa_turn = retry_result
-            retried_console_text = console_text + "\n\n" + qa_turn["full_text"]
-            db.update_session(conn, card_id, console_text=retried_console_text, context_pct=qa_turn.get("context_pct"))
-        elif not qa_parsed["issues"]:
-            # Issue #178: the chain concluded no QA questions without even
-            # attempting the corrective retry above (not suspicious) -- same
-            # last-resort Ollama needs-input check before treating this as a
-            # genuine "no more QA questions" wrap-up.
-            rescued_via_classifier = await _maybe_extract_needs_input_qa(card_id, conn, row, turn["full_text"])
-            if rescued_via_classifier is not None:
-                qa_parsed = rescued_via_classifier
-
-        qa_issues = qa_parsed["issues"]
-        qa_row_id = db.create_session(
-            conn,
-            row["project_id"],
-            claude_session_id=qa_turn["session_id"],
-            session_type="qa",
-            phase="qa_grilling",
-            details={"prd": qa_prd},
-            model=model,
-            effort=effort,
-        )
-        _close_stream_json_engine(card_id)
-        publish(card_id, {"type": "qa_started", "qa_card_id": qa_row_id})
-        publish(card_id, _turn_event(phase="implemented", details=details))
-        publish(card_id, {"type": "done"})
-        await _drain_implement_queue(row["project_id"], cwd)
-        asyncio.create_task(start_qa_job(qa_row_id, qa_prd, qa_issues, cwd=cwd))
-    else:
-        # See the matching comment in _auto_continue_implement_and_qa --
-        # model/effort here match a brand-new /do's own resolution, not
-        # this finishing implement session's own model/effort.
-        new_session_id = await _clear_for_reuse(
-            card_id, project_id=row["project_id"], cwd=cwd, model=db.get_model(conn), effort=db.DEFAULT_EFFORT
-        )
-        db.mark_session_available(conn, card_id, new_session_id)
-        publish(card_id, _turn_event(phase="implemented", details=details))
-        publish(card_id, {"type": "done"})
-        await _drain_implement_queue(row["project_id"], cwd)
+    # Issue #250 (child of PRD #244): every implement turn that completes
+    # cleanly now always takes this plain "implemented" path -- QA never
+    # starts on its own, even when this turn's text happens to contain a
+    # qa_grilling-shaped block (the old auto-spawn branch keyed on
+    # `_parse_qa_grilling_block(turn["full_text"])` is retired). QA only
+    # ever starts via the explicit "Move to QA phase" action
+    # (`start_move_to_qa_job` below).
+    #
+    # See the matching comment in _auto_continue_implement_and_qa --
+    # model/effort here match a brand-new /do's own resolution, not
+    # this finishing implement session's own model/effort.
+    new_session_id = await _clear_for_reuse(
+        card_id, project_id=row["project_id"], cwd=cwd, model=db.get_model(conn), effort=db.DEFAULT_EFFORT
+    )
+    db.mark_session_available(conn, card_id, new_session_id)
+    publish(card_id, _turn_event(phase="implemented", details=details))
+    publish(card_id, {"type": "done"})
+    await _drain_implement_queue(row["project_id"], cwd)
 
 
 async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -> None:
@@ -2212,13 +2152,156 @@ async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -
         return
 
     row = db.get_session(conn, card_id)
-    await _finish_implement_turn(card_id, conn, row, turn, cwd=cwd, model=model, effort=effort)
+    await _finish_implement_turn(card_id, conn, row, turn, cwd=cwd)
+
+
+async def start_move_to_qa_job(card_id: int, *, cwd: str | None) -> None:
+    """Started by POST /api/sessions/{card_id}/move-to-qa (issue #250, child
+    of PRD #244) -- the sole way a QA session starts now, replacing the old
+    implicit auto-handoff that used to run inline at the end of a matching
+    implement turn (see `_finish_implement_turn`, which no longer starts QA
+    on its own). Closes the finished implement session's engine and card
+    outright (`close_session`, no `--resume`) and creates a brand-new
+    `session_type="qa"` row with no prior `claude_session_id`, then runs
+    `/rhubarb:qa` as that new engine's very first turn -- a genuinely fresh
+    conversation, relying on `/rhubarb:qa` Phase 1's own read of
+    `.claude/implement-tracker.json` to reconstruct the PRD/issues/
+    acceptance criteria (no conversation memory needed).
+
+    Parses that first turn's result via the exact same chain the retired
+    auto-handoff branch used (`_parse_qa_grilling_block` for the {phase,
+    prd} signal, `_extract_qa_issues_via_skill` / `_qa_result_is_suspicious`
+    / `_attempt_qa_corrective_retry` / `_maybe_extract_needs_input_qa` for
+    the nested issues/questions), then publishes the qa_grilling turn event
+    via `start_qa_job` so the new row surfaces in the session queue exactly
+    like it always has."""
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    model = row["model"]
+    effort = row["effort"]
+
+    _close_stream_json_engine(card_id)
+
+    qa_row_id = db.create_session(
+        conn,
+        row["project_id"],
+        claude_session_id=None,
+        session_type="qa",
+        phase="qa_grilling",
+        model=model,
+        effort=effort,
+    )
+    close_session(conn, card_id)
+
+    try:
+        turn = await _run_stream_json_turn(
+            qa_row_id, "/rhubarb:qa", session_id=None, cwd=cwd, model=model, effort=effort,
+            phase="qa_grilling",
+        )
+    except StreamJsonEngineUnrecoverableError as e:
+        await _route_crash_to_blocked(qa_row_id, conn, e, phase="qa_grilling")
+        return
+    except ClaudeCLIError as e:
+        _close_stream_json_engine(qa_row_id)
+        message = str(e)
+        needs_login = 1 if _is_gh_auth_failure(message) else 0
+        db.update_session(conn, qa_row_id, error_text=message, needs_github_login=needs_login)
+        publish(
+            qa_row_id,
+            _turn_event(
+                phase="qa_grilling",
+                error=message,
+                needs_github_login=bool(needs_login),
+                card_id=qa_row_id,
+                project_id=row["project_id"],
+            ),
+        )
+        publish(qa_row_id, {"type": "done"})
+        add_error_notification(row["project_id"], qa_row_id, "qa_grilling", message)
+        return
+
+    if turn is None:
+        # Issue #144/#149: a genuine turn for this card_id is already in
+        # flight -- `_run_stream_json_turn` already published the
+        # duplicate-call error itself; nothing more to do here. Can't
+        # actually happen for a card_id this function just created, but
+        # matches every other `_run_stream_json_turn` call site.
+        return
+
+    db.update_session(conn, qa_row_id, console_text=turn["full_text"], context_pct=turn.get("context_pct"))
+
+    qa_data = _parse_qa_grilling_block(turn["full_text"])
+    qa_prd = qa_data.get("prd") if qa_data is not None else None
+
+    qa_file_text = read_question_file(cwd, _QA_QUESTION_FILE)
+    qa_parsed = (
+        await _extract_qa_issues_via_skill(row["project_id"], qa_file_text)
+        if qa_file_text is not None
+        else None
+    )
+    if qa_file_text is not None and (qa_parsed is None or not qa_parsed["issues"]):
+        # Present but unparseable -- never let a corrupt file wedge every
+        # future round; drop it and fall back to the terminal-text path
+        # below exactly as if it had never been written.
+        delete_question_file(cwd, _QA_QUESTION_FILE)
+        qa_parsed = None
+    if qa_parsed is None:
+        qa_parsed = await _extract_qa_issues_via_skill(row["project_id"], turn["full_text"])
+    if qa_parsed is None:
+        qa_parsed = {"prd": None, "issues": []}
+
+    qa_row = db.get_session(conn, qa_row_id)
+    qa_turn = turn
+    if _qa_result_is_suspicious(qa_parsed, qa_file_text, turn["full_text"]):
+        # Issue #159: this round looks like it was genuinely trying to
+        # contain QA questions -- rather than silently treating this as "no
+        # more QA questions" (indistinguishable from a genuine wrap-up
+        # otherwise), give the model one corrective follow-up turn with its
+        # own unparseable output before giving up for real.
+        broken_text = qa_file_text if qa_file_text is not None else turn["full_text"]
+        retry_result = await _attempt_qa_corrective_retry(
+            qa_row_id,
+            conn,
+            qa_row,
+            broken_text=broken_text,
+            session_id=turn["session_id"],
+            cwd=cwd,
+            model=model,
+            effort=effort,
+        )
+        if retry_result is None:
+            # Already fully handled (explicit error published/persisted,
+            # engine closed) -- see `_attempt_qa_corrective_retry`'s
+            # docstring.
+            return
+        qa_parsed, qa_turn = retry_result
+        retried_console_text = turn["full_text"] + "\n\n" + qa_turn["full_text"]
+        db.update_session(conn, qa_row_id, console_text=retried_console_text, context_pct=qa_turn.get("context_pct"))
+    elif not qa_parsed["issues"]:
+        # Issue #178: the chain concluded no QA questions without even
+        # attempting the corrective retry above (not suspicious) -- same
+        # last-resort Ollama needs-input check before treating this as a
+        # genuine "no more QA questions" wrap-up.
+        rescued_via_classifier = await _maybe_extract_needs_input_qa(qa_row_id, conn, qa_row, turn["full_text"])
+        if rescued_via_classifier is not None:
+            qa_parsed = rescued_via_classifier
+
+    if qa_prd is None:
+        qa_prd = qa_parsed.get("prd")
+
+    db.update_session(
+        conn,
+        qa_row_id,
+        claude_session_id=qa_turn["session_id"],
+        details_json=json.dumps({"prd": qa_prd}),
+    )
+    await start_qa_job(qa_row_id, qa_prd, qa_parsed["issues"], cwd=cwd)
 
 
 async def start_qa_job(card_id: int, prd: dict | None, issues: list[dict], *, cwd: str | None) -> None:
-    """Publish the qa_grilling turn event for a QA session created by the
-    /implement auto-handoff. `prd`/`issues` were already parsed from the
-    implement turn's result (the qa_grilling JSON marker for `prd`,
+    """Publish the qa_grilling turn event for a QA session created by
+    `start_move_to_qa_job`. `prd`/`issues` were already parsed from the
+    /rhubarb:qa turn's result (the qa_grilling JSON marker for `prd`,
     `_extract_qa_issues_via_skill` for the nested `issues`/
     `questions`); emit them and leave the session suspended (no 'done')
     until POST /api/session/qa-complete is called."""

@@ -1004,6 +1004,15 @@ textarea.prompt-box:focus {
   transform: translateY(-1px);
 }
 
+@keyframes session-card-glow-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 hsla(var(--card-hue, 210), 70%, 55%, 0.45); }
+  50% { box-shadow: 0 0 0 8px hsla(var(--card-hue, 210), 70%, 55%, 0); }
+}
+
+.session-card-glow {
+  animation: session-card-glow-pulse 2.2s ease-in-out infinite;
+}
+
 .session-card-close {
   flex: 0 0 auto;
   width: 36px;
@@ -1109,19 +1118,30 @@ textarea.prompt-box:focus {
   border: 1px solid var(--glass-border);
   border-radius: 16px;
   padding: 14px 16px;
-  margin: 0 0 20px;
+  margin: 0 0 12px;
   text-align: left;
 }
 
 .implementing-banner-text {
   font-size: 0.85rem;
-  margin: 0 0 12px;
+  margin: 0;
   color: #fff;
   overflow-wrap: anywhere;
 }
 
+.implementing-banner-actions {
+  display: flex;
+  gap: 10px;
+  margin: 0 0 20px;
+}
+
 .implementing-banner-btn {
   width: auto;
+}
+
+.move-to-qa-btn {
+  width: auto;
+  margin: 8px 0 0;
 }
 
 .session-error {
@@ -1135,6 +1155,10 @@ textarea.prompt-box:focus {
   display: flex;
   gap: 10px;
   margin-top: 16px;
+}
+
+.session-error-actions[hidden] {
+  display: none;
 }
 
 .session-error-actions .glass-btn {

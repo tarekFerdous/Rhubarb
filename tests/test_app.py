@@ -1016,6 +1016,55 @@ def test_sessions_list_excludes_a_closed_session(client, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Move-to-QA endpoint (issue #250, child of PRD #244): the sole way a QA
+# session starts now, replacing the retired implicit implement->QA
+# auto-handoff.
+# ---------------------------------------------------------------------------
+
+
+def test_move_to_qa_endpoint_dispatches_for_a_finished_implement_session(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id, session_type="implement", phase="implemented")
+
+    async def _noop_job(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(app_module.session_runner, "start_move_to_qa_job", _noop_job)
+    resp = client.post(f"/api/sessions/{card_id}/move-to-qa")
+
+    assert resp.json() == {"card_id": card_id}
+
+
+def test_move_to_qa_endpoint_rejects_unknown_session(client):
+    resp = client.post("/api/sessions/999999/move-to-qa")
+    assert resp.json() == {"error": "Session not found"}
+
+
+def test_move_to_qa_endpoint_rejects_a_non_implement_session(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id, session_type="qa", phase="qa_grilling")
+
+    resp = client.post(f"/api/sessions/{card_id}/move-to-qa")
+
+    assert resp.json() == {"error": "Session is not a finished implementation"}
+
+
+def test_move_to_qa_endpoint_rejects_an_implement_session_not_yet_implemented(client, tmp_path):
+    project_id = _open_project(client, tmp_path, "proj")
+
+    conn = db.get_connection()
+    card_id = db.create_session(conn, project_id, session_type="implement", phase="implementing")
+
+    resp = client.post(f"/api/sessions/{card_id}/move-to-qa")
+
+    assert resp.json() == {"error": "Session is not a finished implementation"}
+
+
+# ---------------------------------------------------------------------------
 # Stall-reply endpoint (issue #169, child of PRD #168 "Recover from a
 # stalled turn instead of hanging the turn lock forever"; issue #225 changed
 # every resume path to a genuinely new turn -- there is no raw keystroke

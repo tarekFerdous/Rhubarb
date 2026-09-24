@@ -2469,10 +2469,12 @@ Some preamble text.
 ```"""
 
 
-def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(client, tmp_path, monkeypatch):
-    """When /implement Phase 5 runs /qa and the result includes the qa_grilling
-    JSON block, start_implement_job must create a new 'qa' session row, fire
-    qa_started on the implement stream, and NOT pool the implement session."""
+def test_finish_implement_turn_never_auto_spawns_qa_even_with_qa_grilling_block(client, tmp_path, monkeypatch):
+    """Issue #250 (child of PRD #244): an implement turn that completes
+    cleanly always takes the plain "implemented" path now -- no automatic
+    QA handoff occurs even when the turn's text happens to contain a
+    qa_grilling-shaped block. QA only ever starts via the explicit
+    "Move to QA phase" action (`start_move_to_qa_job`)."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
 
@@ -2493,7 +2495,7 @@ def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(c
         'Question 1: "Does it work?"\n'
         'Recommended text: "Yes."\n'
     )
-    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(qa_turn_text, session_id="qa-session-id")]))
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(qa_turn_text, session_id="impl-session-id")]))
     _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
 
     conn = db.get_connection()
@@ -2505,12 +2507,69 @@ def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(c
 
     asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
 
-    # Implement session ends implemented, NOT pooled
+    # Implement session ends implemented and pooled -- exactly like a turn
+    # with no qa_grilling-shaped text at all.
     impl_row = db.get_session(conn, row_id)
     assert impl_row["phase"] == "implemented"
-    assert impl_row["available_for_reuse"] == 0
+    assert impl_row["available_for_reuse"] == 1
 
-    # A QA session row was created
+    # No QA session was ever created.
+    sessions = db.list_sessions_for_project(conn, project_id)
+    assert not [s for s in sessions if s["session_type"] == "qa"]
+
+    impl_events = live_stream._buffers.get(row_id, [])
+    assert not [e for e in impl_events if e.get("type") == "qa_started"]
+    assert impl_events[-1] == {"type": "done"}
+
+
+def test_start_move_to_qa_job_creates_fresh_session_and_runs_qa_as_first_turn(client, tmp_path, monkeypatch):
+    """Issue #250 (child of PRD #244): the explicit "Move to QA phase"
+    action closes the finished implement session's card outright (no
+    --resume) and runs /rhubarb:qa as a brand-new session's very first
+    turn, publishing the parsed qa_grilling round on the new row exactly
+    like the old auto-handoff used to."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _qa_tracker(cwd)
+
+    qa_turn_text = (
+        _QA_BLOCK + "\n\n"
+        'QA session for PRD 7: "Tracked PRD"\n\n'
+        'Issue 8: "Child"\n'
+        'Question 1: "Does it work?"\n'
+        'Recommended text: "Yes."\n'
+    )
+    seen = []
+
+    def handler(prompt, **kw):
+        seen.append((prompt, kw["session_id"]))
+        return iter([_result_event(qa_turn_text, session_id="qa-session-id")])
+
+    _mock_engine(monkeypatch, handler)
+    _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
+
+    conn = db.get_connection()
+    row_id = db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implemented",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+        claude_session_id="old-implement-session-id",
+    )
+
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
+
+    # The first (and only) turn was exactly "/rhubarb:qa", with no
+    # --resume -- a genuinely fresh conversation.
+    assert seen == [("/rhubarb:qa", None)]
+
+    # The old implement card is closed outright.
+    impl_row = db.get_session(conn, row_id)
+    assert impl_row["phase"] == "closed"
+    impl_events = live_stream._buffers.get(row_id, [])
+    assert {"type": "closed", "card_id": row_id} in impl_events
+    assert row_id not in session_runner._stream_json_engines
+
+    # A brand-new QA session row was created.
     sessions = db.list_sessions_for_project(conn, project_id)
     qa_sessions = [s for s in sessions if s["session_type"] == "qa"]
     assert len(qa_sessions) == 1
@@ -2518,16 +2577,6 @@ def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(c
     assert qa_row["phase"] == "qa_grilling"
     assert qa_row["claude_session_id"] == "qa-session-id"
     assert json.loads(qa_row["details_json"])["prd"] == {"number": 7, "title": "Tracked PRD"}
-
-    # qa_started event published on implement stream before done
-    impl_events = live_stream._buffers.get(row_id, [])
-    qa_started_events = [e for e in impl_events if e.get("type") == "qa_started"]
-    assert len(qa_started_events) == 1
-    assert qa_started_events[0]["qa_card_id"] == qa_row["id"]
-    assert impl_events[-1] == {"type": "done"}
-
-    # The implement card's own tab is closed -- the new QA row starts fresh.
-    assert row_id not in session_runner._stream_json_engines
 
     # The nested issues/questions structure was extracted from the turn's
     # free text via the parser-session pipeline
@@ -2546,22 +2595,13 @@ def test_start_implement_job_triggers_qa_session_when_result_contains_qa_block(c
     ]
 
 
-def test_start_implement_job_prefers_rhubarb_qa_file_over_terminal_text(client, tmp_path, monkeypatch):
+def test_start_move_to_qa_job_prefers_rhubarb_qa_file_over_terminal_text(client, tmp_path, monkeypatch):
     """PRD #123: a QA handoff turn whose terminal text has no recognizable
     QA session block still produces a full issues/questions structure when
     `.claude/rhubarb_qa.md` is present with valid content."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
-
-    tracker = {
-        "prd": {"number": 7, "title": "Tracked PRD"},
-        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
-        "qa_changes": [],
-        "status": "implemented",
-    }
-    claude_dir = Path(cwd) / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+    _qa_tracker(cwd)
     _write_question_file(
         cwd, "rhubarb_qa.md",
         'QA session for PRD 7: "Tracked PRD"\n\nIssue 8: "Child"\nQuestion 1: "Does it work?"\nRecommended text: "Yes."\n',
@@ -2573,10 +2613,10 @@ def test_start_implement_job_prefers_rhubarb_qa_file_over_terminal_text(client, 
 
     conn = db.get_connection()
     row_id = db.create_session(
-        conn, project_id, session_type="implement", phase="implementing",
+        conn, project_id, session_type="implement", phase="implemented",
         details={"prd": {"number": 7, "title": "Tracked PRD"}},
     )
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
 
     sessions = db.list_sessions_for_project(conn, project_id)
     qa_row = next(s for s in sessions if s["session_type"] == "qa")
@@ -2591,18 +2631,10 @@ def test_start_implement_job_prefers_rhubarb_qa_file_over_terminal_text(client, 
     ]
 
 
-def test_rhubarb_qa_file_is_not_deleted_merely_by_being_read(client, tmp_path, monkeypatch):
+def test_start_move_to_qa_job_rhubarb_qa_file_is_not_deleted_merely_by_being_read(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
-
-    tracker = {
-        "prd": {"number": 7, "title": "Tracked PRD"},
-        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
-        "qa_changes": [], "status": "implemented",
-    }
-    claude_dir = Path(cwd) / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+    _qa_tracker(cwd)
     _write_question_file(cwd, "rhubarb_qa.md", 'QA session for PRD 7: "Tracked PRD"\n\nIssue 8: "Child"\nQuestion 1: "Does it work?"\n')
 
     _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(_QA_BLOCK, session_id="qa-session-id")]))
@@ -2610,10 +2642,10 @@ def test_rhubarb_qa_file_is_not_deleted_merely_by_being_read(client, tmp_path, m
 
     conn = db.get_connection()
     row_id = db.create_session(
-        conn, project_id, session_type="implement", phase="implementing",
+        conn, project_id, session_type="implement", phase="implemented",
         details={"prd": {"number": 7, "title": "Tracked PRD"}},
     )
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
 
     assert (Path(cwd) / ".claude" / "rhubarb_qa.md").exists()
 
@@ -2635,18 +2667,10 @@ def test_continue_qa_job_deletes_rhubarb_qa_file(client, tmp_path, monkeypatch):
     assert not (Path(cwd) / ".claude" / "rhubarb_qa.md").exists()
 
 
-def test_malformed_rhubarb_qa_file_is_deleted_and_falls_back_to_terminal_text(client, tmp_path, monkeypatch):
+def test_start_move_to_qa_job_malformed_rhubarb_qa_file_falls_back_to_terminal_text(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
-
-    tracker = {
-        "prd": {"number": 7, "title": "Tracked PRD"},
-        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
-        "qa_changes": [], "status": "implemented",
-    }
-    claude_dir = Path(cwd) / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+    _qa_tracker(cwd)
     _write_question_file(cwd, "rhubarb_qa.md", "not a recognizable QA session format at all")
 
     qa_turn_text = (
@@ -2660,10 +2684,10 @@ def test_malformed_rhubarb_qa_file_is_deleted_and_falls_back_to_terminal_text(cl
 
     conn = db.get_connection()
     row_id = db.create_session(
-        conn, project_id, session_type="implement", phase="implementing",
+        conn, project_id, session_type="implement", phase="implemented",
         details={"prd": {"number": 7, "title": "Tracked PRD"}},
     )
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
 
     sessions = db.list_sessions_for_project(conn, project_id)
     qa_row = next(s for s in sessions if s["session_type"] == "qa")
@@ -2673,7 +2697,7 @@ def test_malformed_rhubarb_qa_file_is_deleted_and_falls_back_to_terminal_text(cl
     assert not (Path(cwd) / ".claude" / "rhubarb_qa.md").exists()
 
 
-def test_start_implement_job_qa_extraction_ignores_ollama_declined_setting(client, tmp_path, monkeypatch):
+def test_start_move_to_qa_job_qa_extraction_ignores_ollama_declined_setting(client, tmp_path, monkeypatch):
     """Issue #230: the QA-grilling extraction chain no longer has any
     Ollama-rescue step at all, so `ollama_declined` (issue #119's opt-out,
     which used to gate that rescue call) has no effect on it any more -- a
@@ -2686,16 +2710,7 @@ def test_start_implement_job_qa_extraction_ignores_ollama_declined_setting(clien
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
-
-    tracker = {
-        "prd": {"number": 7, "title": "Tracked PRD"},
-        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
-        "qa_changes": [],
-        "status": "implemented",
-    }
-    claude_dir = Path(cwd) / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+    _qa_tracker(cwd)
 
     qa_turn_text = (
         _QA_BLOCK + "\n\n"
@@ -2709,11 +2724,11 @@ def test_start_implement_job_qa_extraction_ignores_ollama_declined_setting(clien
     db.set_ollama_declined(conn, True)
     row_id = db.create_session(
         conn, project_id,
-        session_type="implement", phase="implementing",
+        session_type="implement", phase="implemented",
         details={"prd": {"number": 7, "title": "Tracked PRD"}},
     )
 
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
 
     sessions = db.list_sessions_for_project(conn, project_id)
     qa_row = next(s for s in sessions if s["session_type"] == "qa")
@@ -2729,7 +2744,7 @@ def test_start_implement_job_qa_extraction_ignores_ollama_declined_setting(clien
 # ---------------------------------------------------------------------------
 
 
-def test_qa_corrective_retry_fires_once_and_uses_reformatted_result(client, tmp_path, monkeypatch):
+def test_move_to_qa_corrective_retry_fires_once_and_uses_reformatted_result(client, tmp_path, monkeypatch):
     """A QA handoff turn whose result contains recognizable QA-question-
     attempt content (the "QA session for PRD" trigger) but doesn't extract
     into any issues must trigger exactly one corrective follow-up turn --
@@ -2738,16 +2753,7 @@ def test_qa_corrective_retry_fires_once_and_uses_reformatted_result(client, tmp_
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     _mock_parser_session_autoextract(monkeypatch, project_id, cwd)
-
-    tracker = {
-        "prd": {"number": 7, "title": "Tracked PRD"},
-        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
-        "qa_changes": [],
-        "status": "implemented",
-    }
-    claude_dir = Path(cwd) / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+    _qa_tracker(cwd)
 
     malformed_qa_text = _QA_BLOCK + "\n\nQA session for PRD 7: this is malformed, no quoted title at all\n"
     well_formed_retry_text = (
@@ -2768,11 +2774,11 @@ def test_qa_corrective_retry_fires_once_and_uses_reformatted_result(client, tmp_
     conn = db.get_connection()
     row_id = db.create_session(
         conn, project_id,
-        session_type="implement", phase="implementing",
+        session_type="implement", phase="implemented",
         details={"prd": {"number": 7, "title": "Tracked PRD"}},
     )
 
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
 
     # Exactly one corrective retry -- the initial handoff turn, plus one
     # follow-up, and no more.
@@ -2788,7 +2794,7 @@ def test_qa_corrective_retry_fires_once_and_uses_reformatted_result(client, tmp_
     assert qa_turn_events[0]["issues"][0]["questions"][0]["text"] == "Does the reformatted round parse now?"
 
 
-def test_qa_no_retry_when_result_has_no_recognizable_qa_content(client, tmp_path, monkeypatch):
+def test_move_to_qa_no_retry_when_result_has_no_recognizable_qa_content(client, tmp_path, monkeypatch):
     """A genuine 'no QA questions' handoff -- the qa_grilling JSON marker is
     present, but neither the (nonexistent) question file nor the terminal
     text contains anything resembling a QA session round -- must NOT trigger
@@ -2796,16 +2802,7 @@ def test_qa_no_retry_when_result_has_no_recognizable_qa_content(client, tmp_path
     session is still created with an empty issues list."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
-
-    tracker = {
-        "prd": {"number": 7, "title": "Tracked PRD"},
-        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
-        "qa_changes": [],
-        "status": "implemented",
-    }
-    claude_dir = Path(cwd) / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+    _qa_tracker(cwd)
 
     seen_prompts = []
 
@@ -2820,11 +2817,11 @@ def test_qa_no_retry_when_result_has_no_recognizable_qa_content(client, tmp_path
     conn = db.get_connection()
     row_id = db.create_session(
         conn, project_id,
-        session_type="implement", phase="implementing",
+        session_type="implement", phase="implemented",
         details={"prd": {"number": 7, "title": "Tracked PRD"}},
     )
 
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
 
     # No corrective retry -- only the original handoff turn.
     assert len(seen_prompts) == 1
@@ -2832,33 +2829,24 @@ def test_qa_no_retry_when_result_has_no_recognizable_qa_content(client, tmp_path
     sessions = db.list_sessions_for_project(conn, project_id)
     qa_row = next(s for s in sessions if s["session_type"] == "qa")
     assert qa_row["claude_session_id"] == "qa-session-id"
+    assert qa_row["error_text"] is None
     qa_events = live_stream._buffers.get(qa_row["id"], [])
     qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
     assert qa_turn_events[0]["issues"] == []
 
-    impl_row = db.get_session(conn, row_id)
-    assert impl_row["error_text"] is None
 
-
-def test_qa_corrective_retry_publishes_explicit_error_when_still_unparseable(client, tmp_path, monkeypatch):
+def test_move_to_qa_corrective_retry_publishes_explicit_error_when_still_unparseable(client, tmp_path, monkeypatch):
     """If the corrective retry's own result also fails to parse, an explicit
-    error must be published/persisted (and land in the app-wide error log)
-    instead of silently falling through to a QA session with empty issues."""
+    error must be published/persisted on the new QA row (and land in the
+    app-wide error log) instead of silently handing off with empty issues.
+    The old implement card is already closed by this point, so the QA row
+    -- not the implement row -- is where this error now lands."""
     log_path = tmp_path / "err-home" / "logs" / "errors.log"
     monkeypatch.setattr(error_log, "DEFAULT_LOG_PATH", log_path)
 
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
-
-    tracker = {
-        "prd": {"number": 7, "title": "Tracked PRD"},
-        "issues": [{"number": 8, "title": "Child", "summary": "does the thing", "acceptance_criteria": ["works"]}],
-        "qa_changes": [],
-        "status": "implemented",
-    }
-    claude_dir = Path(cwd) / ".claude"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
+    _qa_tracker(cwd)
 
     malformed_qa_text = _QA_BLOCK + "\n\nQA session for PRD 7: this is malformed, no quoted title at all\n"
     still_malformed_retry_text = "QA session for PRD 7: still no quoted title, still broken\n"
@@ -2875,34 +2863,30 @@ def test_qa_corrective_retry_publishes_explicit_error_when_still_unparseable(cli
     conn = db.get_connection()
     row_id = db.create_session(
         conn, project_id,
-        session_type="implement", phase="implementing",
+        session_type="implement", phase="implemented",
         details={"prd": {"number": 7, "title": "Tracked PRD"}},
     )
 
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
 
     # Exactly one corrective retry -- not an unbounded loop.
     assert len(seen_prompts) == 2
 
-    # No QA session was created -- the broken handoff is not silently
-    # passed through.
+    # The QA row still exists (created before the /rhubarb:qa turn ran),
+    # but carries the explicit error instead of a parsed qa_grilling round.
     sessions = db.list_sessions_for_project(conn, project_id)
-    assert not [s for s in sessions if s["session_type"] == "qa"]
+    qa_row = next(s for s in sessions if s["session_type"] == "qa")
+    assert qa_row["error_text"]
 
-    # The explicit error landed on the implement card's own stream.
-    impl_events = live_stream._buffers.get(row_id, [])
+    qa_events = live_stream._buffers.get(qa_row["id"], [])
     error_turn_events = [
-        e for e in impl_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling" and e.get("error")
+        e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling" and e.get("error")
     ]
     assert len(error_turn_events) == 1
-    assert impl_events[-1] == {"type": "done"}
-
-    # Persisted on the row, and landed in the app-wide error log too.
-    impl_row = db.get_session(conn, row_id)
-    assert impl_row["error_text"]
+    assert qa_events[-1] == {"type": "done"}
 
     errors = error_log.query_errors(project_id, log_path=log_path)
-    assert any(e["phase"] == "qa_grilling" and e["card_id"] == row_id for e in errors)
+    assert any(e["phase"] == "qa_grilling" and e["card_id"] == qa_row["id"] for e in errors)
 
 
 # ---------------------------------------------------------------------------
@@ -2924,7 +2908,7 @@ def _qa_tracker(cwd):
     (claude_dir / "implement-tracker.json").write_text(json.dumps(tracker), encoding="utf-8")
 
 
-def test_qa_needs_input_classification_renders_rich_ui_on_genuine_wrapup(client, tmp_path, monkeypatch):
+def test_move_to_qa_needs_input_classification_renders_rich_ui_on_genuine_wrapup(client, tmp_path, monkeypatch):
     """A QA handoff round that looks like a genuine "no more QA questions"
     wrap-up (no "QA session for PRD" trigger at all, so the existing chain
     never even attempts a corrective retry) must still be handed to the
@@ -2958,12 +2942,12 @@ def test_qa_needs_input_classification_renders_rich_ui_on_genuine_wrapup(client,
         return {"needs_input": True, "reason": "Still worth a follow-up check."}
 
     async def fake_extract(project_id, raw_text):
-        # First call is the primary extraction attempt in `_finish_implement_
-        # turn` itself (finds nothing, matching this genuine wrap-up text);
-        # the second is `_maybe_extract_needs_input_qa`'s own last-resort
-        # attempt, once the classifier has said a human's input is still
-        # needed -- that second call is the one this test actually cares
-        # about.
+        # First call is the primary extraction attempt in
+        # `start_move_to_qa_job` itself (finds nothing, matching this
+        # genuine wrap-up text); the second is
+        # `_maybe_extract_needs_input_qa`'s own last-resort attempt, once
+        # the classifier has said a human's input is still needed -- that
+        # second call is the one this test actually cares about.
         extract_calls["n"] += 1
         if extract_calls["n"] == 1:
             return None
@@ -2976,11 +2960,11 @@ def test_qa_needs_input_classification_renders_rich_ui_on_genuine_wrapup(client,
     conn = db.get_connection()
     row_id = db.create_session(
         conn, project_id,
-        session_type="implement", phase="implementing",
+        session_type="implement", phase="implemented",
         details={"prd": {"number": 7, "title": "Tracked PRD"}},
     )
 
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
 
     assert seen["phase"] == "qa_grilling"
     assert seen["rescue_raw_text"] == wrapup_text
@@ -2992,12 +2976,12 @@ def test_qa_needs_input_classification_renders_rich_ui_on_genuine_wrapup(client,
     assert qa_turn_events[0]["issues"] == rescued["issues"]
 
 
-def test_qa_needs_input_classification_false_falls_through_to_wrapup(client, tmp_path, monkeypatch):
+def test_move_to_qa_needs_input_classification_false_falls_through_to_wrapup(client, tmp_path, monkeypatch):
     """A negative classification must fall through to today's unchanged QA
     handoff -- a QA session still created, but with an empty issues list --
     and must never trigger `_maybe_extract_needs_input_qa`'s own last-resort
     extraction attempt (a SECOND `_extract_qa_issues_via_skill`
-    call, beyond `_finish_implement_turn`'s own unconditional primary one)."""
+    call, beyond `start_move_to_qa_job`'s own unconditional primary one)."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     _qa_tracker(cwd)
@@ -3022,14 +3006,14 @@ def test_qa_needs_input_classification_false_falls_through_to_wrapup(client, tmp
     conn = db.get_connection()
     row_id = db.create_session(
         conn, project_id,
-        session_type="implement", phase="implementing",
+        session_type="implement", phase="implemented",
         details={"prd": {"number": 7, "title": "Tracked PRD"}},
     )
 
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
 
     # Exactly one extraction attempt -- the primary one in
-    # `_finish_implement_turn` itself; the classifier's own last-resort
+    # `start_move_to_qa_job` itself; the classifier's own last-resort
     # extraction must never fire when `needs_input` is false.
     assert extract_calls["n"] == 1
 
@@ -3040,7 +3024,7 @@ def test_qa_needs_input_classification_false_falls_through_to_wrapup(client, tmp
     assert qa_turn_events[0]["issues"] == []
 
 
-def test_qa_needs_input_true_but_extraction_fails_falls_through_to_wrapup(client, tmp_path, monkeypatch):
+def test_move_to_qa_needs_input_true_but_extraction_fails_falls_through_to_wrapup(client, tmp_path, monkeypatch):
     """A positive classification whose extraction attempt still comes up
     empty must fall through to today's unchanged QA handoff wrap-up."""
     project_id = _open_project(client, tmp_path, "proj")
@@ -3064,11 +3048,11 @@ def test_qa_needs_input_true_but_extraction_fails_falls_through_to_wrapup(client
     conn = db.get_connection()
     row_id = db.create_session(
         conn, project_id,
-        session_type="implement", phase="implementing",
+        session_type="implement", phase="implemented",
         details={"prd": {"number": 7, "title": "Tracked PRD"}},
     )
 
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
 
     sessions = db.list_sessions_for_project(conn, project_id)
     qa_row = next(s for s in sessions if s["session_type"] == "qa")
@@ -3077,7 +3061,7 @@ def test_qa_needs_input_true_but_extraction_fails_falls_through_to_wrapup(client
     assert qa_turn_events[0]["issues"] == []
 
 
-def test_qa_needs_input_classification_rescues_after_corrective_retry_also_failed(client, tmp_path, monkeypatch):
+def test_move_to_qa_needs_input_classification_rescues_after_corrective_retry_also_failed(client, tmp_path, monkeypatch):
     """Once the QA-grilling corrective retry (issue #159) has already run
     and its own extraction attempt *also* came up empty, the needs-input
     classifier gets one last look at that retry's own text before the
@@ -3137,20 +3121,18 @@ def test_qa_needs_input_classification_rescues_after_corrective_retry_also_faile
     conn = db.get_connection()
     row_id = db.create_session(
         conn, project_id,
-        session_type="implement", phase="implementing",
+        session_type="implement", phase="implemented",
         details={"prd": {"number": 7, "title": "Tracked PRD"}},
     )
 
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
 
     assert len(seen_prompts) == 2, "expected exactly one corrective retry turn, in addition to the original"
 
     sessions = db.list_sessions_for_project(conn, project_id)
     qa_row = next(s for s in sessions if s["session_type"] == "qa")
     assert qa_row["claude_session_id"] == "qa-session-id-retry"
-
-    impl_row = db.get_session(conn, row_id)
-    assert impl_row["error_text"] is None
+    assert qa_row["error_text"] is None
 
     qa_events = live_stream._buffers.get(qa_row["id"], [])
     qa_turn_events = [e for e in qa_events if e.get("type") == "turn" and e.get("phase") == "qa_grilling"]
@@ -5910,9 +5892,10 @@ def test_qa_grilling_last_resort_needs_input_classification_enqueues_onto_projec
 ):
     """Issue #191: QA-grilling's own last-resort needs-input check
     (`_maybe_extract_needs_input_qa`, issue #178) now also enqueues a
-    positively-classified turn, tagged with the ORIGINATING implementing
-    session's own card id (the QA handoff turn ran on that same card) and
-    phase `"qa_grilling"`."""
+    positively-classified turn, tagged with the NEW QA session's own card id
+    (issue #250, child of PRD #244: the /rhubarb:qa turn now runs on a
+    brand-new card started by `start_move_to_qa_job`, not on the originating
+    implementing session's card) and phase `"qa_grilling"`."""
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     _qa_tracker(cwd)
@@ -5928,14 +5911,17 @@ def test_qa_grilling_last_resort_needs_input_classification_enqueues_onto_projec
     conn = db.get_connection()
     row_id = db.create_session(
         conn, project_id,
-        session_type="implement", phase="implementing",
+        session_type="implement", phase="implemented",
         details={"prd": {"number": 7, "title": "Tracked PRD"}},
     )
 
-    asyncio.run(session_runner.start_implement_job(row_id, 7, cwd=cwd))
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
+
+    sessions = db.list_sessions_for_project(conn, project_id)
+    qa_row = next(s for s in sessions if s["session_type"] == "qa")
 
     queue = parser_session.get_needs_input_queue(project_id)
-    assert queue == [{"project_id": project_id, "card_id": row_id, "phase": "qa_grilling", "text": wrapup_text}]
+    assert queue == [{"project_id": project_id, "card_id": qa_row["id"], "phase": "qa_grilling", "text": wrapup_text}]
 
 
 def test_implementing_needs_input_classification_enqueues_onto_project_queue(client, tmp_path, monkeypatch):

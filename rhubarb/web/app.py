@@ -1094,7 +1094,26 @@ async def start_implement(body: dict):
     title = body.get("title", "")
 
     afk_loop.record_activity(project_id)
-    return await session_runner.start_or_queue_implement(project_id, number, title, cwd)
+    # A manual PRD-list click no longer starts implementing immediately --
+    # the row is created in `awaiting_proceed` and the actual turn only
+    # fires once the user clicks Proceed (see `start_implementing` below).
+    return await session_runner.start_or_queue_implement(project_id, number, title, cwd, auto_start=False)
+
+
+@app.post("/api/sessions/{card_id}/start-implementing")
+async def start_implementing(card_id: int):
+    """Proceed on the left card's banner for a PRD that was clicked but
+    hasn't started yet -- only valid for an implement session sitting in
+    `awaiting_proceed`, same validate-then-dispatch shape as `move_to_qa`."""
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    if row is None:
+        return {"error": "Session not found"}
+    if row["session_type"] != "implement" or row["phase"] != "awaiting_proceed":
+        return {"error": "Session is not awaiting proceed"}
+    cwd = _active_project_cwd()
+    asyncio.create_task(session_runner.start_pending_implement(card_id, cwd=cwd))
+    return {"card_id": card_id}
 
 
 @app.post("/api/sessions/{card_id}/retry")
@@ -1121,6 +1140,23 @@ async def continue_do(card_id: int, body: dict):
     cwd = _active_project_cwd()
     prompt = body.get("prompt", "")
     asyncio.create_task(session_runner.start_do_continue_job(card_id, prompt, cwd=cwd))
+    return {"card_id": card_id}
+
+
+@app.post("/api/sessions/{card_id}/move-to-qa")
+async def move_to_qa(card_id: int):
+    """Issue #250 (child of PRD #244): the explicit "Move to QA phase"
+    action, replacing the old implicit auto-handoff. Only valid for an
+    implement session sitting at the finished `"implemented"` pause point --
+    same validate-then-dispatch shape as `continue_do`."""
+    conn = db.get_connection()
+    row = db.get_session(conn, card_id)
+    if row is None:
+        return {"error": "Session not found"}
+    if row["session_type"] != "implement" or row["phase"] != "implemented":
+        return {"error": "Session is not a finished implementation"}
+    cwd = _active_project_cwd()
+    asyncio.create_task(session_runner.start_move_to_qa_job(card_id, cwd=cwd))
     return {"card_id": card_id}
 
 

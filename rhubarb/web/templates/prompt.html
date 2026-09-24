@@ -110,11 +110,15 @@
       <div id="session-status" hidden>
         <div id="implementing-banner" class="implementing-banner" hidden>
           <p id="implementing-banner-text" class="implementing-banner-text"></p>
+        </div>
+        <div id="implementing-banner-actions" class="implementing-banner-actions" hidden>
           <button id="implementing-banner-proceed-btn" class="glass-btn implementing-banner-btn" type="button">Proceed</button>
+          <button id="implementing-banner-close-btn" class="glass-btn implementing-banner-btn" type="button">Close</button>
         </div>
         <p id="phase-label" class="phase-label"></p>
         <p id="phase-status-message" class="phase-status-message" hidden></p>
         <div class="scroll-wrap"><div id="details-view" class="details-list"></div></div>
+        <button id="move-to-qa-btn" class="glass-btn move-to-qa-btn" type="button" hidden disabled>Move to QA phase</button>
         <p id="session-error" class="session-error" hidden></p>
         <div id="session-error-actions" class="session-error-actions" hidden>
           <button id="github-login-btn" class="glass-btn" type="button" hidden>Login with GitHub</button>
@@ -617,6 +621,21 @@
     </div>
   </div>
 
+  <!-- Confirmation for the QA-grilling Perfect button (issue #249, child of
+       PRD #244): clicking Perfect closes the PRD and its issues on GitHub,
+       an irreversible action -- warn before it happens instead of firing
+       immediately. -->
+  <div id="perfect-confirm-modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <h2 class="modal-heading">Close PRD and Issues?</h2>
+      <p class="modal-text">The PRD and issues will be closed.</p>
+      <div class="ready-to-proceed-actions">
+        <button id="perfect-confirm-close-btn" class="glass-btn" type="button">Close</button>
+        <button id="perfect-confirm-proceed-btn" class="glass-btn" type="button">Proceed</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     let activeProject = null;
     let leftCardId = null;
@@ -655,7 +674,9 @@
     const sessionStatusEl = document.getElementById("session-status");
     const implementingBannerEl = document.getElementById("implementing-banner");
     const implementingBannerTextEl = document.getElementById("implementing-banner-text");
+    const implementingBannerActionsEl = document.getElementById("implementing-banner-actions");
     const implementingBannerProceedBtn = document.getElementById("implementing-banner-proceed-btn");
+    const implementingBannerCloseBtn = document.getElementById("implementing-banner-close-btn");
     const doFinishedModalEl = document.getElementById("do-finished-modal");
     const doFinishedDetailsEl = document.getElementById("do-finished-details");
     const doFinishedCloseBtnEl = document.getElementById("do-finished-close-btn");
@@ -745,6 +766,9 @@
     const closeSessionLabelEl = document.getElementById("close-session-label");
     const closeSessionCancelBtnEl = document.getElementById("close-session-cancel-btn");
     const closeSessionConfirmBtnEl = document.getElementById("close-session-confirm-btn");
+    const perfectConfirmModalEl = document.getElementById("perfect-confirm-modal");
+    const perfectConfirmCloseBtnEl = document.getElementById("perfect-confirm-close-btn");
+    const perfectConfirmProceedBtnEl = document.getElementById("perfect-confirm-proceed-btn");
     const modelSelectCardEl = document.getElementById("model-select-card");
     const modelSelectSettingsEl = document.getElementById("model-select-settings");
     const modelChangeModalEl = document.getElementById("model-change-modal");
@@ -768,6 +792,7 @@
     const sessionErrorActionsEl = document.getElementById("session-error-actions");
     const githubLoginBtn = document.getElementById("github-login-btn");
     const retryBtn = document.getElementById("retry-btn");
+    const moveToQaBtn = document.getElementById("move-to-qa-btn");
     const prdCardEl = document.getElementById("prd-card");
     const prdButtonRowEl = document.getElementById("prd-button-row");
     const afkNotificationModalEl = document.getElementById("afk-notification-modal");
@@ -916,6 +941,7 @@
           creating_issues: "Creating Issues...",
           publishing: "Publishing to GitHub...",
           details: "Details",
+          awaiting_proceed: "Ready to implement",
           implementing: "Implementing...",
           implemented: "Implemented",
           qa_grilling: "Verifying implementation...",
@@ -936,6 +962,7 @@
           creating_issues: "Phase 3: Creating Issues...",
           publishing: "Phase 4: Publishing to GitHub...",
           details: "Phase 5: Done",
+          awaiting_proceed: "Ready to implement",
           implementing: "Implementing...",
           implemented: "Implemented",
           qa_grilling: "Verifying implementation...",
@@ -1092,7 +1119,8 @@
     function computeImplementingPrdNumbers(sessions) {
       const set = new Set();
       (sessions || []).forEach((s) => {
-        if (s.session_type === "implement" && s.phase === "implementing" && !s.error && s.details && s.details.prd) {
+        const isLive = s.phase === "implementing" || s.phase === "awaiting_proceed";
+        if (s.session_type === "implement" && isLive && !s.error && s.details && s.details.prd) {
           set.add(s.details.prd.number);
         }
       });
@@ -1167,7 +1195,10 @@
       rightCards.set(data.card_id, {
         card_id: data.card_id,
         session_type: "implement",
-        phase: "implementing",
+        // Matches the backend: a manual PRD click creates the row in
+        // `awaiting_proceed` now -- the turn only starts once the user
+        // opens this card and clicks Proceed.
+        phase: "awaiting_proceed",
         details: { prd: { number: prd.number, title: prd.title } },
         error: null,
         needs_github_login: false,
@@ -2961,9 +2992,35 @@
       perfectBtn.className = "glass-btn";
       perfectBtn.textContent = "Perfect";
       perfectBtn.style.marginTop = "12px";
-      perfectBtn.addEventListener("click", () => handlePerfectClick(answerBoxes, extraNotesBox, perfectBtn));
+      perfectBtn.addEventListener("click", () => openPerfectConfirmModal(answerBoxes, extraNotesBox, perfectBtn));
       interviewEl.appendChild(perfectBtn);
     }
+
+    // Issue #249 (child of PRD #244): Perfect no longer runs
+    // handlePerfectClick directly -- it opens this confirmation modal
+    // first. `perfectConfirmTarget` holds the specific (answerBoxes,
+    // extraNotesBox, btn) closure from whichever Perfect button was
+    // clicked, since renderQaGrilling creates a fresh one on every round
+    // refresh.
+    let perfectConfirmTarget = null;
+
+    function openPerfectConfirmModal(answerBoxes, extraNotesBox, btn) {
+      perfectConfirmTarget = { answerBoxes, extraNotesBox, btn };
+      perfectConfirmModalEl.hidden = false;
+    }
+
+    function dismissPerfectConfirmModal() {
+      perfectConfirmModalEl.hidden = true;
+      perfectConfirmTarget = null;
+    }
+
+    perfectConfirmCloseBtnEl.addEventListener("click", dismissPerfectConfirmModal);
+    perfectConfirmProceedBtnEl.addEventListener("click", () => {
+      const target = perfectConfirmTarget;
+      dismissPerfectConfirmModal();
+      if (!target) return;
+      handlePerfectClick(target.answerBoxes, target.extraNotesBox, target.btn);
+    });
 
     async function handlePerfectClick(answerBoxes, extraNotesBox, btn) {
       const qaCardId = leftCardId;
@@ -3365,6 +3422,7 @@
       const snapshot = cardSnapshots.get(cardId);
       if (snapshot) rightCards.set(cardId, snapshot);
       implementingBannerEl.hidden = true;
+      implementingBannerActionsEl.hidden = true;
 
       if (eventSource === es) {
         backgroundSources.set(cardId, es);
@@ -3399,19 +3457,34 @@
       const bgEs = backgroundSources.get(cardId);
       if (bgEs) { bgEs.close(); backgroundSources.delete(cardId); }
 
-      rightCards.set(cardId, snapshot);
-      if (leftCardId === cardId) {
-        leftCardId = null;
-        turnInFlight = false;
-        currentLeftSession = null;
-        resetGrillingFeed();
-        refreshModelEffortCard();
-        resetPromptBox();
-        startForm.style.display = "";
-        interviewEl.innerHTML = "";
-        interviewEl.scrollTop = 0;
-        setHeading("What are we doing?");
-        showOnly(mainFlowEl);
+      // An implement session that just finished while it was the focused
+      // left card (not minimized) stays open in place -- its finished view
+      // (PRD/issue titles, Move to QA button) was already rendered by the
+      // preceding "turn" event (see the `phase === "implemented"` branch of
+      // handleStreamEvent), so there's nothing to reset here. A session
+      // that finished already minimized (never the focus) still moves into
+      // the right-side queue exactly as before. The blocked-takeover
+      // restore case below still needs the queue-move/reset -- this card
+      // is only "focused" because it displaced something else, not because
+      // the user was watching it as its own session the whole time.
+      const stayFocused = snapshot.session_type === "implement" && leftCardId === cardId &&
+        !(cardId === blockedTakeoverCardId && preBlockedLeftSession);
+
+      if (!stayFocused) {
+        rightCards.set(cardId, snapshot);
+        if (leftCardId === cardId) {
+          leftCardId = null;
+          turnInFlight = false;
+          currentLeftSession = null;
+          resetGrillingFeed();
+          refreshModelEffortCard();
+          resetPromptBox();
+          startForm.style.display = "";
+          interviewEl.innerHTML = "";
+          interviewEl.scrollTop = 0;
+          setHeading("What are we doing?");
+          showOnly(mainFlowEl);
+        }
       }
 
       // When a QA session finishes, restore the session that was displaced when QA started
@@ -3925,14 +3998,20 @@
     // derived from `session.phase`/`session.details.prd` -- no separate
     // flag, so it naturally re-appears on reload/reconnect too.
     function updateImplementingBanner(session) {
-      const prd = session && !session.error && session.phase === "implementing" ? session.details?.prd : null;
+      const bannerPhase = session && !session.error &&
+        (session.phase === "implementing" || session.phase === "awaiting_proceed") ? session.phase : null;
+      const prd = bannerPhase ? session.details?.prd : null;
       if (!prd) {
         implementingBannerEl.hidden = true;
+        implementingBannerActionsEl.hidden = true;
       } else {
         implementingBannerTextEl.textContent =
-          `PRD #${prd.number}: ${prd.title} is currently being implemented. This session will keep ` +
-          `implementing in the background — click Proceed to start a new session now.`;
+          bannerPhase === "awaiting_proceed"
+            ? `PRD #${prd.number}: ${prd.title} is ready to implement — click Proceed to start implementing.`
+            : `PRD #${prd.number}: ${prd.title} is currently being implemented. This session will keep ` +
+              `implementing in the background — click Proceed to free up this card for a new /do.`;
         implementingBannerEl.hidden = false;
+        implementingBannerActionsEl.hidden = false;
       }
 
       // Show the do-finished modal when a /do session is sitting at the
@@ -3965,6 +4044,13 @@
       sessionErrorEl.hidden = true;
       sessionErrorActionsEl.hidden = true;
       githubLoginBtn.hidden = true;
+      retryBtn.hidden = true;
+      // Issue #250 (child of PRD #244): the "Move to QA phase" button is
+      // the sole way a QA session starts now -- visible throughout an
+      // implementation's own detail view, disabled (dimmed) until the
+      // implementation finishes.
+      moveToQaBtn.hidden = session.session_type !== "implement";
+      moveToQaBtn.disabled = session.phase !== "implemented";
 
       phaseLabelEl.textContent = session.error ? "Error" : phaseLabelText(session.phase);
 
@@ -3974,6 +4060,9 @@
         sessionErrorEl.textContent = session.error;
         sessionErrorActionsEl.hidden = false;
         githubLoginBtn.hidden = !session.needs_github_login;
+        // Issue #246 (child of PRD #244): Retry only ever appears alongside
+        // the GitHub-login button -- never for any other kind of error.
+        retryBtn.hidden = !session.needs_github_login;
         return;
       }
 
@@ -4051,6 +4140,7 @@
       if (session.error) return "Error";
       if (session.session_type === "implement") {
         const num = session.details && session.details.prd ? session.details.prd.number : "";
+        if (session.phase === "awaiting_proceed") return `Ready to implement PRD #${num}`;
         if (session.phase === "implementing") return `Implementing PRD #${num}`;
         if (session.phase === "implemented") return `Implemented PRD #${num}`;
       }
@@ -4089,6 +4179,20 @@
         const hue = hueForCard(session.card_id);
         card.style.background = `hsla(${hue}, 70%, 55%, 0.18)`;
         card.style.borderColor = `hsla(${hue}, 70%, 55%, 0.45)`;
+
+        // Issue #248 (child of PRD #244): a finished-implementation card
+        // gets a visible "this is done" signal -- a soft pulsing ring in
+        // the card's own accent hue, plus a plain-tooltip convention
+        // already used elsewhere in this app (settings gear, rescue badge,
+        // pty-tab-count indicator). Purely derived from session_type/phase
+        // each render, so it naturally clears once the card leaves this
+        // phase (e.g. once "Move to QA phase" replaces it with a QA card).
+        if (session.session_type === "implement" && session.phase === "implemented") {
+          card.classList.add("session-card-glow");
+          card.style.setProperty("--card-hue", hue);
+          const prdNumber = session.details && session.details.prd ? session.details.prd.number : "";
+          card.title = `PRD #${prdNumber} is already implemented`;
+        }
 
         const dot = document.createElement("span");
         dot.className = "session-card-dot";
@@ -4208,6 +4312,13 @@
       renderQueue();
     });
 
+    // Issue #247 (child of PRD #244): a session at one of these phases has
+    // already published its terminal "done" event -- there is nothing left
+    // to stream, only a historical replay reconnecting would trigger.
+    function _isTerminalPhase(session) {
+      return session.session_type === "implement" && session.phase === "implemented";
+    }
+
     function focusCard(cardId) {
       const session = rightCards.get(cardId);
       if (!session) return;
@@ -4225,7 +4336,19 @@
 
       renderLeftSession(session);
       renderQueue();
-      connectStream(cardId);
+      // Issue #247 (child of PRD #244): a session at a terminal phase (e.g.
+      // "implemented" for an implement session) has nothing further to
+      // stream -- its SSE history's last event is always "done"/"closed".
+      // Reconnecting would replay that terminal event, and the existing
+      // "done" handler (finishCard) can't tell "this just finished live"
+      // apart from "this is a historical replay", so it immediately
+      // re-minimizes the card just opened. Render the persisted state
+      // directly (already done above) and skip connectStream entirely for a
+      // card already at a terminal phase -- there's nothing live left to
+      // watch.
+      if (!_isTerminalPhase(session)) {
+        connectStream(cardId);
+      }
       // Issue #193: if a parser-session result was held for this card while
       // it wasn't focused (raised as a toast at the time -- see
       // `routeParsedResult` below), show it now that the card has become
@@ -4247,13 +4370,79 @@
       retryCard(leftCardId);
     });
 
-    implementingBannerProceedBtn.addEventListener("click", () => {
+    // Issue #250 (child of PRD #244): clicking "Move to QA phase" acts
+    // immediately, no confirmation modal -- the underlying implementation
+    // work (code, commits, tracker file) isn't lost, only the chat session
+    // ends. The backend closes this card outright as part of
+    // start_move_to_qa_job, so reset the left card locally the same way
+    // every other close flow (confirmCloseSession, the do-finished modal's
+    // Close button) already does.
+    moveToQaBtn.addEventListener("click", async () => {
+      const cardId = leftCardId;
+      if (cardId === null) return;
+      moveToQaBtn.disabled = true;
+
+      await fetch(`/api/sessions/${cardId}/move-to-qa`, { method: "POST" });
+
+      moveToQaBtn.disabled = false;
+      closedCardIds.add(cardId);
+      rightCards.delete(cardId);
+      cardSnapshots.delete(cardId);
+      const bgEs = backgroundSources.get(cardId);
+      if (bgEs) { bgEs.close(); backgroundSources.delete(cardId); }
+
+      if (eventSource) { eventSource.close(); eventSource = null; }
+      leftCardId = null;
+      turnInFlight = false;
+      currentLeftSession = null;
+      resetGrillingFeed();
+      refreshModelEffortCard();
+      resetPromptBox();
+      startForm.style.display = "";
+      interviewEl.innerHTML = "";
+      interviewEl.scrollTop = 0;
+      setHeading("What are we doing?");
+      showOnly(mainFlowEl);
+      renderQueue();
+    });
+
+    implementingBannerProceedBtn.addEventListener("click", async () => {
+      if (leftCardId === null) return;
+      // A manually-clicked PRD sitting in `awaiting_proceed` hasn't started
+      // implementing yet -- Proceed here means "start it now", not "move to
+      // background" (that's what it means for every other trigger, where
+      // the turn is already running by the time this banner shows).
+      if (currentLeftSession && currentLeftSession.phase === "awaiting_proceed") {
+        const cardId = leftCardId;
+        implementingBannerProceedBtn.disabled = true;
+        await fetch(`/api/sessions/${cardId}/start-implementing`, { method: "POST" });
+        implementingBannerProceedBtn.disabled = false;
+        // Flip the banner to the "already implementing" wording right away
+        // rather than waiting on the "phase" SSE event -- that event only
+        // patches the banner via `cardSnapshots` for the do-to-implement
+        // handoff's own case (issue #146), and a freshly manually-clicked
+        // PRD has no prior turn event to have seeded `cardSnapshots` yet.
+        if (leftCardId === cardId && currentLeftSession && currentLeftSession.card_id === cardId) {
+          const updated = { ...currentLeftSession, phase: "implementing" };
+          currentLeftSession = updated;
+          cardSnapshots.set(cardId, updated);
+          updateImplementingBanner(updated);
+        }
+        return;
+      }
       // Reuses the exact same minimize path an automatic `minimize` SSE
       // event used to invoke -- just triggered by this click instead
       // (issue #146). `leftCardId`/`eventSource` are the same module-level
       // state handleStreamEvent/applyTurn already use for this card.
-      if (leftCardId === null) return;
       minimizeLeftCardToBackground(leftCardId, eventSource);
+    });
+
+    // Issue #245 (child of PRD #244): Close on the implementing banner
+    // reuses the exact same confirm-then-close flow the right-side session
+    // card's close button already uses -- no new backend endpoint.
+    implementingBannerCloseBtn.addEventListener("click", () => {
+      if (leftCardId === null) return;
+      openCloseSessionModal(leftCardId);
     });
 
     githubLoginBtn.addEventListener("click", async () => {

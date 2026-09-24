@@ -397,7 +397,7 @@ def load_session_state(row: sqlite3.Row) -> dict:
 
 # --- Concurrent session orchestration (PRD 2) -----------------------------
 
-PHASES = ("grilling", "creating_prd", "creating_issues", "details", "implementing", "implemented")
+PHASES = ("grilling", "creating_prd", "creating_issues", "details", "awaiting_proceed", "implementing", "implemented")
 
 
 def create_session(
@@ -491,11 +491,14 @@ def has_active_implement_session(conn: sqlite3.Connection, project_id: int, prd_
     session for `prd_number`. There's no dedicated PRD-number column on
     `sessions`, so this filters the (short) candidate list in Python by
     peeking into each row's `details_json` (seeded at creation with
-    `{"prd": {"number": ...}}`)."""
+    `{"prd": {"number": ...}}`). Includes `awaiting_proceed` -- a manually-
+    clicked PRD sitting there hasn't started yet but is still claimed, so a
+    second click on the same PRD must still be blocked."""
     rows = conn.execute(
         """
         SELECT details_json FROM sessions
-        WHERE project_id = ? AND session_type = 'implement' AND phase = 'implementing' AND error_text IS NULL
+        WHERE project_id = ? AND session_type = 'implement'
+          AND phase IN ('implementing', 'awaiting_proceed') AND error_text IS NULL
         """,
         (project_id,),
     ).fetchall()
@@ -512,11 +515,13 @@ def has_active_implement_session(conn: sqlite3.Connection, project_id: int, prd_
 def has_any_active_implement_session(conn: sqlite3.Connection, project_id: int) -> bool:
     """True if this project has any live (non-terminal) implement session at
     all, regardless of which PRD number it's for -- used to gate serial-mode
-    queueing (`parallel_implementation = False`)."""
+    queueing (`parallel_implementation = False`). Includes `awaiting_proceed`
+    for the same reason as `has_active_implement_session`."""
     row = conn.execute(
         """
         SELECT 1 FROM sessions
-        WHERE project_id = ? AND session_type = 'implement' AND phase = 'implementing' AND error_text IS NULL
+        WHERE project_id = ? AND session_type = 'implement'
+          AND phase IN ('implementing', 'awaiting_proceed') AND error_text IS NULL
         LIMIT 1
         """,
         (project_id,),
