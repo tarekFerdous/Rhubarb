@@ -1,0 +1,50 @@
+[
+  {
+    "baseline_tokens": 10194698,
+    "calls": 302,
+    "saved_pct": 96.563007555496,
+    "saved_tokens": 9844307,
+    "saved_usd": 24.610767499999994,
+    "tool": "ctx_read"
+  },
+  {
+    "baseline_tokens": 836964,
+    "calls": 23,
+    "saved_pct": 96.30354471637968,
+    "saved_tokens": 806026,
+    "saved_usd": 2.015065,
+    "tool": "ocla_savings"
+  },
+  {
+    "baseline_tokens": 16618,
+    "calls": 14,
+    "saved_pct": 64.21952100132387,
+    "saved_tokens": 10672,
+    "saved_usd": 0.02668,
+    "tool": "ctx_shell"
+  },
+  {
+    "baseline_tokens": 89,
+    "calls": 1,
+    "saved_pct": 62.92134831460674,
+    "saved_tokens": 56,
+    "saved_usd": 0.00014,
+    "tool": "ctx_search"
+  },
+  {
+    "baseline_tokens": 6469,
+    "calls": 6,
+    "saved_pct": 0.0,
+    "saved_tokens": 0,
+    "saved_usd": -0.0161725,
+    "tool": "bounce"
+  },
+  {
+    "baseline_tokens": 0,
+    "calls": 156,
+    "saved_pct": 0.0,
+    "saved_tokens": 0,
+    "saved_usd": 0.0,
+    "tool": "edit"
+  }
+]

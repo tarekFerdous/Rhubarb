@@ -12,7 +12,7 @@ import subprocess
 from pathlib import Path
 
 from rhubarb.headroom_installer import HEADROOM_BASE_URL as _HEADROOM_BASE_URL
-from rhubarb.lean_ctx_installer import LEAN_CTX_HOOKS_SETTINGS_PATH, LEAN_CTX_MCP_CONFIG_PATH
+from rhubarb.lean_ctx_installer import LEAN_CTX_HOOKS_SETTINGS_PATH, LEAN_CTX_MCP_CONFIG_PATH, lean_ctx_env
 
 
 class ClaudeCLIError(RuntimeError):
@@ -99,6 +99,16 @@ def _clean_env() -> dict:
         env["ANTHROPIC_BASE_URL"] = _HEADROOM_BASE_URL
     else:
         env.pop("ANTHROPIC_BASE_URL", None)
+    # Point lean-ctx's hooks and MCP server (both inherit this env) at
+    # Rhubarb's own data/config dirs while lean-ctx is enabled (issue #252),
+    # so no Rhubarb session ever writes to the user's global ledger. When
+    # disabled, neither var is passed through at all.
+    lean_ctx_vars = lean_ctx_env()
+    if _lean_ctx_enabled:
+        env.update(lean_ctx_vars)
+    else:
+        for name in lean_ctx_vars:
+            env.pop(name, None)
     return env
 
 

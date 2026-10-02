@@ -1,5 +1,7 @@
+import datetime
 import json
 import subprocess
+from pathlib import Path
 
 from rhubarb import afk_loop, caveman_installer, cli_client, db, error_log, headroom_installer, lean_ctx_installer, ollama_installer, session_runner
 from rhubarb.web import app as app_module
@@ -1729,62 +1731,146 @@ def test_lean_ctx_install_status_lines_reset_on_a_new_install(client, monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# lean-ctx savings widget/modal backend (issue #234, part of PRD #232)
+# lean-ctx savings widget/modal backend (issue #234, normalized schema by
+# issue #253 of PRD #251). Fixtures under `tests/fixtures/lean_ctx/` are
+# captured from real lean-ctx 3.10.x output (`gain --json`, `gain --by-tool
+# --json`, `stats.json`; file paths scrubbed), so a mismatch between the
+# real output and what the endpoint reads fails here instead of shipping.
 # ---------------------------------------------------------------------------
 
+_LEAN_CTX_FIXTURES = Path(__file__).parent / "fixtures" / "lean_ctx"
+_LEAN_CTX_GAIN = (_LEAN_CTX_FIXTURES / "gain.json").read_text(encoding="utf-8")
+_LEAN_CTX_GAIN_BY_TOOL = (_LEAN_CTX_FIXTURES / "gain_by_tool.json").read_text(encoding="utf-8")
+_LEAN_CTX_STATS = json.loads((_LEAN_CTX_FIXTURES / "stats.json").read_text(encoding="utf-8"))
 
-def test_lean_ctx_savings_returns_data_shape_when_command_succeeds_with_data(client, monkeypatch):
-    """A successful `lean-ctx gain --json` run with real data is passed
-    through as `{"available": True, "empty": False, **parsed_json}` --
-    the frontend (issues #235/#236) consumes lean-ctx's own field names
-    as-is rather than a reshaped guess, same contract as `headroom_savings`."""
-    payload = {
-        "windows": {
-            "today": {"tokens_saved": 12000, "tokens_total": 20000, "percent": 60.0},
-            "last_7_days": {"tokens_saved": 40000, "tokens_total": 65000, "percent": 61.5},
-            "last_30_days": {"tokens_saved": 90000, "tokens_total": 150000, "percent": 60.0},
-        },
-        "by_command": [
-            {"command": "ctx_read", "tokens_saved": 30000},
-            {"command": "ctx_search", "tokens_saved": 15000},
-        ],
-        "by_source": [
-            {"source": "mcp", "tokens_saved": 35000},
-            {"source": "shell_hook", "tokens_saved": 10000},
-        ],
-    }
-    monkeypatch.setattr(app_module, "_run_lean_ctx_savings_command", lambda: json.dumps(payload))
+
+def _fake_lean_ctx(monkeypatch, *, gain=_LEAN_CTX_GAIN, by_tool=_LEAN_CTX_GAIN_BY_TOOL, stats=_LEAN_CTX_STATS):
+    """Monkeypatch the two lean-ctx call points (the `gain` subprocess and
+    the local `stats.json` read) plus the clock -- the fixture ledger's last
+    day is 2026-10-02. Pass an exception instance to make a source fail."""
+
+    def fake_run(*extra_args):
+        output = by_tool if extra_args == ("--by-tool",) else gain
+        if isinstance(output, Exception):
+            raise output
+        return output
+
+    def fake_stats():
+        if isinstance(stats, Exception):
+            raise stats
+        return stats
+
+    monkeypatch.setattr(app_module, "_run_lean_ctx_savings_command", fake_run)
+    monkeypatch.setattr(app_module, "_read_lean_ctx_stats", fake_stats)
+    monkeypatch.setattr(app_module, "_lean_ctx_today", lambda: datetime.date(2026, 10, 2))
+
+
+def test_lean_ctx_savings_normalizes_real_lean_ctx_output_into_the_fixed_schema(client, monkeypatch):
+    _fake_lean_ctx(monkeypatch)
 
     data = client.get("/api/lean-ctx-savings").json()
 
-    assert data == {"available": True, "empty": False, **payload}
-
-
-def test_lean_ctx_savings_reports_distinct_empty_shape_when_ledger_has_no_data(client, monkeypatch):
-    """A fresh install with no compressions recorded yet must be reported
-    as `{"available": True, "empty": True}` -- distinct from both a
-    working dashboard and a broken/missing command."""
-    payload = {
+    assert data == {
+        "available": True,
+        "empty": False,
+        "all_time": {"tokens_saved": 11060712, "savings_percent": 93.4},
         "windows": {
-            "today": {"tokens_saved": 0, "tokens_total": 0, "percent": 0},
-            "last_7_days": {"tokens_saved": 0, "tokens_total": 0, "percent": 0},
-            "last_30_days": {"tokens_saved": 0, "tokens_total": 0, "percent": 0},
+            "today": {"tokens_saved": 829696, "tokens_before": 877912, "savings_percent": 94.5},
+            "last_7_days": {"tokens_saved": 931664, "tokens_before": 1181974, "savings_percent": 78.8},
+            "last_30_days": {"tokens_saved": 11060712, "tokens_before": 11845301, "savings_percent": 93.4},
         },
-        "by_command": [],
-        "by_source": [],
+        "by_command": [
+            {"command": "ctx_read", "tokens_saved": 9844307},
+            {"command": "ocla_savings", "tokens_saved": 806026},
+            {"command": "ctx_shell", "tokens_saved": 10672},
+            {"command": "ctx_search", "tokens_saved": 56},
+        ],
+        "by_source": [
+            {"source": "MCP", "tokens_saved": 10254790},
+            {"source": "Shell Hook", "tokens_saved": 805922},
+        ],
     }
-    monkeypatch.setattr(app_module, "_run_lean_ctx_savings_command", lambda: json.dumps(payload))
+
+
+def test_lean_ctx_savings_windows_exclude_days_outside_each_window(client, monkeypatch):
+    """A day 8 days back counts toward the 30-day window only; a day 31
+    days back counts toward none."""
+    stats = {
+        "commands": {},
+        "daily": [
+            {"date": "2026-09-01", "input_tokens": 5000, "output_tokens": 0},
+            {"date": "2026-09-24", "input_tokens": 1000, "output_tokens": 400},
+            {"date": "2026-10-02", "input_tokens": 200, "output_tokens": 50},
+        ],
+    }
+    _fake_lean_ctx(monkeypatch, stats=stats)
+
+    windows = client.get("/api/lean-ctx-savings").json()["windows"]
+
+    assert windows["today"] == {"tokens_saved": 150, "tokens_before": 200, "savings_percent": 75.0}
+    assert windows["last_7_days"] == {"tokens_saved": 150, "tokens_before": 200, "savings_percent": 75.0}
+    assert windows["last_30_days"] == {"tokens_saved": 750, "tokens_before": 1200, "savings_percent": 62.5}
+
+
+def test_lean_ctx_savings_window_with_no_activity_reports_zero_not_a_division_error(client, monkeypatch):
+    stats = {"commands": {}, "daily": [{"date": "2026-09-10", "input_tokens": 100, "output_tokens": 10}]}
+    _fake_lean_ctx(monkeypatch, stats=stats)
+
+    windows = client.get("/api/lean-ctx-savings").json()["windows"]
+
+    assert windows["today"] == {"tokens_saved": 0, "tokens_before": 0, "savings_percent": 0.0}
+
+
+def test_lean_ctx_savings_by_source_never_goes_negative(client, monkeypatch):
+    """A shell-hook command can record more output than input (real
+    fixture: `cli_grep` 0 -> 104); a source total is floored at zero."""
+    stats = {"daily": [], "commands": {"cli_grep": {"input_tokens": 0, "output_tokens": 104}}}
+    _fake_lean_ctx(monkeypatch, stats=stats)
+
+    by_source = client.get("/api/lean-ctx-savings").json()["by_source"]
+
+    assert by_source == [{"source": "MCP", "tokens_saved": 0}, {"source": "Shell Hook", "tokens_saved": 0}]
+
+
+def test_lean_ctx_savings_omits_stats_derived_sections_when_stats_json_is_unreadable(client, monkeypatch):
+    """`windows`/`by_source` come only from `stats.json`; without it the
+    payload still carries `all_time` (the widget's fallback) and
+    `by_command`, and is never reported empty or unavailable."""
+    _fake_lean_ctx(monkeypatch, stats=FileNotFoundError("stats.json"))
+
+    data = client.get("/api/lean-ctx-savings").json()
+
+    assert data["available"] is True
+    assert data["empty"] is False
+    assert data["all_time"] == {"tokens_saved": 11060712, "savings_percent": 93.4}
+    assert "windows" not in data
+    assert "by_source" not in data
+    assert len(data["by_command"]) == 4
+
+
+def test_lean_ctx_savings_omits_by_command_when_by_tool_command_fails(client, monkeypatch):
+    _fake_lean_ctx(monkeypatch, by_tool=subprocess.CalledProcessError(1, ["lean-ctx"]))
+
+    data = client.get("/api/lean-ctx-savings").json()
+
+    assert "by_command" not in data
+    assert "windows" in data
+
+
+def test_lean_ctx_savings_reports_empty_when_ledger_has_no_savings(client, monkeypatch):
+    """Real `gain --json` output from a fresh, empty Rhubarb ledger."""
+    empty_gain = json.loads(_LEAN_CTX_GAIN)
+    empty_gain["summary"]["tokens_saved"] = 0
+    empty_gain["summary"]["total_reduction_pct"] = 0.0
+    _fake_lean_ctx(monkeypatch, gain=json.dumps(empty_gain))
 
     data = client.get("/api/lean-ctx-savings").json()
 
     assert data == {"available": True, "empty": True}
 
 
-def test_lean_ctx_savings_reports_empty_when_windows_breakdown_is_entirely_absent(client, monkeypatch):
-    """Defensive parsing: even if the payload doesn't carry a `windows` key
-    at all, a payload with no "tokens saved"-shaped field anywhere is still
-    treated as empty, not as unavailable or as a crash."""
-    monkeypatch.setattr(app_module, "_run_lean_ctx_savings_command", lambda: json.dumps({}))
+def test_lean_ctx_savings_reports_empty_when_summary_is_missing(client, monkeypatch):
+    _fake_lean_ctx(monkeypatch, gain=json.dumps({"tasks": [], "heatmap": []}))
 
     data = client.get("/api/lean-ctx-savings").json()
 
@@ -1795,11 +1881,7 @@ def test_lean_ctx_savings_reports_unavailable_when_command_fails_to_run(client, 
     """lean-ctx not installed (or genuinely broken) must surface as a
     distinct `{"available": False}` shape -- never a 500 or an unhandled
     exception bubbling out of the route."""
-
-    def fake_run():
-        raise FileNotFoundError("lean-ctx not found")
-
-    monkeypatch.setattr(app_module, "_run_lean_ctx_savings_command", fake_run)
+    _fake_lean_ctx(monkeypatch, gain=FileNotFoundError("lean-ctx not found"))
 
     resp = client.get("/api/lean-ctx-savings")
 
@@ -1808,13 +1890,7 @@ def test_lean_ctx_savings_reports_unavailable_when_command_fails_to_run(client, 
 
 
 def test_lean_ctx_savings_reports_unavailable_when_command_exits_nonzero(client, monkeypatch):
-    """A non-zero exit (lean-ctx installed but erroring) is the same
-    "unavailable" shape as not-installed."""
-
-    def fake_run():
-        raise subprocess.CalledProcessError(1, ["lean-ctx", "gain", "--json"])
-
-    monkeypatch.setattr(app_module, "_run_lean_ctx_savings_command", fake_run)
+    _fake_lean_ctx(monkeypatch, gain=subprocess.CalledProcessError(1, ["lean-ctx", "gain", "--json"]))
 
     data = client.get("/api/lean-ctx-savings").json()
 
@@ -1822,35 +1898,51 @@ def test_lean_ctx_savings_reports_unavailable_when_command_exits_nonzero(client,
 
 
 def test_lean_ctx_savings_reports_unavailable_when_output_is_not_valid_json(client, monkeypatch):
-    """Garbled/unparseable stdout must also degrade to "unavailable" rather
-    than raising out of the route."""
-    monkeypatch.setattr(app_module, "_run_lean_ctx_savings_command", lambda: "not json")
+    _fake_lean_ctx(monkeypatch, gain="not json")
 
     data = client.get("/api/lean-ctx-savings").json()
 
     assert data == {"available": False}
 
 
-def test_lean_ctx_savings_runs_via_resolve_lean_ctx_command(monkeypatch):
-    """`_run_lean_ctx_savings_command` must resolve the CLI the same
-    PATH-safe way as the other lean-ctx call sites (`resolve_lean_ctx_
-    command()`), not a bare `"lean-ctx"`, and invoke `gain --json`."""
+def test_lean_ctx_savings_reports_unavailable_when_output_is_not_a_json_object(client, monkeypatch):
+    _fake_lean_ctx(monkeypatch, gain="[]")
+
+    data = client.get("/api/lean-ctx-savings").json()
+
+    assert data == {"available": False}
+
+
+def test_lean_ctx_savings_command_runs_the_local_binary_against_rhubarb_dirs(monkeypatch):
+    """`_run_lean_ctx_savings_command` runs Rhubarb's local lean-ctx (issue
+    #252) with `LEAN_CTX_DATA_DIR`/`LEAN_CTX_CONFIG_DIR` pointing at
+    Rhubarb's own dirs, so it reports only Rhubarb's ledger."""
     monkeypatch.setattr(lean_ctx_installer, "resolve_lean_ctx_command", lambda: "C:/fake/lean-ctx.CMD")
 
-    captured = {}
+    calls = []
 
     class FakeCompletedProcess:
-        stdout = '{"windows": {}}'
+        stdout = "{}"
 
     def fake_run(argv, **kwargs):
-        captured["argv"] = argv
-        captured["kwargs"] = kwargs
+        calls.append((argv, kwargs))
         return FakeCompletedProcess()
 
     monkeypatch.setattr(app_module.subprocess, "run", fake_run)
 
-    result = app_module._run_lean_ctx_savings_command()
+    assert app_module._run_lean_ctx_savings_command() == "{}"
+    app_module._run_lean_ctx_savings_command("--by-tool")
 
-    assert captured["argv"] == ["C:/fake/lean-ctx.CMD", "gain", "--json"]
-    assert captured["kwargs"]["check"] is True
-    assert result == '{"windows": {}}'
+    assert calls[0][0] == ["C:/fake/lean-ctx.CMD", "gain", "--json"]
+    assert calls[1][0] == ["C:/fake/lean-ctx.CMD", "gain", "--by-tool", "--json"]
+    for _, kwargs in calls:
+        assert kwargs["check"] is True
+        for name, value in lean_ctx_installer.lean_ctx_env().items():
+            assert kwargs["env"][name] == value
+
+
+def test_lean_ctx_stats_are_read_from_rhubarb_data_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(lean_ctx_installer, "LEAN_CTX_DATA_DIR", tmp_path)
+    (tmp_path / "stats.json").write_text(json.dumps(_LEAN_CTX_STATS), encoding="utf-8")
+
+    assert app_module._read_lean_ctx_stats() == _LEAN_CTX_STATS

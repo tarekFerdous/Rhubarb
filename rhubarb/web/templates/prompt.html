@@ -1809,11 +1809,15 @@
     headroomSavingsWidgetEl.addEventListener("click", openHeadroomSavingsModal);
     headroomSavingsModalCloseBtnEl.addEventListener("click", closeHeadroomSavingsModal);
 
-    // --- lean-ctx token-savings widget (issue #235, part of PRD #232) ------
-    // Reuses `pickHeadroomSavingsWindow`/`formatHeadroomTokenCount`/
-    // `pickHeadroomSavingsPercent` from the Headroom widget above rather
-    // than duplicating them -- both endpoints defensively parse an
-    // undocumented `--json` schema the exact same way.
+    // --- lean-ctx token-savings widget (issue #235, reworked by #253) ------
+    // Unlike Headroom's, GET /api/lean-ctx-savings returns a fixed schema
+    // the backend builds itself (see `lean_ctx_savings()` in app.py):
+    // `all_time: {tokens_saved, savings_percent}`, optional
+    // `windows: {today, last_7_days, last_30_days}` (each `{tokens_saved,
+    // tokens_before, savings_percent}`), optional `by_command:
+    // [{command, tokens_saved}]` and optional `by_source: [{source,
+    // tokens_saved}]`. Only those exact keys are read -- no guessed
+    // alternate spellings. Reuses `formatHeadroomTokenCount` from above.
 
     function renderLeanCtxSavingsWidget(data) {
       if (!data || data.available !== true) {
@@ -1827,28 +1831,20 @@
         return;
       }
 
-      const today = pickHeadroomSavingsWindow(data.windows, ["today"]);
-      const last30 = pickHeadroomSavingsWindow(data.windows, [
-        "last_30_days",
-        "last_30d",
-        "last30Days",
-        "thirty_days",
-        "30_day",
-      ]);
-
-      const todayPercent = pickHeadroomSavingsPercent(today);
-      const todayTokens = formatHeadroomTokenCount(today.tokens_saved);
-      if (todayPercent !== null && todayTokens !== null) {
-        leanCtxSavingsTodayLineEl.textContent = `${todayPercent}% saved (${todayTokens} tokens)`;
-      } else {
-        leanCtxSavingsTodayLineEl.textContent = "No savings recorded yet";
-      }
-
-      const last30Tokens = formatHeadroomTokenCount(last30.tokens_saved);
-      if (last30Tokens !== null) {
-        leanCtxSavings30DayLineEl.hidden = false;
+      const today = data.windows?.today;
+      const last30 = data.windows?.last_30_days;
+      const todayTokens = formatHeadroomTokenCount(today?.tokens_saved);
+      const last30Tokens = formatHeadroomTokenCount(last30?.tokens_saved);
+      if (todayTokens !== null && last30Tokens !== null) {
+        leanCtxSavingsTodayLineEl.textContent = `Today: ${today.savings_percent}% saved (${todayTokens} tokens)`;
         leanCtxSavings30DayLineEl.textContent = `${last30Tokens} tokens saved in the last 30 days`;
+        leanCtxSavings30DayLineEl.hidden = false;
       } else {
+        // No readable daily data (stats.json missing/unparseable) -- fall
+        // back to the all-time totals rather than claim "No savings" while
+        // the ledger genuinely has data.
+        const allTimeTokens = formatHeadroomTokenCount(data.all_time?.tokens_saved) ?? "0";
+        leanCtxSavingsTodayLineEl.textContent = `All time: ${data.all_time?.savings_percent ?? 0}% saved (${allTimeTokens} tokens)`;
         leanCtxSavings30DayLineEl.hidden = true;
       }
 
@@ -1865,35 +1861,42 @@
       }
     }
 
-    // --- lean-ctx savings modal (issue #236, part of PRD #232) -------------
+    // --- lean-ctx savings modal (issue #236, reworked by #253) -------------
     // Reuses `renderHeadroomChartSection`/`extractHeadroomBreakdown`/
     // `sumHeadroomEntryValues`/`buildHeadroomBarChartSvg`/
     // `buildHeadroomStackedBarChartSvg` from the Headroom modal above
     // rather than duplicating any of them -- no new charting library, per
-    // PRD #232.
+    // PRD #232. Reads only the fixed schema documented above the widget; a
+    // section whose key is absent (its source couldn't be read) or has
+    // nothing to show renders its "No savings recorded yet" text.
 
     function renderLeanCtxSavingsModalWindows(data) {
       const windowDefs = [
-        { label: "Today", keys: ["today"] },
-        { label: "7-day", keys: ["last_7_days", "last_7d", "last7Days", "seven_days", "7_day"] },
-        { label: "30-day", keys: ["last_30_days", "last_30d", "last30Days", "thirty_days", "30_day"] },
+        { label: "Today", key: "today" },
+        { label: "7-day", key: "last_7_days" },
+        { label: "30-day", key: "last_30_days" },
       ];
       const entries = [];
       windowDefs.forEach((def) => {
-        const windowData = pickHeadroomSavingsWindow(data.windows, def.keys);
-        const percent = pickHeadroomSavingsPercent(windowData);
-        if (percent !== null && percent >= 0) entries.push({ label: def.label, value: percent, valueText: `${percent}%` });
+        const percent = data.windows?.[def.key]?.savings_percent;
+        if (typeof percent === "number" && Number.isFinite(percent) && percent >= 0) {
+          entries.push({ label: def.label, value: percent, valueText: `${percent}%` });
+        }
       });
       renderHeadroomChartSection(leanCtxSavingsModalWindowsChartEl, leanCtxSavingsModalWindowsEmptyEl, entries, 100);
     }
 
+    // A share-of-total chart with nothing but zero-valued rows would have a
+    // zero denominator -- drop zero rows so an all-zero breakdown shows the
+    // section's empty text instead.
+    function leanCtxBreakdownEntries(rows, nameKey) {
+      return extractHeadroomBreakdown(rows, [nameKey], ["tokens_saved"])
+        .filter((e) => e.value > 0)
+        .map((e) => ({ ...e, valueText: formatHeadroomTokenCount(e.value) ?? String(e.value) }));
+    }
+
     function renderLeanCtxSavingsModalByCommand(data) {
-      const raw = extractHeadroomBreakdown(
-        data.by_command ?? data.per_command ?? data.commands,
-        ["command", "name"],
-        ["tokens_saved", "tokens"]
-      );
-      const entries = raw.map((e) => ({ ...e, valueText: formatHeadroomTokenCount(e.value) ?? String(e.value) }));
+      const entries = leanCtxBreakdownEntries(data.by_command, "command");
       renderHeadroomChartSection(
         leanCtxSavingsModalCommandChartEl,
         leanCtxSavingsModalCommandEmptyEl,
@@ -1904,12 +1907,7 @@
     }
 
     function renderLeanCtxSavingsModalBySource(data) {
-      const raw = extractHeadroomBreakdown(
-        data.by_source ?? data.mcp_vs_shell_hook ?? data.sources,
-        ["source", "name"],
-        ["tokens_saved", "tokens"]
-      );
-      const entries = raw.map((e) => ({ ...e, valueText: formatHeadroomTokenCount(e.value) ?? String(e.value) }));
+      const entries = leanCtxBreakdownEntries(data.by_source, "source");
       renderHeadroomChartSection(
         leanCtxSavingsModalSourceChartEl,
         leanCtxSavingsModalSourceEmptyEl,

@@ -162,6 +162,28 @@ def test_start_passes_lean_ctx_args_when_enabled():
     assert argv[argv.index("--settings") + 1] == str(LEAN_CTX_HOOKS_SETTINGS_PATH)
 
 
+def test_start_points_lean_ctx_at_rhubarb_dirs_only_when_enabled():
+    """Issue #252: hooks and the MCP server inherit the child env, so the
+    data/config dirs must ride along with the lean-ctx args."""
+    from rhubarb import cli_client
+    from rhubarb.lean_ctx_installer import lean_ctx_env
+
+    enabled_backend = FakeStreamJsonBackend([])
+    enabled_factory, enabled = _fake_factory(enabled_backend)
+    cli_client.set_lean_ctx_enabled(True)
+    try:
+        StreamJsonEngine(process_factory=enabled_factory).start()
+    finally:
+        cli_client.set_lean_ctx_enabled(False)
+    disabled_backend = FakeStreamJsonBackend([])
+    disabled_factory, disabled = _fake_factory(disabled_backend)
+    StreamJsonEngine(process_factory=disabled_factory).start()
+
+    for name, value in lean_ctx_env().items():
+        assert enabled["env"][name] == value
+        assert name not in disabled["env"]
+
+
 def test_start_strips_api_key_and_auth_token_from_child_env(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-be-inherited")
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok-should-not-be-inherited")

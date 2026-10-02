@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import pytest
 
@@ -221,3 +222,53 @@ def test_run_prompt_omits_lean_ctx_args_when_disabled(monkeypatch):
 
     assert "--mcp-config" not in captured["args"]
     assert "--settings" not in captured["args"]
+
+
+# ---------------------------------------------------------------------------
+# lean-ctx data/config dir env (issue #252, child of PRD #251)
+# ---------------------------------------------------------------------------
+
+
+def _capture_run_prompt_env(monkeypatch, *, lean_ctx_enabled):
+    captured = {}
+
+    class FakeResult:
+        returncode = 0
+        stdout = json.dumps({"session_id": "abc"})
+        stderr = ""
+
+    def fake_run(args, **kwargs):
+        captured["env"] = kwargs["env"]
+        return FakeResult()
+
+    monkeypatch.setattr(cli_client.subprocess, "run", fake_run)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-be-stripped")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "token-should-be-stripped")
+    cli_client.set_lean_ctx_enabled(lean_ctx_enabled)
+    try:
+        cli_client.run_prompt("hello")
+    finally:
+        cli_client.set_lean_ctx_enabled(False)
+    return captured["env"]
+
+
+def test_run_prompt_env_points_lean_ctx_at_rhubarb_dirs_when_enabled(monkeypatch):
+    env = _capture_run_prompt_env(monkeypatch, lean_ctx_enabled=True)
+
+    rhubarb_home = Path.home() / ".rhubarb"
+    assert Path(env["LEAN_CTX_DATA_DIR"]).parent == rhubarb_home
+    assert Path(env["LEAN_CTX_CONFIG_DIR"]).parent == rhubarb_home
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
+
+
+def test_run_prompt_env_has_no_lean_ctx_dirs_when_disabled(monkeypatch):
+    monkeypatch.setenv("LEAN_CTX_DATA_DIR", "/ambient/data")
+    monkeypatch.setenv("LEAN_CTX_CONFIG_DIR", "/ambient/config")
+
+    env = _capture_run_prompt_env(monkeypatch, lean_ctx_enabled=False)
+
+    assert "LEAN_CTX_DATA_DIR" not in env
+    assert "LEAN_CTX_CONFIG_DIR" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "ANTHROPIC_AUTH_TOKEN" not in env

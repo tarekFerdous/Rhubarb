@@ -5,13 +5,19 @@ Pure functions with every external command call injectable, mirroring
 `headroom_installer.py`/`caveman_installer.py`'s injection pattern -- tests
 never require a real lean-ctx install, network access, or npm.
 
-lean-ctx is the `lean-ctx-bin` npm package (`npm install -g lean-ctx-bin`).
+lean-ctx is the `lean-ctx-bin` npm package. Rhubarb installs its own local
+copy under `~/.rhubarb/` (issue #252, child of PRD #251) rather than relying
+on a global `npm install -g` one, and points every lean-ctx process it causes
+at its own data/config dirs -- so Rhubarb's savings ledger never mixes with
+the user's interactive lean-ctx usage and the user's personal lean-ctx config
+never changes how unattended Rhubarb sessions behave.
 This module has no UI or session-runner wiring of its own; the app-level
 consent/install gate and the Settings toggle in `rhubarb/web/app.py` are
 the callers.
 """
 
 import json
+import os
 import platform
 import shutil
 import subprocess
@@ -31,7 +37,16 @@ PRESENCE_PRESENT = "present"
 LEAN_CTX_MCP_CONFIG_PATH = Path.home() / ".rhubarb" / "lean-ctx-mcp-config.json"
 LEAN_CTX_HOOKS_SETTINGS_PATH = Path.home() / ".rhubarb" / "lean-ctx-hooks-settings.json"
 
-_NPM_INSTALL_LEAN_CTX_ARGS = ["install", "-g", "lean-ctx-bin"]
+# Rhubarb's own npm prefix for its local lean-ctx install, plus the data dir
+# (ledger, cache, knowledge) and config dir lean-ctx is pointed at via its own
+# `LEAN_CTX_DATA_DIR`/`LEAN_CTX_CONFIG_DIR` env vars. The config dir starts
+# empty so lean-ctx's own defaults apply. A plain (non-`-g`) `npm install
+# --prefix` gives the same `node_modules/.bin/` layout on every OS.
+LEAN_CTX_PREFIX = Path.home() / ".rhubarb" / "lean-ctx"
+LEAN_CTX_DATA_DIR = Path.home() / ".rhubarb" / "lean-ctx-data"
+LEAN_CTX_CONFIG_DIR = Path.home() / ".rhubarb" / "lean-ctx-config"
+
+_NPM_INSTALL_LEAN_CTX_ARGS = ["install", "--prefix", str(LEAN_CTX_PREFIX), "lean-ctx-bin"]
 
 # The tool-name matcher lean-ctx's own hooks policy uses to redirect a
 # native read/search/list call to its own `ctx_*` tools instead -- every
@@ -44,8 +59,27 @@ _LEAN_CTX_READ_SEARCH_MATCHER = (
 )
 
 
+def lean_ctx_env() -> dict:
+    """The two env vars that point a lean-ctx process at Rhubarb's own data
+    and config dirs -- applied to every spawned `claude` subprocess while
+    lean-ctx is enabled (so its hooks and MCP server inherit them), to the
+    generated MCP config's server entry, and to every lean-ctx command the
+    backend runs itself."""
+    return {"LEAN_CTX_DATA_DIR": str(LEAN_CTX_DATA_DIR), "LEAN_CTX_CONFIG_DIR": str(LEAN_CTX_CONFIG_DIR)}
+
+
+def _install_env() -> dict:
+    """`lean-ctx-bin`'s npm postinstall runs `lean-ctx onboard` unless
+    `LEAN_CTX_NO_ONBOARD=1` -- which rewrites the user's *global*
+    `~/.claude/settings.json` hooks, `~/.claude.json` MCP entry and shell
+    hook to point at whichever binary was just installed (confirmed live
+    against lean-ctx 3.10.5). Rhubarb must never touch the user's global
+    setup, so every install it runs suppresses onboarding."""
+    return {**os.environ, **lean_ctx_env(), "LEAN_CTX_NO_ONBOARD": "1"}
+
+
 def _default_run(argv: list[str]) -> None:
-    subprocess.run(argv, check=True, capture_output=True)
+    subprocess.run(argv, check=True, capture_output=True, env=_install_env())
 
 
 def run_streaming(argv: list[str], *, on_line=None, popen_factory=None) -> None:
@@ -54,10 +88,19 @@ def run_streaming(argv: list[str], *, on_line=None, popen_factory=None) -> None:
     ARRIVES -- mirrors `headroom_installer.run_streaming`/`caveman_
     installer.run_streaming` exactly, including the explicit
     `encoding="utf-8", errors="replace"` (an `npm install` can emit UTF-8
-    progress glyphs that Windows' default ANSI codepage can't decode)."""
+    progress glyphs that Windows' default ANSI codepage can't decode), plus
+    `_install_env()` so the postinstall never onboards the user's global
+    Claude Code config."""
     popen_factory = popen_factory or subprocess.Popen
     process = popen_factory(
-        argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=_install_env(),
     )
     for line in process.stdout:
         if on_line:
@@ -81,25 +124,25 @@ def resolve_npm_command() -> str:
     return shutil.which("npm") or "npm"
 
 
-def resolve_lean_ctx_command() -> str:
-    """`lean-ctx` is installed by `npm install -g lean-ctx-bin` as a
-    `.cmd` shim on Windows (npm's standard global-install layout, same
-    shape as `npx` itself) -- a bare `"lean-ctx"` invocation hits the exact
-    same `WinError 2` `CreateProcess` limitation `resolve_npm_command`/
-    `caveman_installer.resolve_npx_command` already document. `shutil.which`
-    resolves it via a real `PATH` search, extension included, with no
-    per-platform branching needed. Falls back to the bare command name when
-    it's not found on `PATH` at all (e.g. this check runs before the very
-    first install completes)."""
-    return shutil.which("lean-ctx") or "lean-ctx"
+def resolve_lean_ctx_command(*, system=None) -> str:
+    """The `lean-ctx` binary inside Rhubarb's own local prefix -- never a
+    `PATH` lookup, so a global-only lean-ctx is never picked up. npm puts it
+    in `node_modules/.bin/`, as a `.cmd` shim on Windows (a bare name would
+    hit the same `WinError 2` `CreateProcess` limitation `resolve_npm_
+    command` documents). The path is returned whether or not the install
+    has happened yet; `check_lean_ctx_presence` is what tells the two apart.
+    `system` is injectable like `install_for_platform`'s."""
+    resolved_system = system() if system else platform.system()
+    name = "lean-ctx.cmd" if resolved_system == "Windows" else "lean-ctx"
+    return str(LEAN_CTX_PREFIX / "node_modules" / ".bin" / name)
 
 
 def check_lean_ctx_presence(*, run=None) -> str:
-    """Check whether the `lean-ctx` CLI is present by running
-    `lean-ctx --version` -- returns `PRESENCE_PRESENT` if the command
-    succeeds (exit 0), `PRESENCE_NOT_PRESENT` otherwise (including a
-    missing command, since a nonexistent bare fallback name raises
-    `FileNotFoundError`).
+    """Check whether Rhubarb's local `lean-ctx` is present by running
+    its `--version` (a global-only install therefore reports not present)
+    -- returns `PRESENCE_PRESENT` if the command succeeds (exit 0),
+    `PRESENCE_NOT_PRESENT` otherwise (including a not-yet-installed local
+    binary, which raises `FileNotFoundError`).
 
     `run` is injectable (a callable taking an argv list that raises on
     failure) so tests never need a real lean-ctx install."""
@@ -112,26 +155,26 @@ def check_lean_ctx_presence(*, run=None) -> str:
 
 
 def install_windows(*, run=None) -> None:
-    """Install lean-ctx via `npm install -g lean-ctx-bin` on Windows."""
+    """Install lean-ctx into Rhubarb's local prefix on Windows."""
     run = run or _default_run
     run([resolve_npm_command(), *_NPM_INSTALL_LEAN_CTX_ARGS])
 
 
 def install_macos(*, run=None) -> None:
-    """Install lean-ctx via `npm install -g lean-ctx-bin` on macOS."""
+    """Install lean-ctx into Rhubarb's local prefix on macOS."""
     run = run or _default_run
     run([resolve_npm_command(), *_NPM_INSTALL_LEAN_CTX_ARGS])
 
 
 def install_linux(*, run=None) -> None:
-    """Install lean-ctx via `npm install -g lean-ctx-bin` on Linux."""
+    """Install lean-ctx into Rhubarb's local prefix on Linux."""
     run = run or _default_run
     run([resolve_npm_command(), *_NPM_INSTALL_LEAN_CTX_ARGS])
 
 
 def install_for_platform(*, run=None, system=None) -> None:
     """Dispatch to the right per-OS install function for the current
-    platform -- all three run the identical `npm install -g lean-ctx-bin`,
+    platform -- all three run the identical `npm install --prefix ...`,
     so this only exists to mirror `headroom_installer.install_for_platform`/
     `ollama_installer.install_for_platform`'s shape. `system` is injectable
     (a zero-arg callable returning a `platform.system()`-shaped string) so
@@ -186,14 +229,24 @@ def _build_hooks_settings(command: str) -> dict:
 
 def generate_scoped_config() -> None:
     """Write `LEAN_CTX_MCP_CONFIG_PATH` (an MCP-server registration pointing
-    at the resolved `lean-ctx` command) and `LEAN_CTX_HOOKS_SETTINGS_PATH`
-    (the hooks policy above) under `~/.rhubarb/`, regenerating both every
-    time lean-ctx transitions to enabled -- never merely checked for
-    existence, so a reinstalled/relocated `lean-ctx` command is always
-    reflected in what gets passed to the next spawned `claude` subprocess."""
+    at Rhubarb's local `lean-ctx` command, with an explicit `env` block for
+    its data/config dirs so isolation never depends on env inheritance
+    alone) and `LEAN_CTX_HOOKS_SETTINGS_PATH` (the hooks policy above) under
+    `~/.rhubarb/`, regenerating both every time lean-ctx transitions to
+    enabled -- never merely checked for existence, so a reinstalled/
+    relocated `lean-ctx` command is always reflected in what gets passed to
+    the next spawned `claude` subprocess.
+
+    The hooks get the forward-slash form of the path: Claude Code runs hook
+    commands through a shell (Git Bash on Windows), which would eat an
+    unquoted backslash path -- the same form lean-ctx's own onboarding
+    writes."""
     command = resolve_lean_ctx_command()
     LEAN_CTX_MCP_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LEAN_CTX_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    LEAN_CTX_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    mcp_config = {"mcpServers": {"lean-ctx": {"command": command}}}
+    mcp_config = {"mcpServers": {"lean-ctx": {"command": command, "env": lean_ctx_env()}}}
     LEAN_CTX_MCP_CONFIG_PATH.write_text(json.dumps(mcp_config, indent=2))
-    LEAN_CTX_HOOKS_SETTINGS_PATH.write_text(json.dumps(_build_hooks_settings(command), indent=2))
+    hooks_settings = _build_hooks_settings(Path(command).as_posix())
+    LEAN_CTX_HOOKS_SETTINGS_PATH.write_text(json.dumps(hooks_settings, indent=2))

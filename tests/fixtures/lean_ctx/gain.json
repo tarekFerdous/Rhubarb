@@ -1,0 +1,151 @@
+{
+  "bridge": {
+    "engagement": "proxy_down",
+    "proxy_running": false,
+    "total_requests": 0,
+    "tool_count": 78
+  },
+  "summary": {
+    "model": {
+      "model_key": "fallback-blended",
+      "cost": {
+        "input_per_m": 2.5,
+        "output_per_m": 10.0,
+        "cache_write_per_m": 2.5,
+        "cache_read_per_m": 2.5
+      },
+      "match_kind": "Fallback"
+    },
+    "total_commands": 1216,
+    "input_tokens": 11845301,
+    "output_tokens": 784589,
+    "tokens_saved": 11060712,
+    "effective_input_tokens": 10954447,
+    "effective_output_tokens": 762735,
+    "effective_tokens_saved": 10191712,
+    "effective_compression_pct": 93.03721128049641,
+    "total_reduction_pct": 93.37636924549237,
+    "gain_rate_pct": 93.03721128049641,
+    "injected_overhead_tokens_per_turn": 3204,
+    "turns": 0,
+    "injected_overhead_total_tokens": 0,
+    "net_tokens_saved": 10191712,
+    "injected_overhead_budget_tokens": 8000,
+    "over_budget": false,
+    "avoided_usd": 25.591455,
+    "stream_savings": {
+      "first_inject_tokens_saved": 10201359,
+      "reread_tokens_saved": 41692,
+      "input_tokens_saved": 0,
+      "output_tokens_saved": 0,
+      "first_inject_overhead_tokens": 0,
+      "reread_overhead_tokens": 0,
+      "bounce_tokens": 6469,
+      "cache_write_usd_saved": 25.5033975,
+      "cache_read_usd_saved": 0.10423,
+      "input_usd_saved": 0.0,
+      "output_usd_saved": 0.0,
+      "gross_usd_saved": 25.6076275,
+      "overhead_usd": 0.0161725,
+      "net_usd_saved": 25.591455
+    },
+    "energy_wh": 1132.4124444444444,
+    "co2_grams": 537.8959111111111,
+    "tool_spend_usd": 7.258370000000003,
+    "roi": 3.5257854036099,
+    "score": {
+      "total": 72,
+      "compression": 93,
+      "cost_efficiency": 38,
+      "quality": 64,
+      "consistency": 86,
+      "navigability": 84,
+      "trend": "Declining"
+    }
+  },
+  "tasks": [
+    {
+      "category": "Exploration",
+      "commands": 668,
+      "tokens_saved": 10182412,
+      "tool_calls": 540,
+      "tool_spend_usd": 5.822464999999999
+    },
+    {
+      "category": "General",
+      "commands": 392,
+      "tokens_saved": 867732,
+      "tool_calls": 89,
+      "tool_spend_usd": 0.5977575000000002
+    },
+    {
+      "category": "Debugging",
+      "commands": 156,
+      "tokens_saved": 10672,
+      "tool_calls": 104,
+      "tool_spend_usd": 0.8381474999999998
+    }
+  ],
+  "heatmap": [
+    {
+      "path": "project/src/file_1.py",
+      "access_count": 221,
+      "tokens_saved": 8293989,
+      "compression_pct": 97.66493
+    },
+    {
+      "path": "project/src/file_2.py",
+      "access_count": 116,
+      "tokens_saved": 6133154,
+      "compression_pct": 98.13646
+    },
+    {
+      "path": "project/src/file_3.py",
+      "access_count": 116,
+      "tokens_saved": 2586614,
+      "compression_pct": 94.887314
+    },
+    {
+      "path": "project/src/file_4.py",
+      "access_count": 34,
+      "tokens_saved": 825745,
+      "compression_pct": 97.842064
+    },
+    {
+      "path": "project/src/file_5.py",
+      "access_count": 42,
+      "tokens_saved": 286730,
+      "compression_pct": 88.71459
+    },
+    {
+      "path": "project/src/file_6.py",
+      "access_count": 21,
+      "tokens_saved": 215122,
+      "compression_pct": 92.37144
+    },
+    {
+      "path": "project/src/file_7.py",
+      "access_count": 10,
+      "tokens_saved": 162976,
+      "compression_pct": 96.77622
+    },
+    {
+      "path": "project/src/file_8.py",
+      "access_count": 23,
+      "tokens_saved": 128868,
+      "compression_pct": 92.0282
+    },
+    {
+      "path": "project/src/file_9.py",
+      "access_count": 11,
+      "tokens_saved": 91848,
+      "compression_pct": 88.744606
+    },
+    {
+      "path": "project/src/file_10.py",
+      "access_count": 14,
+      "tokens_saved": 71922,
+      "compression_pct": 46.878548
+    }
+  ]
+}

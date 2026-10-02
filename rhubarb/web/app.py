@@ -1,6 +1,8 @@
 import asyncio
 import contextlib
+import datetime
 import json
+import os
 import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -601,54 +603,154 @@ def lean_ctx_status():
     }
 
 
-def _run_lean_ctx_savings_command() -> str:
-    """Runs `lean-ctx gain --json` and returns its raw stdout. Split out
-    from `lean_ctx_savings()` below as a single injectable call point,
-    mirroring `_run_headroom_savings_command`'s "monkeypatch the one
-    function that actually shells out" pattern -- no real subprocess is
-    spawned in tests.
+def _run_lean_ctx_savings_command(*extra_args: str) -> str:
+    """Runs `lean-ctx gain [extra_args] --json` (plain `gain --json`, or
+    `gain --by-tool --json`) and returns its raw stdout. Split out from
+    `lean_ctx_savings()` below as a single injectable call point, mirroring
+    `_run_headroom_savings_command`'s "monkeypatch the one function that
+    actually shells out" pattern -- no real subprocess is spawned in tests.
 
-    `resolve_lean_ctx_command()`, not a bare `"lean-ctx"` -- same
-    `.cmd`-shim caveat as `check_lean_ctx_presence`/`install_for_platform`."""
+    `resolve_lean_ctx_command()` -- Rhubarb's local install, run against
+    Rhubarb's own data/config dirs (issue #252) so it reports only
+    Rhubarb's ledger, never the user's global one."""
     result = subprocess.run(
-        [lean_ctx_installer.resolve_lean_ctx_command(), "gain", "--json"],
+        [lean_ctx_installer.resolve_lean_ctx_command(), "gain", *extra_args, "--json"],
         capture_output=True,
         text=True,
         check=True,
+        env={**os.environ, **lean_ctx_installer.lean_ctx_env()},
     )
     return result.stdout
+
+
+def _read_lean_ctx_stats() -> dict:
+    """Reads Rhubarb's local lean-ctx ledger (`stats.json` in its data dir)
+    -- the only source of the per-day and per-command numbers, since
+    lean-ctx has no JSON form of its `gain --daily` table. Raises on a
+    missing/unparseable file; the caller treats that as "omit the sections
+    derived from it". The injectable call point tests monkeypatch."""
+    return json.loads((lean_ctx_installer.LEAN_CTX_DATA_DIR / "stats.json").read_text(encoding="utf-8"))
+
+
+def _lean_ctx_today() -> datetime.date:
+    return datetime.date.today()
+
+
+def _number(value) -> float:
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def _savings_percent(saved, before) -> float:
+    return round(saved / before * 100, 1) if before > 0 else 0.0
+
+
+def _lean_ctx_windows(stats: dict, today: datetime.date) -> dict:
+    """today / last 7 days / last 30 days (each window ending today,
+    inclusive) from `stats.json`'s `daily` array. Per day, before =
+    `input_tokens` and saved = `input_tokens - output_tokens` -- the same
+    math as lean-ctx's own `gain --daily` table."""
+    windows = {}
+    for name, days in (("today", 1), ("last_7_days", 7), ("last_30_days", 30)):
+        start = today - datetime.timedelta(days=days - 1)
+        before = saved = 0
+        for day in stats["daily"]:
+            if start <= datetime.date.fromisoformat(day["date"]) <= today:
+                day_before = _number(day.get("input_tokens"))
+                before += day_before
+                saved += day_before - _number(day.get("output_tokens"))
+        windows[name] = {
+            "tokens_saved": saved,
+            "tokens_before": before,
+            "savings_percent": _savings_percent(saved, before),
+        }
+    return windows
+
+
+def _lean_ctx_by_source(stats: dict) -> list[dict]:
+    """MCP tool calls (`ctx_*` commands) vs shell-hook commands (`cli_*`),
+    summing each command's `input_tokens - output_tokens` from
+    `stats.json`. A source's total never goes below zero."""
+    totals = {"ctx_": 0, "cli_": 0}
+    for command, entry in stats["commands"].items():
+        for prefix in totals:
+            if command.startswith(prefix):
+                totals[prefix] += _number(entry.get("input_tokens")) - _number(entry.get("output_tokens"))
+    return [
+        {"source": "MCP", "tokens_saved": max(totals["ctx_"], 0)},
+        {"source": "Shell Hook", "tokens_saved": max(totals["cli_"], 0)},
+    ]
+
+
+def _lean_ctx_by_command() -> list[dict]:
+    """Per-tool savings from `gain --by-tool --json` (`tool`/`saved_tokens`),
+    dropping tools that saved nothing."""
+    rows = json.loads(_run_lean_ctx_savings_command("--by-tool"))
+    return [
+        {"command": row["tool"], "tokens_saved": row["saved_tokens"]}
+        for row in rows
+        if _number(row.get("saved_tokens")) > 0
+    ]
 
 
 @app.get("/api/lean-ctx-savings")
 def lean_ctx_savings():
     """Backend for the Settings token-savings widget/modal (issue #234,
-    part of PRD #232) -- same three-shape contract as `headroom_savings()`
-    above, reusing `_savings_payload_has_data` for the empty-ledger check
-    rather than duplicating it:
-    - `{"available": False}` -- the command failed to run at all (not
-      installed, non-zero exit, or output that isn't valid JSON).
-    - `{"available": True, "empty": True}` -- ran fine, produced valid
-      JSON, but no compressions recorded yet.
-    - `{"available": True, "empty": False, **data}` -- ran fine with real
-      data. `data` is `lean-ctx gain --json`'s own parsed payload, merged
-      through as-is (expected shape per PRD #232: a today/7-day/30-day
-      window breakdown, a per-command breakdown, and an MCP-vs-Shell-Hook
-      breakdown) rather than a guess at exact field names the future
-      widget/modal issues would otherwise be briefed against incorrectly."""
+    reworked by issue #253) -- same three-shape contract as
+    `headroom_savings()` above:
+    - `{"available": False}` -- `lean-ctx gain --json` failed to run at all
+      (not installed, non-zero exit, or output that isn't a JSON object).
+    - `{"available": True, "empty": True}` -- ran fine, but Rhubarb's own
+      ledger has no savings yet (`all_time.tokens_saved` is 0 or missing).
+    - `{"available": True, "empty": False, ...}` -- a fixed schema built
+      here, never a raw pass-through (real `gain --json` only emits
+      `summary`/`tasks`/`heatmap`/`bridge`, which the frontend once guessed
+      wrong):
+      - `all_time`: `{tokens_saved, savings_percent}` from `gain --json`'s
+        `summary`.
+      - `windows`: `{today, last_7_days, last_30_days}`, each
+        `{tokens_saved, tokens_before, savings_percent}`, from
+        `stats.json`'s `daily` array.
+      - `by_command`: `[{command, tokens_saved}]` from `gain --by-tool
+        --json`, zero-saving tools dropped.
+      - `by_source`: `[{source: "MCP", ...}, {source: "Shell Hook", ...}]`
+        from `stats.json`'s `ctx_*` vs `cli_*` commands.
+      Each of `windows`/`by_command`/`by_source` is omitted when its source
+      can't be read, so the frontend shows that section's empty text."""
     try:
-        raw_output = _run_lean_ctx_savings_command()
-        data = json.loads(raw_output)
-        if not isinstance(data, dict):
+        data = json.loads(_run_lean_ctx_savings_command())
+        summary = data.get("summary") or {}
+        if not isinstance(summary, dict):
             return {"available": False}
     except Exception:
         return {"available": False}
-    if not _savings_payload_has_data(data):
+    tokens_saved = _number(summary.get("tokens_saved"))
+    if tokens_saved <= 0:
         return {"available": True, "empty": True}
-    return {"available": True, "empty": False, **data}
+
+    payload = {
+        "available": True,
+        "empty": False,
+        "all_time": {
+            "tokens_saved": tokens_saved,
+            "savings_percent": round(_number(summary.get("total_reduction_pct")), 1),
+        },
+    }
+    try:
+        stats = _read_lean_ctx_stats()
+    except Exception:
+        stats = None
+    if stats is not None:
+        with contextlib.suppress(Exception):
+            payload["windows"] = _lean_ctx_windows(stats, _lean_ctx_today())
+        with contextlib.suppress(Exception):
+            payload["by_source"] = _lean_ctx_by_source(stats)
+    with contextlib.suppress(Exception):
+        payload["by_command"] = _lean_ctx_by_command()
+    return payload
 
 
 # Same live-output pattern as `_headroom_install_lines`/`_caveman_install_lines`
-# above, for the `npm install -g lean-ctx-bin` install -- reset at the start
+# above, for the local `npm install --prefix ... lean-ctx-bin` install -- reset at the start
 # of each install, appended live via `lean_ctx_installer.run_streaming`,
 # polled by `/api/lean-ctx-install-status`.
 _lean_ctx_install_lines: list[str] = []
