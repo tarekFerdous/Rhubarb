@@ -234,10 +234,16 @@ class StreamJsonEngine:
         effort: str | None = None,
         resume_session_id: str | None = None,
         process_factory=None,
+        bypass_headroom: bool = False,
+        disable_thinking: bool = False,
     ):
         self.cwd = cwd
         self.model = model
         self.effort = effort
+        # PRD #254: set only by the parser session -- skip the Headroom
+        # proxy for this engine alone, and turn extended thinking off.
+        self.bypass_headroom = bypass_headroom
+        self.disable_thinking = disable_thinking
 
         # Unlike `PtyEngine`, this transport's native `result` event hands
         # back a real session id from the CLI itself -- there is nothing to
@@ -276,7 +282,9 @@ class StreamJsonEngine:
         no-op if already started."""
         if self._proc is not None:
             return self
-        env = _clean_env()
+        env = _clean_env(bypass_headroom=self.bypass_headroom)
+        if self.disable_thinking:
+            env["MAX_THINKING_TOKENS"] = "0"
         self._proc = self._process_factory(self._build_args(), cwd=self.cwd, env=env)
         return self
 

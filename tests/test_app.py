@@ -1946,3 +1946,43 @@ def test_lean_ctx_stats_are_read_from_rhubarb_data_dir(tmp_path, monkeypatch):
     (tmp_path / "stats.json").write_text(json.dumps(_LEAN_CTX_STATS), encoding="utf-8")
 
     assert app_module._read_lean_ctx_stats() == _LEAN_CTX_STATS
+
+
+# PRD #254: the session snapshot exposes a mid-parse round, and the prompt
+# page handles the `parsing` event type with its event-driven status line.
+
+
+def test_session_snapshot_exposes_parsing_state_for_a_row_mid_parse(client, tmp_path):
+    conn = db.get_connection()
+    conn.execute("INSERT INTO projects (name, path) VALUES ('p', ?)", (str(tmp_path),))
+    conn.commit()
+    project_id = conn.execute("SELECT id FROM projects").fetchone()["id"]
+    card_id = db.create_session(conn, project_id)
+    parsing = {"phase": "grilling", "state": "responding", "raw_text": "❓ **Q1** - New round?"}
+    db.update_session(conn, card_id, parsing_json=json.dumps(parsing))
+
+    sessions = client.get(f"/api/projects/{project_id}/sessions").json()["sessions"]
+
+    assert sessions[0]["parsing"] == parsing
+
+
+def test_session_snapshot_parsing_is_none_when_not_parsing(client, tmp_path):
+    conn = db.get_connection()
+    conn.execute("INSERT INTO projects (name, path) VALUES ('p', ?)", (str(tmp_path),))
+    conn.commit()
+    project_id = conn.execute("SELECT id FROM projects").fetchone()["id"]
+    db.create_session(conn, project_id)
+
+    sessions = client.get(f"/api/projects/{project_id}/sessions").json()["sessions"]
+
+    assert sessions[0]["parsing"] is None
+
+
+def test_prompt_page_handles_the_parsing_event_type(client, monkeypatch):
+    monkeypatch.setattr(app_module, "get_auth_status", lambda: {"loggedIn": True, "email": "a@b.c"})
+
+    html = client.get("/prompt").text
+
+    assert 'event.type === "parsing"' in html
+    assert "Reading questions…" in html
+    assert "Parser responding…" in html

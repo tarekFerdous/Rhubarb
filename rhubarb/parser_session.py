@@ -10,8 +10,8 @@ only the lifecycle slice of that (spawn-on-first-open, reuse-on-reopen,
 independent concurrent sessions across projects, and clean shutdown -- issue
 #189), then grew issue #190's token-ceiling handling: tracking each parser
 session's own context-window usage from its turn results, and draining +
-`/clear`-ing it in place once usage crosses 60% (see `stream_turn`/
-`_CONTEXT_CLEAR_CUTOFF` below). It now also owns issue #191's needs-input
+`/clear`-ing it in place (originally once usage crossed 60%; since PRD
+#254 after every turn -- see `stream_turn` below). It now also owns issue #191's needs-input
 queue (see "Needs-input queue" below) -- the gating/enqueue half of the
 pipeline, fed by `session_runner.handle_turn_completed` -- and issue #192's
 actual dispatch/extraction half (see "Queue draining and structured
@@ -62,9 +62,11 @@ project id, rather than needing any wrapper or subclass.
 import asyncio
 import json
 import re
+import time
 from collections import deque
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
+from rhubarb import error_log
 from rhubarb.ollama_rescue import _is_valid_grilling_shape
 from rhubarb.stream_json_engine import StreamJsonEngine
 
@@ -88,6 +90,13 @@ _parser_sessions: dict[int, StreamJsonEngine] = {}
 # bookkeeping to prune), mirroring this module's own "in-memory, process-
 # lifetime only" contract.
 _locks: dict[int, asyncio.Lock] = {}
+
+# PRD #254 / issue #255: the parser session is a pure extraction worker, so
+# it is always pinned to a small, fast model with low effort and thinking
+# off -- whatever model/effort the project-open flow passes is ignored. Not
+# user-configurable (PRD #254's Out of Scope list).
+PARSER_MODEL = "claude-haiku-4-5-20251001"
+PARSER_EFFORT = "low"
 
 
 def _lock_for(project_id: int) -> asyncio.Lock:
@@ -125,11 +134,11 @@ async def ensure_parser_session(
       spawn, its own `session_id`, spawned/torn down independently of any
       other project's.
 
-    `model`/`effort` only matter for a fresh spawn -- unlike the standby-
-    engine registries in `session_runner.py`, a live parser session is never
-    respawned just because a later call passes different settings (it has
-    no "claim" step to mismatch against; it is the same long-lived session
-    for as long as it stays alive).
+    `model`/`effort` are accepted for the project-open flow's convenience but
+    ignored (PRD #254 / issue #255): every parser session is spawned on
+    `PARSER_MODEL`/`PARSER_EFFORT` with thinking disabled and the Headroom
+    proxy bypassed -- see `_spawn_parser_session`. A session left over from
+    an older configuration is simply replaced on the next fresh spawn.
 
     Double-checked-locking against `project_id`'s own lock so two calls
     racing for the same brand-new project (e.g. two overlapping opens)
@@ -149,18 +158,27 @@ async def ensure_parser_session(
         if existing is not None:
             return existing
 
-        engine = await asyncio.to_thread(_spawn_parser_session, cwd=cwd, model=model, effort=effort)
+        engine = await asyncio.to_thread(_spawn_parser_session, cwd=cwd)
         _parser_sessions[project_id] = engine
         return engine
 
 
-def _spawn_parser_session(*, cwd: str | None, model: str | None, effort: str | None) -> StreamJsonEngine:
+def _spawn_parser_session(*, cwd: str | None) -> StreamJsonEngine:
     """Construct and start a genuinely fresh `StreamJsonEngine` -- no
-    `resume_session_id`, a brand-new conversation. Blocking (a real spawn is
-    a subprocess call) -- `ensure_parser_session` runs this via
-    `asyncio.to_thread`, mirroring `session_runner._spawn_fresh_engine`/
-    `_spawn_fresh_stream_json_engine`."""
-    engine = StreamJsonEngine(cwd=cwd, model=model, effort=effort)
+    `resume_session_id`, a brand-new conversation -- pinned to the parser's
+    own lightweight configuration (PRD #254 / issue #255): `PARSER_MODEL`,
+    `PARSER_EFFORT`, thinking disabled, and the Headroom proxy bypassed
+    (the API key / auth token are still stripped, keeping subscription
+    billing). Blocking (a real spawn is a subprocess call) --
+    `ensure_parser_session` runs this via `asyncio.to_thread`, mirroring
+    `session_runner._spawn_fresh_engine`/`_spawn_fresh_stream_json_engine`."""
+    engine = StreamJsonEngine(
+        cwd=cwd,
+        model=PARSER_MODEL,
+        effort=PARSER_EFFORT,
+        bypass_headroom=True,
+        disable_thinking=True,
+    )
     engine.start()
     return engine
 
@@ -197,10 +215,10 @@ def close_all_parser_sessions() -> None:
 # body for why a parser session's identity must survive a clear).
 # ---------------------------------------------------------------------------
 
-# Claude Code's own interactive statusline threshold this mirrors is a UI
-# nicety; this is a hard gate PRD #187 fixed at 60% of the model's 1M-token
-# context window. Not user-configurable (see PRD #187's Out of Scope list).
-_CONTEXT_CLEAR_CUTOFF = 0.60
+# PRD #254 / issue #255 replaced the original "clear once usage crosses 60%"
+# rule with a `/clear` after EVERY turn, so each extraction runs against a
+# tiny context instead of carrying ~100k tokens of accumulated history. The
+# usage tracking below is kept for diagnostics.
 
 # Last-known context-window usage fraction (0.0-1.0) per project id, updated
 # from every turn's own raw `result` event that carried enough usage data to
@@ -284,20 +302,20 @@ async def stream_turn(project_id: int, prompt: str) -> AsyncIterator[dict]:
     session (call `ensure_parser_session` first -- this looks up, but never
     creates, a session; raises `LookupError` if none is currently live for
     `project_id`), tracking context-window usage from the turn's own
-    `result` event, and handling the 60%-ceiling `/clear` per issue #190.
+    `result` event.
 
     Yields every event the underlying `StreamJsonEngine.stream_turn`
     yields for `prompt`, unmodified and in order -- a parse already in
-    flight is NEVER interrupted by crossing the ceiling, structurally: the
-    ceiling is only ever checked AFTER `prompt`'s own turn has fully
-    finished (its `result` event already yielded), never mid-turn.
+    flight is NEVER interrupted by the clear below, structurally: it only
+    happens AFTER `prompt`'s own turn has fully finished (its `result`
+    event already yielded), never mid-turn.
 
-    If usage is now at/over `_CONTEXT_CLEAR_CUTOFF` once `prompt`'s turn
-    has completed, this drains one `/clear` turn through the SAME engine
-    (`_drain_clear_turn` -- same subprocess, same `session_id`, only
-    history resets) before returning, so the very next `stream_turn` call
-    for this project already starts against a cleared session -- "resume
-    normal processing afterward" per the issue's spec. A synthetic
+    Once `prompt`'s turn has completed, this ALWAYS drains exactly one
+    `/clear` turn through the SAME engine (`_drain_clear_turn` -- same
+    subprocess, same `session_id`, only history resets; PRD #254 / issue
+    #255 replaced issue #190's 60%-ceiling rule with this) before
+    returning, so the very next `stream_turn` call for this project starts
+    against a cleared session. A synthetic
     `{"type": "context_cleared", ...}` event is yielded once that finishes,
     mirroring `stream_translate.py`'s own precedent for injecting
     synthetic (non-CLI-native) event types alongside the CLI's real ones,
@@ -312,9 +330,8 @@ async def stream_turn(project_id: int, prompt: str) -> AsyncIterator[dict]:
         if event.get("type") == "result":
             _record_usage(project_id, event)
 
-    if (_context_pct.get(project_id) or 0.0) >= _CONTEXT_CLEAR_CUTOFF:
-        await _drain_clear_turn(project_id, engine)
-        yield {"type": "context_cleared", "project_id": project_id, "session_id": engine.session_id}
+    await _drain_clear_turn(project_id, engine)
+    yield {"type": "context_cleared", "project_id": project_id, "session_id": engine.session_id}
 
 
 # ---------------------------------------------------------------------------
@@ -771,6 +788,72 @@ async def _retry_extraction_once(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Extraction timing + progress (PRD #254, issues #256/#257).
+#
+# Every extraction measures time-to-first-token (prompt sent -> the parser's
+# first streamed output event) and total duration (prompt sent -> `result`),
+# kept per project alongside the usage tracking above. An extraction slower
+# than `SLOW_EXTRACTION_LOG_SECONDS` is also written to `errors.log` -- a
+# logging-only cutoff that never changes behaviour or UI: nothing here adds
+# a timeout, cancellation or restart.
+#
+# `on_progress(state)` lets a caller (`session_runner`) turn parser stream
+# events into card events without this module knowing about cards:
+# `"started"` right before the extraction prompt is sent, `"responding"` on
+# that prompt's first streamed output event.
+# ---------------------------------------------------------------------------
+
+SLOW_EXTRACTION_LOG_SECONDS = 60.0
+
+# Event types that count as the parser actually producing output for the
+# turn (vs. `system` bookkeeping such as `init`).
+_OUTPUT_EVENT_TYPES = frozenset({"stream_event", "assistant", "result"})
+
+# project_id -> the most recent extraction timings, oldest first. In-memory,
+# process-lifetime only, bounded so a long-lived project can't grow it
+# without limit.
+_extraction_timings: dict[int, deque] = {}
+_MAX_TIMINGS_PER_PROJECT = 100
+
+
+def get_extraction_timings(project_id: int) -> list[dict]:
+    """Read-only snapshot of `project_id`'s recorded extraction timings,
+    oldest first: `{"phase", "card_id", "ttft_s", "total_s"}` dicts, with
+    `ttft_s`/`total_s` `None` when that point was never reached (e.g. the
+    parser died before producing output)."""
+    return list(_extraction_timings.get(project_id, ()))
+
+
+def _record_extraction_timing(
+    project_id: int, *, card_id: int | None, phase: str, ttft_s: float | None, total_s: float | None
+) -> None:
+    timing = {"phase": phase, "card_id": card_id, "ttft_s": ttft_s, "total_s": total_s}
+    _extraction_timings.setdefault(project_id, deque(maxlen=_MAX_TIMINGS_PER_PROJECT)).append(timing)
+    if total_s is not None and total_s > SLOW_EXTRACTION_LOG_SECONDS:
+        ttft_text = f"{ttft_s:.1f}s" if ttft_s is not None else "n/a"
+        error_log.log_error(
+            project_id=project_id,
+            card_id=card_id,
+            phase=phase,
+            message=(
+                f"slow parser extraction: time-to-first-token {ttft_text}, total {total_s:.1f}s "
+                f"(ttft_s={ttft_s}, total_s={total_s})"
+            ),
+        )
+
+
+def _notify_progress(on_progress: Callable[[str], None] | None, state: str) -> None:
+    """Call `on_progress(state)`, never letting a callback bug break the
+    extraction itself."""
+    if on_progress is None:
+        return
+    try:
+        on_progress(state)
+    except Exception:  # noqa: BLE001 -- progress reporting is best-effort
+        pass
+
+
 async def extract_with_validation(
     project_id: int,
     text: str,
@@ -778,6 +861,8 @@ async def extract_with_validation(
     phase: str,
     validator=_is_valid_grilling_shape,
     detect_mismatches: bool = True,
+    card_id: int | None = None,
+    on_progress: Callable[[str], None] | None = None,
 ) -> dict | None:
     """Drive `project_id`'s already-running parser session to extract
     structured question/issue data out of `text` via the `/rhubarb:parse-
@@ -817,6 +902,11 @@ async def extract_with_validation(
     given the size of that generalization -- a known follow-up gap, not
     something silently dropped.
 
+    `card_id` (when known) tags this extraction's timing record and slow-
+    parse log entry; `on_progress` receives `"started"`/`"responding"` (see
+    the "Extraction timing + progress" section above). Neither changes what
+    is returned.
+
     Returns, on a schema-valid response: for the flat shape,
     `{header, questions, footer, source: "parser_session"}` (now possibly
     carrying `extraction_incomplete: true` on individual questions); for the
@@ -828,13 +918,24 @@ async def extract_with_validation(
     via_parser_session` already had before this refactor."""
     prompt = _build_extraction_prompt(phase=phase, text=text)
 
+    started_at = time.monotonic()
+    ttft_s = None
+    total_s = None
+    _notify_progress(on_progress, "started")
     try:
         result_text = None
         async for event in stream_turn(project_id, prompt):
-            if event.get("type") == "result":
+            event_type = event.get("type")
+            if ttft_s is None and event_type in _OUTPUT_EVENT_TYPES:
+                ttft_s = time.monotonic() - started_at
+                _notify_progress(on_progress, "responding")
+            if event_type == "result":
+                total_s = time.monotonic() - started_at
                 result_text = event.get("result")
     except Exception:  # noqa: BLE001 -- a dead/failed parser session is just "extraction failed"
         return None
+    finally:
+        _record_extraction_timing(project_id, card_id=card_id, phase=phase, ttft_s=ttft_s, total_s=total_s)
 
     if result_text is None:
         return None
@@ -1021,9 +1122,9 @@ async def drain_needs_input_queue(project_id: int) -> AsyncIterator[dict]:
 
     Ceiling-crossing safety (issue #190): `_process_one_queued_item` calls
     `stream_turn`, which -- transparently, internally -- drains a `/clear`
-    turn through the SAME still-open subprocess/session if this item's own
-    turn pushed usage over the 60% cutoff, before `stream_turn`'s async
-    generator itself finishes. Since this loop fully awaits that generator
+    turn through the SAME still-open subprocess/session once this item's
+    own turn completes (after every turn since PRD #254), before
+    `stream_turn`'s async generator itself finishes. Since this loop fully awaits that generator
     (via the `async for` inside `_process_one_queued_item`) before ever
     calling `dequeue_needs_input_turn` again, a mid-drain `/clear` can never
     cause an item to be skipped (the next `dequeue` only happens once the

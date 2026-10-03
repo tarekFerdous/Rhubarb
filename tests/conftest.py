@@ -69,6 +69,8 @@ def _isolated_parser_sessions(monkeypatch):
     # so a leftover reading from one test can never be seen by an unrelated
     # test's identically-numbered project.
     monkeypatch.setattr(parser_session, "_context_pct", {})
+    # Same again for PRD #254's per-project extraction timings.
+    monkeypatch.setattr(parser_session, "_extraction_timings", {})
 
 
 @pytest.fixture(autouse=True)
@@ -121,7 +123,7 @@ def _parser_session_engine_is_a_fake_by_default(monkeypatch):
     and test_sessions.py's own `_classify_needs_input_is_a_no_op_by_default`."""
 
     class _NoopParserEngine:
-        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None, **_kwargs):
             self.cwd = cwd
             self.model = model
             self.effort = effort

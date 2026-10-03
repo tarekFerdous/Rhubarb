@@ -164,6 +164,12 @@ def get_connection(db_path: Path | None = None) -> sqlite3.Connection:
         # can recover and re-show it while the turn is still genuinely stuck
         # quiet mid-flight.
         conn.execute("ALTER TABLE sessions ADD COLUMN stalled_json TEXT")
+    if "parsing_json" not in session_columns:
+        # PRD #254: a round persisted before its questions are parsed --
+        # `{"phase", "state", "raw_text"}` while the parser session is
+        # extracting, NULL otherwise -- so a reload mid-parse can rebuild
+        # the card's parsing state instead of showing the previous round.
+        conn.execute("ALTER TABLE sessions ADD COLUMN parsing_json TEXT")
     conn.commit()
     return conn
 

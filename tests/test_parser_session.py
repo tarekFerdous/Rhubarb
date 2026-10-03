@@ -50,18 +50,30 @@ class FakeStreamJsonBackend:
     `/clear`-turn assertions -- a `written_lines` log of every line written
     to it, same as `test_stream_json_engine.py`'s own fake already keeps)."""
 
-    def __init__(self, lines, *, eof_after=True):
+    def __init__(self, lines, *, eof_after=True, answer_clear=True):
         self._lines = list(lines)
         self._eof_after = eof_after
+        # PRD #254 / issue #255: `parser_session.stream_turn` now drains a
+        # `/clear` turn after EVERY turn -- answer it automatically (like the
+        # real CLI would) so every test doesn't have to script that line.
+        self._answer_clear = answer_clear
+        self._last_session_id = None
         self.terminated = False
         self.written_lines = []
 
     def write_line(self, line):
         self.written_lines.append(line)
+        if self._answer_clear and json.loads(line)["message"]["content"] == "/clear":
+            self._lines.insert(0, _result_line(self._last_session_id, text="cleared"))
 
     def read_line(self):
         if self._lines:
-            return self._lines.pop(0)
+            line = self._lines.pop(0)
+            try:
+                self._last_session_id = json.loads(line).get("session_id", self._last_session_id)
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            return line
         if self._eof_after:
             raise EOFError
         return ""
@@ -73,11 +85,9 @@ class FakeStreamJsonBackend:
         self.terminated = True
 
 
-def _result_line(session_id):
-    import json
-
+def _result_line(session_id, text="ok"):
     return json.dumps(
-        {"type": "result", "subtype": "success", "is_error": False, "result": "ok", "session_id": session_id}
+        {"type": "result", "subtype": "success", "is_error": False, "result": text, "session_id": session_id}
     )
 
 
@@ -104,9 +114,14 @@ def _patch_stream_json_engine_process_factory(monkeypatch, factory):
     to a constructor that always injects `factory`."""
 
     class _InjectedStreamJsonEngine(StreamJsonEngine):
-        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None, **_kwargs):
             super().__init__(
-                cwd=cwd, model=model, effort=effort, resume_session_id=resume_session_id, process_factory=factory
+                cwd=cwd,
+                model=model,
+                effort=effort,
+                resume_session_id=resume_session_id,
+                process_factory=factory,
+                **_kwargs,
             )
 
     monkeypatch.setattr(parser_session, "StreamJsonEngine", _InjectedStreamJsonEngine)
@@ -123,6 +138,41 @@ def test_ensure_parser_session_spawns_exactly_one_subprocess_on_first_open(monke
     assert engine.isalive() is True
     assert 1 in parser_session._parser_sessions
     assert parser_session._parser_sessions[1] is engine
+
+
+def test_parser_session_is_pinned_to_haiku_low_effort_no_thinking_regardless_of_passed_settings(monkeypatch):
+    """PRD #254 / issue #255: the project-open flow's model/effort are
+    ignored -- the parser always runs Haiku 4.5, effort low, thinking off."""
+    backend = FakeStreamJsonBackend([], eof_after=False)
+    factory, calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+
+    engine = run(parser_session.ensure_parser_session(1, cwd="/repo", model="claude-sonnet-5", effort="high"))
+
+    argv = calls[0]["argv"]
+    assert argv[argv.index("--model") + 1] == "claude-haiku-4-5-20251001"
+    assert argv[argv.index("--effort") + 1] == "low"
+    assert "claude-sonnet-5" not in argv
+    assert calls[0]["env"]["MAX_THINKING_TOKENS"] == "0"
+    assert engine.model == parser_session.PARSER_MODEL
+
+
+def test_parser_session_bypasses_headroom_and_never_carries_api_credentials(monkeypatch):
+    from rhubarb import cli_client
+
+    monkeypatch.setattr(cli_client, "_headroom_proxy_active", True)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-be-inherited")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok-should-not-be-inherited")
+    backend = FakeStreamJsonBackend([], eof_after=False)
+    factory, calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+
+    run(parser_session.ensure_parser_session(1, cwd="/repo"))
+
+    env = calls[0]["env"]
+    assert "ANTHROPIC_BASE_URL" not in env
+    assert "ANTHROPIC_API_KEY" not in env
+    assert "ANTHROPIC_AUTH_TOKEN" not in env
 
 
 def test_reopening_the_same_project_reuses_the_existing_session_no_new_subprocess(monkeypatch):
@@ -242,8 +292,8 @@ def test_concurrent_ensure_calls_for_the_same_project_spawn_exactly_once(monkeyp
         calls.append(argv)
         return backend
 
-    def slow_spawn(*, cwd, model, effort):
-        engine = StreamJsonEngine(cwd=cwd, model=model, effort=effort, process_factory=slow_factory)
+    def slow_spawn(*, cwd):
+        engine = StreamJsonEngine(cwd=cwd, process_factory=slow_factory)
         engine.start()
         return engine
 
@@ -332,7 +382,7 @@ def _make_fake_parser_engine_class():
     class FakeEngine:
         instances: list["FakeEngine"] = []
 
-        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None, **_kwargs):
             self.cwd = cwd
             self.model = model
             self.effort = effort
@@ -478,17 +528,24 @@ async def _consume(agen):
     return [event async for event in agen]
 
 
-def _written_prompts(backend):
+def _written_prompts(backend, *, include_clear=False):
     """The `content` field of every turn written to `backend`, in order --
     what a test checks to prove exactly which turns (the caller's own
-    prompts vs. an auto-issued `/clear`) actually reached the subprocess."""
-    return [json.loads(line)["message"]["content"] for line in backend.written_lines]
+    prompts vs. an auto-issued `/clear`) actually reached the subprocess.
+    The automatic per-turn `/clear` (PRD #254 / issue #255) is left out
+    unless `include_clear=True`, so tests about the caller's own prompts
+    stay focused on those."""
+    prompts = [json.loads(line)["message"]["content"] for line in backend.written_lines]
+    if include_clear:
+        return prompts
+    return [prompt for prompt in prompts if prompt != "/clear"]
 
 
 def test_stream_turn_tracks_context_pct_from_result_event_usage(monkeypatch):
     backend = FakeStreamJsonBackend(
-        [_result_line_with_usage("session-abc", input_tokens=100_000)], eof_after=False
+        [_result_line_with_usage("session-abc", input_tokens=100_000)], eof_after=False, answer_clear=False
     )
+    backend._lines.append(_result_line("session-abc", text="cleared"))  # the /clear's result, no usage
     factory, _calls = _sequenced_process_factory([backend])
     _patch_stream_json_engine_process_factory(monkeypatch, factory)
     run(parser_session.ensure_parser_session(1, cwd="/repo"))
@@ -498,7 +555,6 @@ def test_stream_turn_tracks_context_pct_from_result_event_usage(monkeypatch):
     run(_consume(parser_session.stream_turn(1, "parse this turn")))
 
     assert parser_session.get_context_pct(1) == pytest.approx(0.10)
-    assert _written_prompts(backend) == ["parse this turn"]  # well under 60%, no /clear issued
 
 
 def test_result_event_without_usage_data_leaves_tracked_pct_unchanged(monkeypatch):
@@ -518,16 +574,15 @@ def test_result_event_without_usage_data_leaves_tracked_pct_unchanged(monkeypatc
     assert parser_session.get_context_pct(1) == pytest.approx(0.10)  # unchanged, not clobbered to None/0
 
 
-def test_crossing_60_percent_does_not_interrupt_the_in_flight_parse(monkeypatch):
-    """The turn that itself pushes usage over the cutoff must still yield
-    every one of its own events normally -- the ceiling is only ever acted
-    on AFTER this turn's `result` event, never mid-turn."""
+def test_the_clear_never_interrupts_the_in_flight_parse(monkeypatch):
+    """The turn's own events must all be yielded normally, INCLUDING its
+    own result -- the per-turn `/clear` (PRD #254 / issue #255) only ever
+    happens AFTER that `result` event, never mid-turn."""
     backend = FakeStreamJsonBackend(
         [
             json.dumps({"type": "system", "subtype": "init", "session_id": "session-abc"}),
             json.dumps({"type": "stream_event", "event": {"delta": "partial text"}}),
             _result_line_with_usage("session-abc", input_tokens=650_000, text="the full parse result"),
-            _result_line_with_usage("session-abc", input_tokens=5_000, text="cleared"),  # the auto /clear's result
         ],
         eof_after=False,
     )
@@ -538,18 +593,20 @@ def test_crossing_60_percent_does_not_interrupt_the_in_flight_parse(monkeypatch)
     events = run(_consume(parser_session.stream_turn(1, "parse this turn")))
 
     kinds = [e["type"] for e in events]
-    # The in-flight parse's own events all made it through untouched, in
-    # order, INCLUDING its own result -- nothing was truncated or dropped
-    # to react to the crossing.
-    assert kinds[:3] == ["system", "stream_event", "result"]
+    assert kinds == ["system", "stream_event", "result", "context_cleared"]
     assert events[2]["result"] == "the full parse result"
+    # The /clear was written only after the parse's own result was read.
+    assert _written_prompts(backend, include_clear=True) == ["parse this turn", "/clear"]
 
 
-def test_crossing_60_percent_sends_clear_turn_to_the_same_subprocess_after_parse_completes(monkeypatch):
+def test_every_turn_is_followed_by_exactly_one_clear_regardless_of_context_pct(monkeypatch):
+    """PRD #254 / issue #255: a `/clear` after EVERY turn, even a turn using
+    a tiny fraction of the context window -- same subprocess, same
+    `session_id`, not a respawn."""
     backend = FakeStreamJsonBackend(
         [
-            _result_line_with_usage("session-abc", input_tokens=650_000),  # crosses 60%
-            _result_line_with_usage("session-abc", input_tokens=5_000),  # the auto /clear's own result
+            _result_line_with_usage("session-abc", input_tokens=1_000),
+            _result_line_with_usage("session-abc", input_tokens=2_000, text="second parse"),
         ],
         eof_after=False,
     )
@@ -557,62 +614,34 @@ def test_crossing_60_percent_sends_clear_turn_to_the_same_subprocess_after_parse
     _patch_stream_json_engine_process_factory(monkeypatch, factory)
     engine = run(parser_session.ensure_parser_session(1, cwd="/repo"))
 
-    events = run(_consume(parser_session.stream_turn(1, "parse this turn")))
+    first = run(_consume(parser_session.stream_turn(1, "first turn")))
+    second = run(_consume(parser_session.stream_turn(1, "second turn")))
 
-    # Exactly two turns reached the subprocess: the caller's own prompt,
-    # then -- and only then -- a `/clear` turn, automatically.
-    assert _written_prompts(backend) == ["parse this turn", "/clear"]
-    # Same subprocess, same session_id -- not a respawn.
+    assert _written_prompts(backend, include_clear=True) == ["first turn", "/clear", "second turn", "/clear"]
     assert len(calls) == 1
     assert engine.session_id == "session-abc"
     assert engine.isalive() is True
-    # The caller can observe the clear happened via the synthetic event.
-    assert events[-1] == {"type": "context_cleared", "project_id": 1, "session_id": "session-abc"}
-    # Tracked usage reflects the /clear turn's own (much lower) reading,
-    # not a hardcoded/assumed zero.
-    assert parser_session.get_context_pct(1) == pytest.approx(0.005)
+    assert first[-1] == {"type": "context_cleared", "project_id": 1, "session_id": "session-abc"}
+    assert second[-2]["result"] == "second parse"
+    assert second[-1]["type"] == "context_cleared"
 
 
-def test_usage_under_60_percent_never_triggers_a_clear_turn(monkeypatch):
+def test_tracked_usage_reflects_the_clear_turns_own_reading(monkeypatch):
     backend = FakeStreamJsonBackend(
-        [_result_line_with_usage("session-abc", input_tokens=300_000)], eof_after=False
+        [
+            _result_line_with_usage("session-abc", input_tokens=650_000),
+            _result_line_with_usage("session-abc", input_tokens=5_000),  # the /clear's own result
+        ],
+        eof_after=False,
+        answer_clear=False,
     )
     factory, _calls = _sequenced_process_factory([backend])
     _patch_stream_json_engine_process_factory(monkeypatch, factory)
     run(parser_session.ensure_parser_session(1, cwd="/repo"))
 
-    events = run(_consume(parser_session.stream_turn(1, "parse this turn")))
+    run(_consume(parser_session.stream_turn(1, "parse this turn")))
 
-    assert _written_prompts(backend) == ["parse this turn"]
-    assert all(e["type"] != "context_cleared" for e in events)
-
-
-def test_turn_submitted_after_the_clear_is_processed_normally(monkeypatch):
-    """A `stream_turn` call made AFTER a prior call already crossed the
-    ceiling and cleared must be a completely ordinary turn: no extra
-    `/clear`, same live subprocess, its own result returned."""
-    backend = FakeStreamJsonBackend(
-        [
-            _result_line_with_usage("session-abc", input_tokens=650_000),  # crosses 60%
-            _result_line_with_usage("session-abc", input_tokens=5_000),  # the auto /clear's own result
-            _result_line_with_usage("session-abc", input_tokens=8_000, text="post-clear parse"),
-        ],
-        eof_after=False,
-    )
-    factory, calls = _sequenced_process_factory([backend])
-    _patch_stream_json_engine_process_factory(monkeypatch, factory)
-    engine = run(parser_session.ensure_parser_session(1, cwd="/repo"))
-
-    run(_consume(parser_session.stream_turn(1, "turn that crosses the ceiling")))
-    events = run(_consume(parser_session.stream_turn(1, "turn after the clear")))
-
-    assert _written_prompts(backend) == ["turn that crosses the ceiling", "/clear", "turn after the clear"]
-    assert len(calls) == 1  # still the same one subprocess throughout
-    assert engine.session_id == "session-abc"
-    assert events[-1]["type"] == "result"
-    assert events[-1]["result"] == "post-clear parse"
-    assert all(e["type"] != "context_cleared" for e in events)  # this turn alone didn't cross anything
-    assert parser_session.get_context_pct(1) == pytest.approx(0.008)
+    assert parser_session.get_context_pct(1) == pytest.approx(0.005)
 
 
 def test_stream_turn_raises_lookup_error_when_no_parser_session_is_registered():
@@ -821,16 +850,14 @@ def test_drain_sends_items_to_the_correct_project_and_leaves_other_projects_alon
     assert parser_session.get_needs_input_queue(2) == []
 
 
-def test_drain_respects_the_drain_then_clear_ceiling_mid_queue(monkeypatch):
-    """Three items queued; the FIRST item's own turn crosses the 60%
-    ceiling, triggering an automatic `/clear` (issue #190) before the queue
-    keeps going. All three must still be processed, in order, none skipped
-    or double-processed, and the `/clear` must reach the subprocess between
-    the first and second items' own extraction turns."""
+def test_drain_clears_between_every_queued_item(monkeypatch):
+    """Three items queued; each item's own extraction turn is followed by
+    an automatic `/clear` (PRD #254 / issue #255) before the queue keeps
+    going. All three must still be processed, in order, none skipped or
+    double-processed, with exactly one `/clear` after each extraction."""
     backend = FakeStreamJsonBackend(
         [
-            _extraction_result_line("session-abc", _VALID_PAYLOAD_1, input_tokens=650_000),  # crosses 60%
-            _result_line_with_usage("session-abc", input_tokens=5_000, text="cleared"),  # the auto /clear's result
+            _extraction_result_line("session-abc", _VALID_PAYLOAD_1, input_tokens=650_000),
             _extraction_result_line("session-abc", _VALID_PAYLOAD_2, input_tokens=8_000),
             _extraction_result_line("session-abc", _VALID_PAYLOAD_3, input_tokens=8_000),
         ],
@@ -850,15 +877,12 @@ def test_drain_respects_the_drain_then_clear_ceiling_mid_queue(monkeypatch):
     assert results[0]["questions"] == _VALID_PAYLOAD_1["questions"]
     assert results[1]["questions"] == _VALID_PAYLOAD_2["questions"]
     assert results[2]["questions"] == _VALID_PAYLOAD_3["questions"]
-    # Same subprocess throughout -- the ceiling crossing never respawned it.
+    # Same subprocess throughout -- clearing never respawned it.
     assert len(calls) == 1
     assert engine.isalive() is True
-    # The `/clear` reached the subprocess exactly once, between the first
-    # and second items' own extraction prompts -- nothing skipped, nothing
-    # sent twice.
-    written = _written_prompts(backend)
-    assert len(written) == 4
-    assert written[1] == "/clear"
+    written = _written_prompts(backend, include_clear=True)
+    assert len(written) == 6
+    assert [w == "/clear" for w in written] == [False, True, False, True, False, True]
     assert parser_session.get_needs_input_queue(1) == []
 
 
@@ -1048,7 +1072,7 @@ def test_extraction_prompt_invokes_the_parse_interview_skill_with_phase_and_text
     # written_lines[0] is the init/resume handshake; written_lines[1] is the
     # first user-turn JSON written to the subprocess stdin.
     assert len(backend.written_lines) >= 1
-    prompt_json = backend.written_lines[-1]
+    prompt_json = backend.written_lines[-2]  # [-1] is the per-turn /clear
     assert "/rhubarb:parse-interview" in prompt_json
     assert "phase: grilling" in prompt_json
     assert "Does this matter?" in prompt_json
@@ -1120,7 +1144,7 @@ def test_reproduces_original_bug_scenario_prompt_carries_the_full_raw_text_throu
 
     # (a) the constructed prompt invokes the new skill and carries the raw
     # text (including the transition phrase) through untouched.
-    prompt_json = backend.written_lines[-1]
+    prompt_json = backend.written_lines[-2]  # [-1] is the per-turn /clear
     assert "/rhubarb:parse-interview" in prompt_json
     assert "phase: grilling" in prompt_json
     assert "One more branch to close" in prompt_json
@@ -1985,3 +2009,132 @@ def test_extract_with_validation_returns_none_when_no_live_session():
     result = run(parser_session.extract_with_validation(999999, "some text", phase="grilling"))
 
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# PRD #254, issues #256/#257: extraction timing (TTFT + total), slow-parse
+# error-log entries, and the `on_progress` hook.
+# ---------------------------------------------------------------------------
+
+
+class _SlowFakeStreamJsonBackend(FakeStreamJsonBackend):
+    """Sleeps `delay_s` before every non-empty read, simulating a slow
+    upstream parser."""
+
+    def __init__(self, lines, *, delay_s, **kwargs):
+        super().__init__(lines, **kwargs)
+        self._delay_s = delay_s
+
+    def read_line(self):
+        import time
+
+        if self._lines:
+            time.sleep(self._delay_s)
+        return super().read_line()
+
+
+def _setup_extraction(monkeypatch, project_id, lines, *, delay_s=0.0):
+    backend = _SlowFakeStreamJsonBackend(lines, delay_s=delay_s, eof_after=False)
+    factory, _calls = _sequenced_process_factory([backend])
+    _patch_stream_json_engine_process_factory(monkeypatch, factory)
+    run(parser_session.ensure_parser_session(project_id, cwd="/repo"))
+    return backend
+
+
+def test_every_extraction_records_ttft_and_total_duration(monkeypatch):
+    _setup_extraction(
+        monkeypatch,
+        1,
+        [
+            json.dumps({"type": "system", "subtype": "init", "session_id": "session-abc"}),
+            json.dumps({"type": "stream_event", "event": {"type": "message_start"}}),
+            _extraction_result_line("session-abc", _VALID_PAYLOAD_1),
+        ],
+        delay_s=0.02,
+    )
+
+    run(parser_session.extract_with_validation(1, "Python or Node?", phase="grilling", card_id=5))
+
+    [timing] = parser_session.get_extraction_timings(1)
+    assert timing["phase"] == "grilling"
+    assert timing["card_id"] == 5
+    assert timing["ttft_s"] is not None and timing["total_s"] is not None
+    assert 0 < timing["ttft_s"] <= timing["total_s"]
+
+
+def test_slow_extraction_writes_exactly_one_error_log_entry(monkeypatch, tmp_path):
+    from rhubarb import error_log
+
+    log_path = tmp_path / "errors.log"
+    monkeypatch.setattr(error_log, "DEFAULT_LOG_PATH", log_path)
+    monkeypatch.setattr(parser_session, "SLOW_EXTRACTION_LOG_SECONDS", 0.05)
+    _setup_extraction(
+        monkeypatch,
+        7,
+        [
+            json.dumps({"type": "stream_event", "event": {"type": "message_start"}}),
+            _extraction_result_line("session-abc", _VALID_PAYLOAD_1),
+        ],
+        delay_s=0.06,
+    )
+
+    result = run(parser_session.extract_with_validation(7, "Python or Node?", phase="grilling", card_id=42))
+
+    # The cutoff only logs -- the extraction itself still succeeds.
+    assert result["questions"] == _VALID_PAYLOAD_1["questions"]
+    errors = error_log.query_errors(7, log_path=log_path)
+    assert len(errors) == 1
+    entry = errors[0]
+    assert entry["project_id"] == 7
+    assert entry["card_id"] == 42
+    assert entry["phase"] == "grilling"
+    assert "time-to-first-token" in entry["message"] and "total" in entry["message"]
+
+
+def test_fast_extraction_writes_no_error_log_entry(monkeypatch, tmp_path):
+    from rhubarb import error_log
+
+    log_path = tmp_path / "errors.log"
+    monkeypatch.setattr(error_log, "DEFAULT_LOG_PATH", log_path)
+    _setup_extraction(monkeypatch, 8, [_extraction_result_line("session-abc", _VALID_PAYLOAD_1)])
+
+    run(parser_session.extract_with_validation(8, "Python or Node?", phase="grilling", card_id=1))
+
+    assert not log_path.exists() or error_log.query_errors(8, log_path=log_path) == []
+
+
+def test_progress_hook_fires_started_then_responding_on_first_output_event(monkeypatch):
+    """`started` before the prompt is written; `responding` on the first
+    streamed OUTPUT event (not the `system` init), exactly once."""
+    backend = _setup_extraction(
+        monkeypatch,
+        1,
+        [
+            json.dumps({"type": "system", "subtype": "init", "session_id": "session-abc"}),
+            json.dumps({"type": "stream_event", "event": {"type": "message_start"}}),
+            json.dumps({"type": "stream_event", "event": {"type": "content_block_delta"}}),
+            _extraction_result_line("session-abc", _VALID_PAYLOAD_1),
+        ],
+    )
+    seen = []
+
+    def on_progress(state):
+        seen.append((state, len(backend.written_lines), len(backend._lines)))
+
+    result = run(parser_session.extract_with_validation(1, "Python or Node?", phase="grilling", on_progress=on_progress))
+
+    assert [state for state, _w, _r in seen] == ["started", "responding"]
+    assert seen[0][1] == 0  # nothing written yet when "started" fires
+    assert seen[1][2] == 2  # fired right after the first stream_event, two lines still unread
+    assert result is not None
+
+
+def test_progress_hook_failure_never_breaks_the_extraction(monkeypatch):
+    _setup_extraction(monkeypatch, 1, [_extraction_result_line("session-abc", _VALID_PAYLOAD_1)])
+
+    def broken(state):
+        raise RuntimeError("boom")
+
+    result = run(parser_session.extract_with_validation(1, "Python or Node?", phase="grilling", on_progress=broken))
+
+    assert result["questions"] == _VALID_PAYLOAD_1["questions"]

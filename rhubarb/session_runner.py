@@ -583,7 +583,27 @@ async def _run_stream_json_turn(
         return holder["turn"]
 
 
-async def _extract_questions_via_parser_session(project_id: int, text: str, *, phase: str) -> dict | None:
+def _parsing_progress(conn, card_id: int, *, phase: str, raw_text: str):
+    """PRD #254: the `on_progress` hook handed to `parser_session.
+    extract_with_validation` for a card's live extraction. Each state
+    (`"started"`, then `"responding"`) is persisted on the row's
+    `parsing_json` -- so a reload mid-parse rebuilds the same state -- and
+    published as a `{"type": "parsing", ...}` event on the card's stream.
+    The existing completion event (e.g. `turn`) still marks the end; the
+    caller clears `parsing_json` once extraction returns. No timeout, no
+    threshold: the state only ever changes on these parser events."""
+
+    def on_progress(state: str) -> None:
+        parsing = {"phase": phase, "state": state, "raw_text": raw_text}
+        db.update_session(conn, card_id, parsing_json=json.dumps(parsing))
+        publish(card_id, {"type": "parsing", **parsing})
+
+    return on_progress
+
+
+async def _extract_questions_via_parser_session(
+    project_id: int, text: str, *, phase: str, card_id: int | None = None, on_progress=None
+) -> dict | None:
     """Issue #221 (child of PRD #187/#220), simplified by issue #230's own
     scope-update to a shared helper, and -- PRD #227 follow-up, gap 1,
     discovered during manual testing/design review after #228/#229/#230 were
@@ -616,16 +636,22 @@ async def _extract_questions_via_parser_session(project_id: int, text: str, *, p
     regex/Ollama-rescue fallback here (unlike
     `parser_session.drain_needs_input_queue`'s own queue path): a caller with
     no live parser session has nothing else to try for this phase anymore."""
-    return await parser_session.extract_with_validation(project_id, text, phase=phase)
+    return await parser_session.extract_with_validation(
+        project_id, text, phase=phase, card_id=card_id, on_progress=on_progress
+    )
 
 
-async def _extract_grilling_questions_via_parser_session(project_id: int, text: str) -> dict | None:
+async def _extract_grilling_questions_via_parser_session(
+    project_id: int, text: str, *, card_id: int | None = None, on_progress=None
+) -> dict | None:
     """Grilling's own call into the shared `_extract_questions_via_parser_
     session` helper above, with phase `"grilling"` -- kept as its own named
     function (rather than inlining the phase literal at `_run_grilling_turn_
     stream_json`'s own call site) since it's referenced by name in this
     module's docstrings/comments elsewhere."""
-    return await _extract_questions_via_parser_session(project_id, text, phase="grilling")
+    return await _extract_questions_via_parser_session(
+        project_id, text, phase="grilling", card_id=card_id, on_progress=on_progress
+    )
 
 
 def _grilling_completion_verdict(parsed: dict) -> tuple[bool, str]:
@@ -772,6 +798,22 @@ async def _run_grilling_turn_stream_json(
     full_text = turn["full_text"]
     console_text = row["console_text"] + "\n\n" + full_text if row["console_text"] else full_text
 
+    # PRD #254 / issue #257: persist the round BEFORE parsing, so a slow or
+    # crashed parse never loses it, and mark the row as parsing (with the
+    # round's raw text) so a reload mid-parse rebuilds that state instead of
+    # showing the previous, already-answered round. `interview_json` is
+    # still only written once extraction returns.
+    db.update_session(
+        conn,
+        card_id,
+        model=model,
+        effort=effort,
+        claude_session_id=turn["session_id"],
+        console_text=console_text,
+        context_pct=turn.get("context_pct"),
+        parsing_json=json.dumps({"phase": "grilling", "state": "pending", "raw_text": full_text}),
+    )
+
     # Issue #221 (child of PRD #187/#220), simplified by issue #230: go
     # straight to this project's live parser session -- the SAME
     # synchronous-extraction contract `parser_session._process_one_queued_
@@ -781,20 +823,16 @@ async def _run_grilling_turn_stream_json(
     # the old `handle_turn_completed` Ollama needs-input classifier gate
     # entirely: grilling always transitions to PRD next, so there is no
     # "needs input" holding state for it to gate into anymore.
-    parsed = await _extract_grilling_questions_via_parser_session(row["project_id"], full_text)
+    parsed = await _extract_grilling_questions_via_parser_session(
+        row["project_id"],
+        full_text,
+        card_id=card_id,
+        on_progress=_parsing_progress(conn, card_id, phase="grilling", raw_text=full_text),
+    )
     if parsed is None:
         parsed = {"header": full_text, "questions": [], "footer": "", "source": None}
 
-    db.update_session(
-        conn,
-        card_id,
-        model=model,
-        effort=effort,
-        claude_session_id=turn["session_id"],
-        console_text=console_text,
-        interview_json=json.dumps(parsed),
-        context_pct=turn.get("context_pct"),
-    )
+    db.update_session(conn, card_id, interview_json=json.dumps(parsed), parsing_json=None)
 
     if parsed["questions"] or publish_when_empty:
         publish(card_id, _turn_event(phase="grilling", interview=parsed))
@@ -1716,7 +1754,9 @@ def _looks_like_qa_attempt(text: str) -> bool:
     return _QA_ATTEMPT_TRIGGER in text.lower()
 
 
-async def _extract_qa_issues_via_skill(project_id: int, text: str) -> dict | None:
+async def _extract_qa_issues_via_skill(
+    project_id: int, text: str, *, card_id: int | None = None, on_progress=None
+) -> dict | None:
     """PRD #227 follow-up, gap 2 (`gh issue view 227`; discovered during
     manual testing/design review after #228/#229/#230 were already closed
     out in code): the QA-grilling analogue of
@@ -1745,7 +1785,7 @@ async def _extract_qa_issues_via_skill(project_id: int, text: str) -> dict | Non
     That queue's own consumer (`parser_session._process_one_queued_item`)
     expects the FLAT `{header, questions, footer}` shape for every phase it
     handles, `"qa_grilling"` included (see `tests/test_parser_session.py`'s
-    `test_drain_respects_the_drain_then_clear_ceiling_mid_queue`, which
+    `test_drain_clears_between_every_queued_item`, which
     asserts a flat-shape result for a `"qa_grilling"`-phase queued item) --
     reusing that same phase string here would have made the skill's own
     `phase:` branching ambiguous for one identical phase name used by two
@@ -1767,8 +1807,29 @@ async def _extract_qa_issues_via_skill(project_id: int, text: str) -> dict | Non
     Callers must treat `None` as "extraction failed", not as "found
     nothing"."""
     return await parser_session.extract_with_validation(
-        project_id, text, phase="qa_grilling_issues", validator=_is_valid_qa_shape, detect_mismatches=False
+        project_id,
+        text,
+        phase="qa_grilling_issues",
+        validator=_is_valid_qa_shape,
+        detect_mismatches=False,
+        card_id=card_id,
+        on_progress=on_progress,
     )
+
+
+async def _extract_qa_issues_for_card(conn, card_id: int, project_id: int, text: str) -> dict | None:
+    """PRD #254 / issue #258: `_extract_qa_issues_via_skill` for a live
+    QA-grilling card -- the row is marked as parsing `text` (and `parsing`
+    events are published) for exactly as long as the extraction runs; the
+    existing qa_grilling `turn` event still marks completion."""
+    parsed = await _extract_qa_issues_via_skill(
+        project_id,
+        text,
+        card_id=card_id,
+        on_progress=_parsing_progress(conn, card_id, phase="qa_grilling", raw_text=text),
+    )
+    db.update_session(conn, card_id, parsing_json=None)
+    return parsed
 
 
 def _qa_result_is_suspicious(qa_parsed: dict, qa_file_text: str | None, terminal_text: str) -> bool:
@@ -1841,7 +1902,7 @@ async def _maybe_extract_needs_input_qa(card_id: int, conn, row, text: str) -> d
     classification = await handle_turn_completed(card_id, conn, row, text, "qa_grilling")
     if classification is None or not classification.get("needs_input"):
         return None
-    rescued = await _extract_qa_issues_via_skill(row["project_id"], text)
+    rescued = await _extract_qa_issues_for_card(conn, card_id, row["project_id"], text)
     if rescued is None or not rescued["issues"]:
         return None
     return rescued
@@ -1890,12 +1951,16 @@ async def _attempt_qa_corrective_retry(
         return None
 
     retry_file_text = read_question_file(cwd, _QA_QUESTION_FILE)
-    retry_parsed = await _extract_qa_issues_via_skill(row["project_id"], retry_file_text) if retry_file_text is not None else None
+    retry_parsed = (
+        await _extract_qa_issues_for_card(conn, card_id, row["project_id"], retry_file_text)
+        if retry_file_text is not None
+        else None
+    )
     if retry_file_text is not None and (retry_parsed is None or not retry_parsed["issues"]):
         delete_question_file(cwd, _QA_QUESTION_FILE)
         retry_parsed = None
     if retry_parsed is None:
-        retry_parsed = await _extract_qa_issues_via_skill(row["project_id"], retry_turn["full_text"])
+        retry_parsed = await _extract_qa_issues_for_card(conn, card_id, row["project_id"], retry_turn["full_text"])
     if retry_parsed is None:
         retry_parsed = {"prd": None, "issues": []}
 
@@ -1925,7 +1990,9 @@ async def _attempt_qa_corrective_retry(
     return retry_parsed, retry_turn
 
 
-async def _extract_implementing_question(project_id: int, text: str) -> dict | None:
+async def _extract_implementing_question(
+    project_id: int, text: str, *, card_id: int | None = None, on_progress=None
+) -> dict | None:
     """Try to pull recognizable question/option content out of an
     implementing turn's rendered `text`, once `classify_needs_input` (issue
     #179, child of PRD #174) has already decided a human needs to read this
@@ -1952,7 +2019,9 @@ async def _extract_implementing_question(project_id: int, text: str) -> dict | N
     missing parser session, an unparseable response, or a response with no
     recognizable question at all), so the caller can fall back to the
     generic reply panel instead of rendering an empty rich-question UI."""
-    parsed = await _extract_questions_via_parser_session(project_id, text, phase="implementing")
+    parsed = await _extract_questions_via_parser_session(
+        project_id, text, phase="implementing", card_id=card_id, on_progress=on_progress
+    )
     return parsed if parsed and parsed["questions"] else None
 
 
@@ -1965,7 +2034,15 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
     and otherwise run the existing tracker-file/QA-handoff/pooling logic
     exactly as before this function existed."""
     console_text = row["console_text"] + "\n\n" + turn["full_text"] if row["console_text"] else turn["full_text"]
-    db.update_session(conn, card_id, console_text=console_text, context_pct=turn.get("context_pct"))
+    # PRD #254 / issue #258: the session id is persisted with the text,
+    # before any needs-input extraction below runs.
+    db.update_session(
+        conn,
+        card_id,
+        console_text=console_text,
+        claude_session_id=turn["session_id"],
+        context_pct=turn.get("context_pct"),
+    )
 
     file_text = read_question_file(cwd, _IMPLEMENT_BLOCKED_FILE)
     blocked = None
@@ -2017,7 +2094,13 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
     # exact `_finish_implement_turn` tail, just N at once.
     classification = await handle_turn_completed(card_id, conn, row, turn["full_text"], "implementing")
     if classification is not None and classification.get("needs_input"):
-        extracted = await _extract_implementing_question(row["project_id"], turn["full_text"])
+        extracted = await _extract_implementing_question(
+            row["project_id"],
+            turn["full_text"],
+            card_id=card_id,
+            on_progress=_parsing_progress(conn, card_id, phase="implementing", raw_text=turn["full_text"]),
+        )
+        db.update_session(conn, card_id, parsing_json=None)
         if extracted is not None:
             # Recognizable question/option content -- render it with the
             # exact same rich question UI grilling's own rounds use.
@@ -2228,14 +2311,22 @@ async def start_move_to_qa_job(card_id: int, *, cwd: str | None) -> None:
         # matches every other `_run_stream_json_turn` call site.
         return
 
-    db.update_session(conn, qa_row_id, console_text=turn["full_text"], context_pct=turn.get("context_pct"))
+    # PRD #254 / issue #258: persist the round (text + session id) BEFORE
+    # any extraction runs, so a slow or crashed parse never loses it.
+    db.update_session(
+        conn,
+        qa_row_id,
+        console_text=turn["full_text"],
+        claude_session_id=turn["session_id"],
+        context_pct=turn.get("context_pct"),
+    )
 
     qa_data = _parse_qa_grilling_block(turn["full_text"])
     qa_prd = qa_data.get("prd") if qa_data is not None else None
 
     qa_file_text = read_question_file(cwd, _QA_QUESTION_FILE)
     qa_parsed = (
-        await _extract_qa_issues_via_skill(row["project_id"], qa_file_text)
+        await _extract_qa_issues_for_card(conn, qa_row_id, row["project_id"], qa_file_text)
         if qa_file_text is not None
         else None
     )
@@ -2246,7 +2337,7 @@ async def start_move_to_qa_job(card_id: int, *, cwd: str | None) -> None:
         delete_question_file(cwd, _QA_QUESTION_FILE)
         qa_parsed = None
     if qa_parsed is None:
-        qa_parsed = await _extract_qa_issues_via_skill(row["project_id"], turn["full_text"])
+        qa_parsed = await _extract_qa_issues_for_card(conn, qa_row_id, row["project_id"], turn["full_text"])
     if qa_parsed is None:
         qa_parsed = {"prd": None, "issues": []}
 

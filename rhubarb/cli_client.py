@@ -86,7 +86,10 @@ def set_headroom_proxy_active(active: bool) -> None:
     _headroom_proxy_active = active
 
 
-def _clean_env() -> dict:
+def _clean_env(*, bypass_headroom: bool = False) -> dict:
+    """`bypass_headroom=True` (PRD #254, only the parser session sets it)
+    never routes through the Headroom proxy, even while it's active -- the
+    API key / auth token are still stripped either way."""
     env = os.environ.copy()
     # Always strip these so the subprocess uses the subscription login, not
     # an API key -- this must happen regardless of Headroom's state.
@@ -95,7 +98,7 @@ def _clean_env() -> dict:
     # Route traffic through the local Headroom proxy when it's active.
     # When not active, ensure any ambient ANTHROPIC_BASE_URL in the parent
     # environment is not passed through either.
-    if _headroom_proxy_active:
+    if _headroom_proxy_active and not bypass_headroom:
         env["ANTHROPIC_BASE_URL"] = _HEADROOM_BASE_URL
     else:
         env.pop("ANTHROPIC_BASE_URL", None)

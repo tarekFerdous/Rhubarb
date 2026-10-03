@@ -196,6 +196,44 @@ def test_start_strips_api_key_and_auth_token_from_child_env(monkeypatch):
     assert "ANTHROPIC_AUTH_TOKEN" not in captured["env"]
 
 
+def test_default_engine_routes_through_headroom_when_active(monkeypatch):
+    """PRD #254 / issue #255: no regression -- every engine that doesn't opt
+    out still points ANTHROPIC_BASE_URL at the Headroom proxy."""
+    from rhubarb import cli_client
+
+    monkeypatch.setattr(cli_client, "_headroom_proxy_active", True)
+    factory, captured = _fake_factory(FakeStreamJsonBackend([]))
+    StreamJsonEngine(process_factory=factory).start()
+
+    assert captured["env"]["ANTHROPIC_BASE_URL"] == cli_client._HEADROOM_BASE_URL
+
+
+def test_bypass_headroom_engine_never_gets_a_base_url_and_still_strips_api_keys(monkeypatch):
+    """PRD #254 / issue #255: the per-instance bypass (set only by the
+    parser session) drops ANTHROPIC_BASE_URL even while Headroom is active
+    -- including an ambient one inherited from the parent env -- and never
+    reintroduces an API key / auth token."""
+    from rhubarb import cli_client
+
+    monkeypatch.setattr(cli_client, "_headroom_proxy_active", True)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://ambient.example")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-be-inherited")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok-should-not-be-inherited")
+    factory, captured = _fake_factory(FakeStreamJsonBackend([]))
+    StreamJsonEngine(process_factory=factory, bypass_headroom=True).start()
+
+    assert "ANTHROPIC_BASE_URL" not in captured["env"]
+    assert "ANTHROPIC_API_KEY" not in captured["env"]
+    assert "ANTHROPIC_AUTH_TOKEN" not in captured["env"]
+
+
+def test_disable_thinking_sets_max_thinking_tokens_to_zero():
+    factory, captured = _fake_factory(FakeStreamJsonBackend([]))
+    StreamJsonEngine(process_factory=factory, disable_thinking=True).start()
+
+    assert captured["env"]["MAX_THINKING_TOKENS"] == "0"
+
+
 def test_start_is_idempotent_and_does_not_respawn():
     backend = FakeStreamJsonBackend([])
     calls = []

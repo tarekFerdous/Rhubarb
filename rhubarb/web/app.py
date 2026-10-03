@@ -920,6 +920,7 @@ def _session_to_dict(row) -> dict:
         "needs_github_login": bool(row["needs_github_login"]),
         "blocked": json.loads(row["blocked_json"]) if row["blocked_json"] else None,
         "stalled": json.loads(row["stalled_json"]) if row["stalled_json"] else None,
+        "parsing": json.loads(row["parsing_json"]) if row["parsing_json"] else None,
     }
 
 

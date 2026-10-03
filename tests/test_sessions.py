@@ -256,7 +256,7 @@ def _mock_parser_session_extraction(
     payload = json.dumps(payload_dict)
 
     class FakeParserEngine:
-        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None, **_kwargs):
             self.session_id = resume_session_id or "parser-session-fake"
             self._alive = False
 
@@ -411,7 +411,7 @@ def _mock_parser_session_autoextract(monkeypatch, project_id, cwd):
     `_fake_autoextract_grilling_shape`."""
 
     class FakeParserEngine:
-        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None, **_kwargs):
             self.session_id = resume_session_id or "parser-session-fake"
             self._alive = False
 
@@ -926,7 +926,7 @@ def _mock_parser_session_sequence(monkeypatch, project_id, cwd, payloads):
     remaining = list(payloads)
 
     class FakeParserEngine:
-        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None, **_kwargs):
             self.session_id = resume_session_id or "parser-session-fake"
             self._alive = False
 
@@ -1309,7 +1309,7 @@ def test_grilling_stall_reply_resumes_grilling_and_can_then_advance(client, tmp_
     _mock_engine(monkeypatch, handler)
 
     class FakeParserEngine:
-        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None, **_kwargs):
             self.session_id = resume_session_id or "parser-session-fake"
             self._alive = False
 
@@ -2341,7 +2341,7 @@ def test_extract_qa_issues_via_skill_invokes_the_parse_interview_skill(client, t
     seen_prompts = []
 
     class FakeParserEngine:
-        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None, **_kwargs):
             self.session_id = resume_session_id or "parser-session-fake"
             self._alive = False
 
@@ -2356,7 +2356,8 @@ def test_extract_qa_issues_via_skill_invokes_the_parse_interview_skill(client, t
             return self._alive
 
         async def stream_turn(self, prompt):
-            seen_prompts.append(prompt)
+            if prompt != "/clear":  # PRD #254's per-turn /clear isn't what this test checks
+                seen_prompts.append(prompt)
             yield {
                 "type": "result",
                 "subtype": "success",
@@ -2403,7 +2404,7 @@ def test_extract_qa_issues_via_skill_returns_none_on_schema_invalid_response(cli
     cwd = _cwd_for(project_id)
 
     class FakeParserEngine:
-        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None):
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None, **_kwargs):
             self.session_id = "parser-session-fake"
             self._alive = False
 
@@ -2941,7 +2942,7 @@ def test_move_to_qa_needs_input_classification_renders_rich_ui_on_genuine_wrapup
         seen["phase"] = phase
         return {"needs_input": True, "reason": "Still worth a follow-up check."}
 
-    async def fake_extract(project_id, raw_text):
+    async def fake_extract(project_id, raw_text, **_kwargs):
         # First call is the primary extraction attempt in
         # `start_move_to_qa_job` itself (finds nothing, matching this
         # genuine wrap-up text); the second is
@@ -2996,7 +2997,7 @@ def test_move_to_qa_needs_input_classification_false_falls_through_to_wrapup(cli
 
     extract_calls = {"n": 0}
 
-    async def fake_extract(project_id, raw_text):
+    async def fake_extract(project_id, raw_text, **_kwargs):
         extract_calls["n"] += 1
         return None
 
@@ -3039,7 +3040,7 @@ def test_move_to_qa_needs_input_true_but_extraction_fails_falls_through_to_wrapu
     async def fake_classify(card_id, conn, text, phase, **kw):
         return {"needs_input": True, "reason": "Looks unfinished."}
 
-    async def fake_extract(project_id, raw_text):
+    async def fake_extract(project_id, raw_text, **_kwargs):
         return None
 
     monkeypatch.setattr(session_runner, "classify_needs_input", fake_classify)
@@ -3102,7 +3103,7 @@ def test_move_to_qa_needs_input_classification_rescues_after_corrective_retry_al
     }
     retry_text_extract_calls = {"n": 0}
 
-    async def fake_extract(project_id, raw_text):
+    async def fake_extract(project_id, raw_text, **_kwargs):
         if raw_text != still_malformed_retry_text:
             return None
         retry_text_extract_calls["n"] += 1
@@ -6049,3 +6050,462 @@ def test_parallel_per_issue_implement_sessions_enqueue_in_fifo_order_under_the_s
     assert [item["phase"] for item in queue] == ["implementing", "implementing"]
     assert queue[0]["text"] == "Confirm before touching schema for PRD 5."
     assert queue[1]["text"] == "Confirm before touching schema for PRD 6."
+
+
+# ---------------------------------------------------------------------------
+# PRD #254 / issue #257: grilling persists the round BEFORE parsing, marks
+# the row as parsing (with the round's raw text), and publishes event-driven
+# `parsing` events (`started` -> `responding`) before the existing `turn`.
+# ---------------------------------------------------------------------------
+
+_GRILLING_ROUND_TEXT = "❓ **Q1** - **Scope**: Should this ship behind a flag?"
+_GRILLING_PARSED_PAYLOAD = {
+    "header": "",
+    "questions": [
+        {
+            "id": "q1",
+            "text": "Should this ship behind a flag?",
+            "kind": "open",
+            "options": None,
+            "recommended": None,
+            "recommended_text": None,
+        }
+    ],
+    "footer": "",
+}
+
+
+def _mock_observing_parser_session(monkeypatch, project_id, cwd, *, payload=None, observe=None, block_forever=False):
+    """A fake parser session whose extraction turn calls `observe()` (from
+    INSIDE extraction, i.e. after `started` and before any output), then
+    streams one `stream_event` (-> `responding`) and the result -- or, with
+    `block_forever`, never produces anything at all (a parse that is merely
+    slow, forever)."""
+    payload = _GRILLING_PARSED_PAYLOAD if payload is None else payload
+
+    class ObservingParserEngine:
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, process_factory=None, **_kwargs):
+            self.session_id = "parser-session-fake"
+            self._alive = False
+
+        def start(self):
+            self._alive = True
+            return self
+
+        def close(self):
+            self._alive = False
+
+        def isalive(self):
+            return self._alive
+
+        async def stream_turn(self, prompt):
+            if prompt == "/clear":
+                yield {"type": "result", "subtype": "success", "is_error": False, "result": "", "session_id": self.session_id}
+                return
+            if observe is not None:
+                observe(prompt)
+            if block_forever:
+                await asyncio.Event().wait()
+            yield {"type": "stream_event", "event": {"type": "message_start"}}
+            yield {
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "result": json.dumps(payload),
+                "session_id": self.session_id,
+            }
+
+    monkeypatch.setattr(parser_session, "StreamJsonEngine", ObservingParserEngine)
+    parser_session._parser_sessions.pop(project_id, None)
+    asyncio.run(parser_session.ensure_parser_session(project_id, cwd=cwd))
+
+
+def _grilling_round_handler(prompt, **kw):
+    return iter([_result_event(_GRILLING_ROUND_TEXT, session_id="grill-session-1")])
+
+
+def _snapshot_for(client, project_id, card_id):
+    sessions = client.get(f"/api/projects/{project_id}/sessions").json()["sessions"]
+    return next(s for s in sessions if s["card_id"] == card_id)
+
+
+def test_grilling_round_is_persisted_before_extraction_is_invoked(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _mock_engine(monkeypatch, _grilling_round_handler)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    seen = {}
+
+    def observe(prompt):
+        row = db.get_session(db.get_connection(), row_id)
+        seen["console_text"] = row["console_text"]
+        seen["claude_session_id"] = row["claude_session_id"]
+        seen["parsing"] = json.loads(row["parsing_json"]) if row["parsing_json"] else None
+        seen["interview_json"] = row["interview_json"]
+        # The reload seam: the session snapshot exposes the parsing state.
+        seen["snapshot_parsing"] = _snapshot_for(client, project_id, row_id)["parsing"]
+
+    _mock_observing_parser_session(monkeypatch, project_id, cwd, observe=observe)
+
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    assert _GRILLING_ROUND_TEXT in seen["console_text"]
+    assert seen["claude_session_id"] == "grill-session-1"
+    assert seen["interview_json"] is None  # still only written after extraction
+    assert seen["parsing"] == {"phase": "grilling", "state": "started", "raw_text": _GRILLING_ROUND_TEXT}
+    assert seen["snapshot_parsing"] == seen["parsing"]
+
+    row = db.get_session(conn, row_id)
+    assert row["parsing_json"] is None  # cleared once extraction returned
+    assert json.loads(row["interview_json"])["questions"] == _GRILLING_PARSED_PAYLOAD["questions"]
+    assert _snapshot_for(client, project_id, row_id)["parsing"] is None
+
+
+def test_grilling_card_stream_gets_parsing_started_then_responding_then_turn(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _mock_engine(monkeypatch, _grilling_round_handler)
+    _mock_observing_parser_session(monkeypatch, project_id, cwd)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    events = live_stream._buffers.get(row_id, [])
+    relevant = [e for e in events if e["type"] in ("parsing", "turn")]
+    assert [(e["type"], e.get("state")) for e in relevant] == [
+        ("parsing", "started"),
+        ("parsing", "responding"),
+        ("turn", None),
+    ]
+    for e in relevant[:2]:
+        assert e["phase"] == "grilling"
+        assert e["raw_text"] == _GRILLING_ROUND_TEXT
+    assert relevant[2]["interview"]["questions"] == _GRILLING_PARSED_PAYLOAD["questions"]
+
+
+def test_grilling_parse_that_never_returns_stays_in_parsing_state_with_no_timeout(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _mock_engine(monkeypatch, _grilling_round_handler)
+    _mock_observing_parser_session(monkeypatch, project_id, cwd, block_forever=True)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+
+    async def _run_until_parsing_then_wait():
+        task = asyncio.create_task(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+        # Let it run well past the point of reaching the parser, then a
+        # while longer: nothing may time out, error, or move on.
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+        assert not task.done()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run_until_parsing_then_wait())
+
+    row = db.get_session(conn, row_id)
+    parsing = json.loads(row["parsing_json"])
+    assert parsing == {"phase": "grilling", "state": "started", "raw_text": _GRILLING_ROUND_TEXT}
+    assert _GRILLING_ROUND_TEXT in row["console_text"]
+    events = live_stream._buffers.get(row_id, [])
+    assert [e for e in events if e["type"] == "parsing"][-1]["state"] == "started"
+    assert not [e for e in events if e["type"] == "turn"]
+    assert not [e for e in events if e.get("error")]
+
+
+def test_grilling_extraction_returning_none_still_takes_the_existing_fallback(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _mock_engine(monkeypatch, _grilling_round_handler)
+
+    async def failed_extraction(project_id, text, **kwargs):
+        return None
+
+    monkeypatch.setattr(session_runner, "_extract_grilling_questions_via_parser_session", failed_extraction)
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["parsing_json"] is None
+    interview = json.loads(row["interview_json"])
+    assert interview == {"header": _GRILLING_ROUND_TEXT, "questions": [], "footer": "", "source": None}
+
+
+# ---------------------------------------------------------------------------
+# PRD #254 / issue #258: QA-grilling and implementing also persist their
+# turn before parsing and publish `parsing` events tagged with their phase.
+# ---------------------------------------------------------------------------
+
+_QA_ROUND_TEXT = 'QA session for PRD 7: "Tracked PRD"\n\nIssue 8: "Child"\nQuestion 1: "Does it work?"\n'
+_QA_PARSED_PAYLOAD = {
+    "prd": {"number": 7, "title": "Tracked PRD"},
+    "issues": [
+        {
+            "number": 8,
+            "title": "Child",
+            "questions": [{"id": "issue8-q1", "text": "Does it work?", "recommended_text": "Yes."}],
+        }
+    ],
+}
+
+
+def _create_implemented_row(conn, project_id):
+    return db.create_session(
+        conn, project_id,
+        session_type="implement", phase="implemented",
+        details={"prd": {"number": 7, "title": "Tracked PRD"}},
+        claude_session_id="old-implement-session-id",
+    )
+
+
+def _qa_row_for(conn, project_id):
+    return next(s for s in db.list_sessions_for_project(conn, project_id) if s["session_type"] == "qa")
+
+
+def test_qa_grilling_round_is_persisted_before_extraction_and_parsing_events_precede_the_turn(
+    client, tmp_path, monkeypatch
+):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _qa_tracker(cwd)
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(_QA_ROUND_TEXT, session_id="qa-session-id")]))
+    conn = db.get_connection()
+    row_id = _create_implemented_row(conn, project_id)
+    seen = {}
+
+    def observe(prompt):
+        qa_row = _qa_row_for(db.get_connection(), project_id)
+        seen["console_text"] = qa_row["console_text"]
+        seen["claude_session_id"] = qa_row["claude_session_id"]
+        seen["parsing"] = json.loads(qa_row["parsing_json"]) if qa_row["parsing_json"] else None
+        seen["snapshot_parsing"] = _snapshot_for(client, project_id, qa_row["id"])["parsing"]
+
+    _mock_observing_parser_session(monkeypatch, project_id, cwd, payload=_QA_PARSED_PAYLOAD, observe=observe)
+
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
+
+    assert seen["console_text"] == _QA_ROUND_TEXT
+    assert seen["claude_session_id"] == "qa-session-id"
+    assert seen["parsing"] == {"phase": "qa_grilling", "state": "started", "raw_text": _QA_ROUND_TEXT}
+    assert seen["snapshot_parsing"] == seen["parsing"]
+
+    qa_row = _qa_row_for(conn, project_id)
+    assert qa_row["parsing_json"] is None
+    events = live_stream._buffers.get(qa_row["id"], [])
+    relevant = [e for e in events if e["type"] == "parsing" or (e["type"] == "turn" and e["phase"] == "qa_grilling")]
+    assert [(e["type"], e.get("state")) for e in relevant] == [
+        ("parsing", "started"),
+        ("parsing", "responding"),
+        ("turn", None),
+    ]
+    assert all(e["phase"] == "qa_grilling" for e in relevant)
+    assert relevant[2]["issues"] == _QA_PARSED_PAYLOAD["issues"]
+
+
+def test_qa_grilling_parse_that_never_returns_stays_in_parsing_state(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _qa_tracker(cwd)
+    _mock_engine(monkeypatch, lambda prompt, **kw: iter([_result_event(_QA_ROUND_TEXT, session_id="qa-session-id")]))
+    _mock_observing_parser_session(monkeypatch, project_id, cwd, block_forever=True)
+    conn = db.get_connection()
+    row_id = _create_implemented_row(conn, project_id)
+
+    async def _run_then_cancel():
+        task = asyncio.create_task(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+        assert not task.done()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run_then_cancel())
+
+    qa_row = _qa_row_for(conn, project_id)
+    assert json.loads(qa_row["parsing_json"]) == {"phase": "qa_grilling", "state": "started", "raw_text": _QA_ROUND_TEXT}
+    events = live_stream._buffers.get(qa_row["id"], [])
+    parsing_events = [e for e in events if e["type"] == "parsing"]
+    assert parsing_events == [{"type": "parsing", "phase": "qa_grilling", "state": "started", "raw_text": _QA_ROUND_TEXT}]
+    assert qa_row["console_text"] == _QA_ROUND_TEXT
+    assert not [e for e in events if e["type"] == "turn"]
+    assert not [e for e in events if e.get("error")]
+
+
+def test_qa_grilling_extraction_returning_none_keeps_the_existing_fallback_chain(client, tmp_path, monkeypatch):
+    """`None` from the skill still flows into today's suspicious-result
+    corrective retry -- unchanged by the parsing state."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _qa_tracker(cwd)
+    prompts = []
+
+    def handler(prompt, **kw):
+        prompts.append(prompt)
+        return iter([_result_event(_QA_ROUND_TEXT, session_id="qa-session-id")])
+
+    _mock_engine(monkeypatch, handler)
+
+    async def failed_extract(project_id, raw_text, **_kwargs):
+        return None
+
+    monkeypatch.setattr(session_runner, "_extract_qa_issues_via_skill", failed_extract)
+    monkeypatch.setattr(session_runner, "classify_needs_input", _fake_classify_needs_input({"needs_input": False}))
+    conn = db.get_connection()
+    row_id = _create_implemented_row(conn, project_id)
+
+    asyncio.run(session_runner.start_move_to_qa_job(row_id, cwd=cwd))
+
+    assert len(prompts) == 2  # the original /rhubarb:qa turn + exactly one corrective retry
+    qa_row = _qa_row_for(conn, project_id)
+    assert qa_row["parsing_json"] is None
+    assert qa_row["error_text"]
+
+
+_IMPLEMENTING_QUESTION_TEXT = "Should I use Python or Node for the worker?"
+_IMPLEMENTING_PARSED_PAYLOAD = {
+    "header": "",
+    "questions": [
+        {
+            "id": "q1",
+            "text": "Python or Node?",
+            "kind": "single",
+            "options": ["Python", "Node"],
+            "recommended": None,
+            "recommended_text": None,
+        }
+    ],
+    "footer": "",
+}
+
+
+def _create_implementing_row(conn, project_id):
+    return db.create_session(
+        conn, project_id, session_type="implement", phase="implementing",
+        details={"prd": {"number": 5, "title": "My PRD"}},
+    )
+
+
+def test_implementing_turn_is_persisted_before_extraction_and_parsing_events_precede_the_turn(
+    client, tmp_path, monkeypatch
+):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _mock_engine(
+        monkeypatch, lambda prompt, **kw: iter([_result_event(_IMPLEMENTING_QUESTION_TEXT, session_id="impl-q1")])
+    )
+    monkeypatch.setattr(
+        session_runner,
+        "classify_needs_input",
+        _fake_classify_needs_input({"needs_input": True, "reason": "Asked which language to use."}),
+    )
+    conn = db.get_connection()
+    row_id = _create_implementing_row(conn, project_id)
+    seen = {}
+
+    def observe(prompt):
+        row = db.get_session(db.get_connection(), row_id)
+        seen["console_text"] = row["console_text"]
+        seen["claude_session_id"] = row["claude_session_id"]
+        seen["parsing"] = json.loads(row["parsing_json"]) if row["parsing_json"] else None
+        seen["snapshot_parsing"] = _snapshot_for(client, project_id, row_id)["parsing"]
+
+    _mock_observing_parser_session(monkeypatch, project_id, cwd, payload=_IMPLEMENTING_PARSED_PAYLOAD, observe=observe)
+
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    assert _IMPLEMENTING_QUESTION_TEXT in seen["console_text"]
+    assert seen["claude_session_id"] == "impl-q1"
+    assert seen["parsing"] == {"phase": "implementing", "state": "started", "raw_text": _IMPLEMENTING_QUESTION_TEXT}
+    assert seen["snapshot_parsing"] == seen["parsing"]
+
+    row = db.get_session(conn, row_id)
+    assert row["parsing_json"] is None
+    events = live_stream._buffers.get(row_id, [])
+    relevant = [e for e in events if e["type"] == "parsing" or (e["type"] == "turn" and e["phase"] == "implementing")]
+    assert [(e["type"], e.get("state")) for e in relevant] == [
+        ("parsing", "started"),
+        ("parsing", "responding"),
+        ("turn", None),
+    ]
+    assert all(e["phase"] == "implementing" for e in relevant)
+    assert relevant[2]["interview"]["questions"] == _IMPLEMENTING_PARSED_PAYLOAD["questions"]
+
+
+def test_implementing_parse_that_never_returns_stays_in_parsing_state(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _mock_engine(
+        monkeypatch, lambda prompt, **kw: iter([_result_event(_IMPLEMENTING_QUESTION_TEXT, session_id="impl-q1")])
+    )
+    monkeypatch.setattr(
+        session_runner,
+        "classify_needs_input",
+        _fake_classify_needs_input({"needs_input": True, "reason": "Asked which language to use."}),
+    )
+    _mock_observing_parser_session(monkeypatch, project_id, cwd, block_forever=True)
+    conn = db.get_connection()
+    row_id = _create_implementing_row(conn, project_id)
+    snapshots = []
+
+    async def _run_then_cancel():
+        task = asyncio.create_task(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+        for _ in range(200):
+            await asyncio.sleep(0.005)
+        snapshots.append(db.get_session(db.get_connection(), row_id)["parsing_json"])
+        assert not task.done()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(_run_then_cancel())
+
+    assert json.loads(snapshots[0]) == {
+        "phase": "implementing",
+        "state": "started",
+        "raw_text": _IMPLEMENTING_QUESTION_TEXT,
+    }
+    events = live_stream._buffers.get(row_id, [])
+    assert not [e for e in events if e["type"] == "turn"]
+    assert not [e for e in events if e.get("error")]
+
+
+def test_implementing_extraction_returning_none_still_falls_back_to_the_generic_reply_panel(
+    client, tmp_path, monkeypatch
+):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+    _mock_engine(
+        monkeypatch, lambda prompt, **kw: iter([_result_event(_IMPLEMENTING_QUESTION_TEXT, session_id="impl-q1")])
+    )
+    monkeypatch.setattr(
+        session_runner,
+        "classify_needs_input",
+        _fake_classify_needs_input({"needs_input": True, "reason": "Asked which language to use."}),
+    )
+
+    async def failed_extract(project_id, text, **_kwargs):
+        return None
+
+    monkeypatch.setattr(session_runner, "_extract_questions_via_parser_session", failed_extract)
+    conn = db.get_connection()
+    row_id = _create_implementing_row(conn, project_id)
+
+    asyncio.run(session_runner.start_implement_job(row_id, 5, cwd=cwd))
+
+    row = db.get_session(conn, row_id)
+    assert row["parsing_json"] is None
+    assert json.loads(row["stalled_json"]) == {"phase": "implementing", "context": "Asked which language to use."}
+    events = live_stream._buffers.get(row_id, [])
+    assert [e for e in events if e["type"] == "turn"][-1]["stalled"] is True

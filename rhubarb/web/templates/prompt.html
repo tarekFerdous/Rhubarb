@@ -44,6 +44,14 @@
       padding-left: 8px;
       border-left: 2px solid var(--fg-muted);
     }
+    /* PRD #254: "round finished, questions being parsed" status line --
+       changes only on parser events, never on a timer/threshold. */
+    .parsing-status {
+      color: var(--fg-muted);
+      font-size: 0.85rem;
+      font-style: italic;
+      margin: 0 0 12px;
+    }
   </style>
 </head>
 <body>
@@ -3116,6 +3124,11 @@
         return;
       }
 
+      if (event.type === "parsing") {
+        applyParsing(cardId, event);
+        return;
+      }
+
       // Ollama-unavailable notification (issue #175): a completed turn's
       // needs-input classification call was attempted but failed/timed out.
       // Purely informational -- shown regardless of which card is currently
@@ -3180,6 +3193,54 @@
       }
     }
 
+    // PRD #254: a round finished streaming and its questions are being
+    // parsed. Recorded on the card's snapshot regardless of focus (so a
+    // refocus shows it), and rendered on the left card when focused. The
+    // status line only ever changes on these parser events -- no timers,
+    // no thresholds, no buttons; the existing `turn` event replaces it.
+    function applyParsing(cardId, event) {
+      const parsing = { phase: event.phase, state: event.state, raw_text: event.raw_text };
+      const prior = cardSnapshots.get(cardId) || { card_id: cardId, session_type: cardSessionTypes.get(cardId) || "do", phase: event.phase };
+      const snapshot = { ...prior, parsing };
+      cardSnapshots.set(cardId, snapshot);
+      if (rightCards.has(cardId)) {
+        rightCards.set(cardId, snapshot);
+        renderQueue();
+      }
+
+      if (cardId !== leftCardId) {
+        // An implementing turn only reaches extraction once the needs-input
+        // classifier said a human is needed -- take over the left card now,
+        // exactly like its later `turn` event would (see applyTurn).
+        if (event.phase === "implementing") takeOverLeftCardForImplementingInput(cardId, snapshot, () => renderParsing(parsing));
+        return;
+      }
+      if (event.phase === "grilling") grillingFeedCurrentTextEl = null;
+      if (event.phase === "implementing") setHeading("Implementing — needs your input");
+      startForm.style.display = "none";
+      showOnly(mainFlowEl);
+      renderParsing(parsing);
+    }
+
+    function parsingStatusText(state) {
+      return state === "responding" ? "Parser responding…" : "Reading questions…";
+    }
+
+    function renderParsing(parsing) {
+      interviewEl.innerHTML = "";
+      interviewEl.scrollTop = 0;
+      if (parsing.raw_text) {
+        const raw = document.createElement("div");
+        raw.className = "preamble md-prose";
+        raw.innerHTML = marked.parse(parsing.raw_text);
+        interviewEl.appendChild(raw);
+      }
+      const status = document.createElement("p");
+      status.className = "parsing-status";
+      status.textContent = parsingStatusText(parsing.state);
+      interviewEl.appendChild(status);
+    }
+
     function applyTurn(cardId, event) {
       // Issue #171 (child of PRD #168): a stall is a heartbeat published
       // mid-turn, not a resolved turn -- the turn lock is still held and
@@ -3241,6 +3302,8 @@
         // session_runner clearing `stalled_json` back to None the moment
         // the completion marker is finally seen.
         stalled: null,
+        // PRD #254: a resolved turn ends any "questions being parsed" state.
+        parsing: null,
       };
       cardSnapshots.set(cardId, snapshot);
 
@@ -3337,28 +3400,12 @@
       if (event.phase === "implementing" && event.interview && event.interview.questions && event.interview.questions.length) {
         if (leftCardId === cardId) {
           setHeading("Implementing — needs your input");
+          startForm.style.display = "none";
+          showOnly(mainFlowEl);
           renderInterview(event.interview, sendImplementReply);
           return;
         }
-
-        if (leftCardId !== null && currentLeftSession) {
-          preBlockedLeftSession = currentLeftSession;
-          rightCards.set(leftCardId, currentLeftSession);
-        }
-        if (eventSource) { eventSource.close(); eventSource = null; }
-        const bgEs = backgroundSources.get(cardId);
-        if (bgEs) { backgroundSources.delete(cardId); eventSource = bgEs; }
-
-        blockedTakeoverCardId = cardId;
-        leftCardId = cardId;
-        turnInFlight = false;
-        currentLeftSession = snapshot;
-        refreshModelEffortCard();
-        startForm.style.display = "none";
-        setHeading("Implementing — needs your input");
-        showOnly(mainFlowEl);
-        renderInterview(event.interview, sendImplementReply);
-        renderQueue();
+        takeOverLeftCardForImplementingInput(cardId, snapshot, () => renderInterview(event.interview, sendImplementReply));
         return;
       }
 
@@ -3404,6 +3451,31 @@
         // after /rhubarb:publish-to-github's `gh issue create` calls.
         setTimeout(loadPrdList, 10000);
       }
+    }
+
+    // Issue #179's implementing needs-input takeover (a stuck
+    // implementation needs a human regardless of which card is focused),
+    // shared by applyTurn and -- PRD #254 -- applyParsing, which starts it
+    // as soon as that turn's question is being parsed.
+    function takeOverLeftCardForImplementingInput(cardId, snapshot, renderFn) {
+      if (leftCardId !== null && currentLeftSession) {
+        preBlockedLeftSession = currentLeftSession;
+        rightCards.set(leftCardId, currentLeftSession);
+      }
+      if (eventSource) { eventSource.close(); eventSource = null; }
+      const bgEs = backgroundSources.get(cardId);
+      if (bgEs) { backgroundSources.delete(cardId); eventSource = bgEs; }
+
+      blockedTakeoverCardId = cardId;
+      leftCardId = cardId;
+      turnInFlight = false;
+      currentLeftSession = snapshot;
+      refreshModelEffortCard();
+      startForm.style.display = "none";
+      setHeading("Implementing — needs your input");
+      showOnly(mainFlowEl);
+      renderFn();
+      renderQueue();
     }
 
     function minimizeLeftCardToBackground(cardId, es) {
@@ -4103,10 +4175,19 @@
         return;
       }
 
+      // PRD #254: a round persisted but still being parsed (live snapshot
+      // from `parsing` events, or `_session_to_dict`'s persisted `parsing`
+      // after a reload) shows its raw text + status, never the previous round.
+      const parsing = snap.parsing !== undefined ? snap.parsing : session.parsing;
+
       if (session.phase === "grilling") {
         startForm.style.display = "none";
         setHeading(headingForPhase("grilling"));
         showOnly(mainFlowEl);
+        if (parsing && parsing.phase === "grilling") {
+          renderParsing(parsing);
+          return;
+        }
         renderInterview(session.interview || { header: "", questions: [], footer: "" });
         return;
       }
@@ -4117,7 +4198,19 @@
         const prdNum = snap.prd?.number || snap.details?.prd?.number || "";
         setHeading(`QA — PRD #${prdNum}`);
         showOnly(mainFlowEl);
+        if (parsing && parsing.phase === "qa_grilling") {
+          renderParsing(parsing);
+          return;
+        }
         renderQaGrilling(snap);
+        return;
+      }
+
+      if (session.phase === "implementing" && parsing && parsing.phase === "implementing") {
+        startForm.style.display = "none";
+        setHeading("Implementing — needs your input");
+        showOnly(mainFlowEl);
+        renderParsing(parsing);
         return;
       }
 
