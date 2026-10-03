@@ -622,3 +622,131 @@ def test_close_terminates_a_live_process():
 def test_close_is_a_noop_when_never_started():
     engine = StreamJsonEngine(process_factory=lambda *a, **kw: FakeStreamJsonBackend([]))
     engine.close()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Deliberate close() mid-turn (issue #260, PRD #259): a closed engine ends its
+# turn with `StreamJsonEngineClosedError` -- never an `AttributeError` on a
+# `None` backend, and never a crash-retry respawn of the closed process.
+# ---------------------------------------------------------------------------
+
+
+class BlockingStreamJsonBackend(FakeStreamJsonBackend):
+    """Serves its queued lines, then BLOCKS in `read_line()` (like a real
+    pipe with a live process and nothing new yet) until `terminate()` is
+    called -- at which point the blocked read raises `EOFError`, exactly what
+    `_PopenBackend.read_line` does once a killed process's stdout closes."""
+
+    def __init__(self, lines):
+        super().__init__(lines, eof_after=False)
+        import threading
+
+        self.blocked = threading.Event()
+        self._killed = threading.Event()
+
+    def read_line(self):
+        self.reads += 1
+        if self._lines:
+            return self._lines.pop(0)
+        self.blocked.set()
+        self._killed.wait(timeout=5)
+        raise EOFError
+
+    def terminate(self, force=False):
+        self.terminated = True
+        self._killed.set()
+
+
+def test_close_between_yielded_events_raises_closed_error_and_never_respawns():
+    from rhubarb.stream_json_engine import StreamJsonEngineClosedError
+
+    backend = FakeStreamJsonBackend(
+        [json.dumps({"type": "system", "subtype": "init"}), _result_line("done", "s1")]
+    )
+    factory, calls = _sequenced_factory([backend])
+    engine = StreamJsonEngine(process_factory=factory)
+
+    async def scenario():
+        agen = engine.stream_turn("go")
+        first = await agen.__anext__()
+        assert first["type"] == "system"
+        engine.close()
+        await agen.__anext__()
+
+    with pytest.raises(StreamJsonEngineClosedError):
+        run(scenario())
+
+    assert len(calls) == 1  # no respawn of the deliberately closed process
+
+
+def test_close_while_a_read_is_blocked_raises_closed_error_and_never_respawns():
+    from rhubarb.stream_json_engine import StreamJsonEngineClosedError
+
+    backend = BlockingStreamJsonBackend([])
+    factory, calls = _sequenced_factory([backend])
+    engine = StreamJsonEngine(process_factory=factory)
+
+    async def scenario():
+        task = asyncio.ensure_future(_collect(engine.stream_turn("go")))
+        await asyncio.to_thread(backend.blocked.wait, 5)
+        engine.close()
+        await task
+
+    with pytest.raises(StreamJsonEngineClosedError):
+        run(scenario())
+
+    assert len(calls) == 1
+
+
+def test_closed_error_is_not_an_attribute_error_when_blank_line_follows_close():
+    """A blank read after `close()` used to hit `self._proc.is_alive()` on a
+    `None` backend -- the reported `'NoneType' object has no attribute`
+    crash shape."""
+    from rhubarb.stream_json_engine import StreamJsonEngineClosedError
+
+    backend = FakeStreamJsonBackend([json.dumps({"type": "system"}), ""], eof_after=False)
+    factory, calls = _sequenced_factory([backend])
+    engine = StreamJsonEngine(process_factory=factory)
+
+    async def scenario():
+        agen = engine.stream_turn("go")
+        await agen.__anext__()
+        engine.close()
+        await agen.__anext__()
+
+    with pytest.raises(StreamJsonEngineClosedError):
+        run(scenario())
+    assert len(calls) == 1
+
+
+def test_stream_turn_on_an_already_closed_engine_raises_closed_error_without_spawning():
+    from rhubarb.stream_json_engine import StreamJsonEngineClosedError
+
+    backend = FakeStreamJsonBackend([_result_line("x", "s")])
+    factory, calls = _sequenced_factory([backend])
+    engine = StreamJsonEngine(process_factory=factory)
+    engine.start()
+    engine.close()
+
+    with pytest.raises(StreamJsonEngineClosedError):
+        run(_collect(engine.stream_turn("go")))
+    assert len(calls) == 1
+
+
+def test_start_after_close_spawns_nothing():
+    from rhubarb.stream_json_engine import StreamJsonEngineClosedError
+
+    factory, calls = _sequenced_factory([FakeStreamJsonBackend([]), FakeStreamJsonBackend([])])
+    engine = StreamJsonEngine(process_factory=factory)
+    engine.start()
+    engine.close()
+
+    with pytest.raises(StreamJsonEngineClosedError):
+        engine.start()
+    assert len(calls) == 1
+
+
+def test_closed_error_is_distinct_from_the_unrecoverable_crash_error():
+    from rhubarb.stream_json_engine import StreamJsonEngineClosedError
+
+    assert not issubclass(StreamJsonEngineClosedError, StreamJsonEngineUnrecoverableError)

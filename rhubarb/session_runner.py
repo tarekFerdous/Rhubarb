@@ -18,6 +18,8 @@ headless-originated session proved unreliable under full interactive mode).
 """
 
 import asyncio
+import contextvars
+import functools
 import json
 import re
 from pathlib import Path
@@ -102,7 +104,11 @@ from rhubarb.cli_client import ClaudeCLIError
 from rhubarb.live_stream import publish
 from rhubarb.ollama_rescue import _is_valid_qa_shape, classify_turn_needs_input
 from rhubarb.question_files import delete_question_file, read_question_file
-from rhubarb.stream_json_engine import StreamJsonEngine, StreamJsonEngineUnrecoverableError
+from rhubarb.stream_json_engine import (
+    StreamJsonEngine,
+    StreamJsonEngineClosedError,
+    StreamJsonEngineUnrecoverableError,
+)
 from rhubarb.stream_translate import translate_event
 
 # Filenames under `.claude/` a skill writes its structured question/blocked
@@ -189,17 +195,108 @@ def _context_window_pct(raw_result_event: dict) -> float | None:
     return used / context_window
 
 
-# Per-card_id lock guarding a turn's actual write/read against a duplicate
-# overlapping call for the same card_id (issue #144) -- a confirmed race
-# where two turn-initiating requests for the same session (e.g. a
-# double-clicked button, a retried request) could both reach the same
-# resident engine's `stream_turn` at once, interleaving writes and reads on
-# a connection that only ever expects one turn in flight. Mirrors
-# `_stream_json_engines`'s own per-card_id lifecycle: created on first use
-# by `_get_turn_lock`, popped (and discarded) by `_close_stream_json_engine`
-# alongside the engine itself so the registry never grows unboundedly over a
-# long-running instance.
+# Per-card_id lock guarding a card against two overlapping jobs (issue #144)
+# -- a confirmed race where two turn-initiating requests for the same
+# session (e.g. a double-clicked button, a retried request) could both reach
+# the same resident engine's `stream_turn` at once. Issue #261 (PRD #259)
+# widened it from "the stream only" to the WHOLE job: turn, parser-session
+# extraction, completion verdict, DB updates, and the advance into the next
+# phase (see `_card_job`). Created on first use by `_get_turn_lock`; dropped
+# again by teardown or job end only while no job holds it, so the registry
+# never grows unboundedly and a held lock is never swapped out.
 _turn_locks: dict[int, asyncio.Lock] = {}
+
+_TURN_IN_PROGRESS_ERROR = "Another turn for this session is already in progress -- please wait for it to finish."
+
+
+class _JobScope:
+    """One running job (issue #261): the card locks it holds, and the engine
+    instance it last used per card, so its teardown closes only that
+    instance. Bound to the task that created it -- a task spawned from
+    inside a job (`asyncio.create_task` copies the context) is not part of
+    it."""
+
+    def __init__(self, task: asyncio.Task | None):
+        self.task = task
+        self.held: dict[int, asyncio.Lock] = {}
+        self.engines: dict[int, StreamJsonEngine] = {}
+
+
+_job_scope: contextvars.ContextVar[_JobScope | None] = contextvars.ContextVar("_job_scope", default=None)
+
+
+def _current_job_scope() -> _JobScope | None:
+    scope = _job_scope.get()
+    if scope is not None and scope.task is asyncio.current_task():
+        return scope
+    return None
+
+
+def _publish_turn_in_progress(card_id: int, phase: str | None) -> None:
+    """Issue #149: a rejected duplicate publishes an explicit error `turn`
+    event instead of vanishing silently."""
+    lookup_row = db.get_session(db.get_connection(), card_id)
+    if phase is None:
+        phase = lookup_row["phase"] if lookup_row is not None else "unknown"
+    publish(
+        card_id,
+        _turn_event(
+            phase=phase,
+            error=_TURN_IN_PROGRESS_ERROR,
+            needs_github_login=False,
+            card_id=card_id,
+            project_id=lookup_row["project_id"] if lookup_row is not None else None,
+        ),
+    )
+
+
+def _release_card_lock(card_id: int, lock: asyncio.Lock) -> None:
+    lock.release()
+    _apply_pending_settings(card_id)
+    if card_id not in _stream_json_engines and _turn_locks.get(card_id) is lock:
+        del _turn_locks[card_id]
+
+
+def _card_job(fn):
+    """Run a public job function (first positional argument: `card_id`)
+    holding that card's lock for the whole job (issue #261). A second job
+    for the same card while one is running is rejected immediately with
+    the "already in progress" error `turn` event and returns `None`. Nested
+    calls inside the same job (e.g. grilling -> `advance_past_grilling` ->
+    each chain step) reuse the lock instead of re-acquiring it. Any further
+    card a job runs a turn on (the move-to-QA handoff's new QA row) is
+    locked lazily by `_run_stream_json_turn` and released here too."""
+
+    @functools.wraps(fn)
+    async def wrapper(card_id, *args, **kwargs):
+        scope = _current_job_scope()
+        if scope is not None:
+            if card_id in scope.held:
+                return await fn(card_id, *args, **kwargs)
+            lock = _get_turn_lock(card_id)
+            if lock.locked():
+                _publish_turn_in_progress(card_id, None)
+                return None
+            await lock.acquire()
+            scope.held[card_id] = lock
+            return await fn(card_id, *args, **kwargs)
+
+        lock = _get_turn_lock(card_id)
+        if lock.locked():
+            _publish_turn_in_progress(card_id, None)
+            return None
+        await lock.acquire()
+        scope = _JobScope(asyncio.current_task())
+        scope.held[card_id] = lock
+        token = _job_scope.set(scope)
+        try:
+            return await fn(card_id, *args, **kwargs)
+        finally:
+            _job_scope.reset(token)
+            for held_card_id, held_lock in scope.held.items():
+                _release_card_lock(held_card_id, held_lock)
+
+    return wrapper
 
 
 def _get_turn_lock(card_id: int) -> asyncio.Lock:
@@ -226,8 +323,13 @@ def close_session(conn, card_id: int) -> None:
     No literal `/clear` turn is sent first -- the process is destroyed
     directly, same rationale as `_spawn_fresh_stream_json_engine`'s
     docstring: the point is to end this conversation for good, not to
-    round-trip a slash command into a process that may itself be mid-turn."""
-    _close_stream_json_engine(card_id)
+    round-trip a slash command into a process that may itself be mid-turn.
+
+    Issue #260: this stays a hard cancel of whatever engine the card has
+    right now, even mid-job -- the interrupted turn ends silently via
+    `StreamJsonEngineClosedError`."""
+    _pending_settings.pop(card_id, None)
+    _hard_close_stream_json_engine(card_id)
     db.update_session(conn, card_id, phase="closed")
     publish(card_id, {"type": "closed", "card_id": card_id})
 
@@ -257,19 +359,59 @@ def _maybe_respawn_for_settings_change(
     fresh conversation has a new session id and nothing yet measured for
     `context_pct`). Only ever touches `_stream_json_engines[card_id]` -- no
     other card's engine, and no project's standby engine, is read or written
-    here. Always returns True; callers only call this once they've already
-    confirmed (via `get_engine_model_effort`) that `card_id` has a live
-    engine to replace."""
-    _close_stream_json_engine(card_id)
+    here. Callers only call this once they've already confirmed (via
+    `get_engine_model_effort`) that `card_id` has a live engine to replace.
+
+    Issue #262: while the card's job lock is held (a turn, or the
+    extraction/advance after it, is running), nothing is torn down -- the
+    new model/effort is recorded in `_pending_settings` and applied by
+    `_apply_pending_settings` the moment that job ends. Returns `"applied"`
+    for an immediate respawn, `"deferred"` otherwise."""
+    if _get_turn_lock(card_id).locked():
+        _pending_settings[card_id] = {"model": model, "effort": effort, "cwd": cwd}
+        return "deferred"
+    _hard_close_stream_json_engine(card_id)
     engine = _spawn_fresh_stream_json_engine(cwd=cwd, model=model, effort=effort)
     _stream_json_engines[card_id] = engine
     db.update_session(
         conn, card_id, claude_session_id=engine.session_id, model=model, effort=effort, context_pct=None
     )
-    return True
+    return "applied"
 
 
-def respawn_engine_for_model_change(conn, card_id: int | None, *, cwd: str | None, model: str | None) -> bool:
+# card_id -> {"model", "effort", "cwd"} recorded by a settings change made
+# while that card's job was running (issue #262), applied when the job ends.
+_pending_settings: dict[int, dict] = {}
+
+
+def _apply_pending_settings(card_id: int) -> None:
+    """Called as a card's job releases its lock (issue #262): respawn the
+    card's engine under a model/effort change deferred during that job, so
+    the card's next turn runs under the new settings. Dropped if the job
+    left no live engine for the card (nothing to respawn -- the same no-op
+    an idle change on an engine-less card gets)."""
+    pending = _pending_settings.pop(card_id, None)
+    if pending is None or card_id not in _stream_json_engines:
+        return
+    _maybe_respawn_for_settings_change(
+        db.get_connection(), card_id, cwd=pending["cwd"], model=pending["model"], effort=pending["effort"]
+    )
+
+
+def _settings_target(card_id: int) -> tuple[str | None, str | None] | None:
+    """The `(model, effort)` a settings change on `card_id` should start
+    from: a still-pending deferred change if there is one (so a model change
+    followed by an effort change mid-turn keeps both), else the live
+    engine's own."""
+    pending = _pending_settings.get(card_id)
+    if pending is not None:
+        return pending["model"], pending["effort"]
+    return get_engine_model_effort(card_id)
+
+
+def respawn_engine_for_model_change(
+    conn, card_id: int | None, *, cwd: str | None, model: str | None
+) -> str | None:
     """Called from `POST /api/settings/model` (issue #141) with `card_id`
     naming the currently-open/visible session card, if any -- the frontend's
     `leftCardId` at the moment the model selector changed. When that card
@@ -279,31 +421,35 @@ def respawn_engine_for_model_change(conn, card_id: int | None, *, cwd: str | Non
     global setting, so a model-only change never silently also changes
     effort.
 
-    Returns False (a pure no-op -- touches no engine, no row) when `card_id`
-    is None or names a card with no live engine: the caller's global
-    `db.set_model` write already happened either way and is unaffected by
-    this function's return value. This is exactly today's behavior for
-    every existing caller that doesn't pass a `card_id`."""
+    Returns `None` (a pure no-op -- touches no engine, no row) when
+    `card_id` is None or names a card with no live engine: the caller's
+    global `db.set_model` write already happened either way and is
+    unaffected by this function's return value. This is exactly today's
+    behavior for every existing caller that doesn't pass a `card_id`.
+    Otherwise `"applied"` or `"deferred"` (issue #262, see
+    `_maybe_respawn_for_settings_change`)."""
     if card_id is None:
-        return False
-    engine_model_effort = get_engine_model_effort(card_id)
+        return None
+    engine_model_effort = _settings_target(card_id)
     if engine_model_effort is None:
-        return False
+        return None
     _, current_effort = engine_model_effort
     return _maybe_respawn_for_settings_change(conn, card_id, cwd=cwd, model=model, effort=current_effort)
 
 
-def respawn_engine_for_effort_change(conn, card_id: int | None, *, cwd: str | None, effort: str | None) -> bool:
+def respawn_engine_for_effort_change(
+    conn, card_id: int | None, *, cwd: str | None, effort: str | None
+) -> str | None:
     """Symmetric to `respawn_engine_for_model_change` above, for `POST
     /api/settings/effort` -- `model` is read off the live engine's own
     ground truth instead of the global setting, so an effort-only change
     never silently also changes model. See that function's docstring for
     the no-op/return-value contract, which is identical here."""
     if card_id is None:
-        return False
-    engine_model_effort = get_engine_model_effort(card_id)
+        return None
+    engine_model_effort = _settings_target(card_id)
     if engine_model_effort is None:
-        return False
+        return None
     current_model, _ = engine_model_effort
     return _maybe_respawn_for_settings_change(conn, card_id, cwd=cwd, model=current_model, effort=effort)
 
@@ -400,18 +546,68 @@ def register_stream_json_engine(card_id: int, engine: StreamJsonEngine) -> None:
     _stream_json_engines[card_id] = engine
 
 
-def _close_stream_json_engine(card_id: int) -> None:
-    """Close and forget this card's resident tab, if any -- called whenever
-    a card's tab finishes: pooled for reuse, fully done, handed off to a
-    different card_id (the /implement -> /qa auto-handoff), or errored out
-    (a later retry reattaches a fresh tab via `--resume` instead of
-    continuing to drive a process that just raised). Also drops this card's
-    turn lock from `_turn_locks`, recreated on first use by the next
-    incarnation."""
+def _register_job_engine(card_id: int, engine: StreamJsonEngine) -> None:
+    """Register `engine` as `card_id`'s resident tab and, inside a job,
+    record it as the engine this job owns for that card (issue #261)."""
+    _stream_json_engines[card_id] = engine
+    scope = _current_job_scope()
+    if scope is not None:
+        scope.engines[card_id] = engine
+
+
+def _job_engine(card_id: int) -> StreamJsonEngine | None:
+    """The engine instance the calling job may tear down for `card_id`
+    (issue #261): the one it last used, or -- while it holds the card's
+    lock -- whatever is registered. Outside a job, the registered engine,
+    unless another job currently holds the card (then `None`: hands off)."""
+    scope = _current_job_scope()
+    if scope is not None:
+        if card_id in scope.engines:
+            return scope.engines[card_id]
+        if card_id in scope.held:
+            return _stream_json_engines.get(card_id)
+    lock = _turn_locks.get(card_id)
+    if lock is not None and lock.locked():
+        return None
+    return _stream_json_engines.get(card_id)
+
+
+def _close_stream_json_engine(card_id: int, engine: StreamJsonEngine | None = None) -> None:
+    """Close this job's own tab for `card_id` -- called whenever a card's
+    tab finishes: pooled for reuse, fully done, handed off to a different
+    card_id (the /implement -> /qa handoff), or errored out (a later retry
+    reattaches a fresh tab via `--resume` instead of continuing to drive a
+    process that just raised).
+
+    Identity-safe (issue #261): closes only `engine` (default: the calling
+    job's engine, see `_job_engine`), and unregisters it only if the
+    registry still maps `card_id` to that same instance -- a newer engine
+    another job registered is left untouched. The card's turn lock is
+    dropped only while no job holds it."""
+    if engine is None:
+        engine = _job_engine(card_id)
+    if engine is not None:
+        if _stream_json_engines.get(card_id) is engine:
+            del _stream_json_engines[card_id]
+        engine.close()
+        scope = _current_job_scope()
+        if scope is not None and scope.engines.get(card_id) is engine:
+            del scope.engines[card_id]
+    lock = _turn_locks.get(card_id)
+    if lock is not None and not lock.locked():
+        del _turn_locks[card_id]
+
+
+def _hard_close_stream_json_engine(card_id: int) -> None:
+    """Close and forget whatever engine `card_id` has right now, regardless
+    of which job registered it -- only for a user-initiated session close
+    and an idle settings respawn. A held turn lock is left in place."""
     engine = _stream_json_engines.pop(card_id, None)
     if engine is not None:
         engine.close()
-    _turn_locks.pop(card_id, None)
+    lock = _turn_locks.get(card_id)
+    if lock is not None and not lock.locked():
+        del _turn_locks[card_id]
 
 
 async def ensure_standby_stream_json_engine(
@@ -452,13 +648,15 @@ def claim_standby_stream_json_engine(
     return engine
 
 
-def close_standby_stream_json_engine(project_id: int) -> None:
-    """Close and discard `project_id`'s standby, if any -- called when a
-    project is closed or switched away from, so a standby never leaks past
-    the project it was warmed for."""
-    existing = _standby_stream_json_engines.pop(project_id, None)
-    if existing is not None:
-        existing[0].close()
+def close_all_standby_stream_json_engines() -> None:
+    """Close every project's standby and clear the registry. Issue #263
+    (PRD #259): a project Close/switch no longer touches its standby -- it
+    lives until Rhubarb itself exits, like a parser session -- so this is
+    called only from the web app's shutdown hook. Safe on an empty
+    registry."""
+    for engine, _model, _effort in _standby_stream_json_engines.values():
+        engine.close()
+    _standby_stream_json_engines.clear()
 
 
 def _spawn_fresh_stream_json_engine(*, cwd: str | None, model: str | None, effort: str | None) -> StreamJsonEngine:
@@ -511,76 +709,101 @@ async def _run_stream_json_turn(
 
     Issue #144: guarded by this card's turn lock (`_get_turn_lock`) so two
     overlapping calls for the same `card_id` can never both write to and
-    read from the same resident engine at once. If the lock is already
-    held -- a genuine in-flight turn for this card_id -- this call (issue
-    #149) publishes an explicit error `turn` event (`_turn_event`, tagged
-    with the caller's own in-flight `phase`) on this card's stream, then
-    returns `None` immediately, touching neither the engine nor anything
-    else. Every caller must check for `None` and return early rather than
-    treat it as a normal completed (or failed) turn -- and must NOT publish
-    or log anything further for this case, since the error has already
-    been surfaced here.
+    read from the same resident engine at once. Inside a `_card_job` that
+    already holds the lock (issue #261), the turn just runs; a job that
+    doesn't hold it yet acquires it here and keeps it until the job ends.
+    If another job holds it, this call (issue #149) publishes an explicit
+    error `turn` event (`_turn_event`, tagged with the caller's own
+    in-flight `phase`) on this card's stream, then returns `None`
+    immediately, touching neither the engine nor anything else.
+
+    Issue #260: a turn whose engine was deliberately closed (a session
+    close mid-turn) also returns `None` -- silently: no error event, no
+    error log. Every caller must check for `None` and return early rather
+    than treat it as a normal completed (or failed) turn -- and must NOT
+    publish or log anything further, since either the error has already
+    been surfaced here or whoever closed the engine owns what happens next.
 
     Raises `ClaudeCLIError` on an ordinary failure, or propagates
     `StreamJsonEngineUnrecoverableError` (this engine's own internal
     crash-retry-once already gave up) unwrapped -- callers route that into
     the blocked-card flow (see `_route_crash_to_blocked`) instead of
     treating it like a plain `ClaudeCLIError`."""
+    scope = _current_job_scope()
+    if scope is not None and card_id in scope.held:
+        return await _run_locked_stream_json_turn(
+            card_id, prompt, session_id=session_id, cwd=cwd, model=model, effort=effort
+        )
+
     lock = _get_turn_lock(card_id)
     if lock.locked():
-        lookup_conn = db.get_connection()
-        lookup_row = db.get_session(lookup_conn, card_id)
-        publish(
-            card_id,
-            _turn_event(
-                phase=phase,
-                error="Another turn for this session is already in progress -- please wait for it to finish.",
-                needs_github_login=False,
-                card_id=card_id,
-                project_id=lookup_row["project_id"] if lookup_row is not None else None,
-            ),
-        )
+        _publish_turn_in_progress(card_id, phase)
         return None
 
-    async with lock:
-        holder: dict = {}
+    await lock.acquire()
+    if scope is not None:
+        # Held until the job ends (`_card_job` releases it).
+        scope.held[card_id] = lock
+        return await _run_locked_stream_json_turn(
+            card_id, prompt, session_id=session_id, cwd=cwd, model=model, effort=effort
+        )
+    try:
+        return await _run_locked_stream_json_turn(
+            card_id, prompt, session_id=session_id, cwd=cwd, model=model, effort=effort
+        )
+    finally:
+        _release_card_lock(card_id, lock)
 
-        async def runner():
-            engine = _get_or_create_stream_json_engine(
-                card_id, cwd=cwd, model=model, effort=effort, resume_session_id=session_id
-            )
-            text_chunks: list[str] = []
-            async for raw_event in engine.stream_turn(prompt):
-                translated = translate_event(raw_event)
-                if translated is None:
-                    continue
-                if translated["type"] == "text":
-                    text_chunks.append(translated["text"])
-                if translated["type"] == "turn":
-                    translated["context_pct"] = _context_window_pct(raw_event)
-                    translated["full_text"] = "".join(text_chunks) or translated["result"]
-                    holder["turn"] = translated
-                    continue
-                publish(card_id, translated)
 
-        try:
-            await runner()
-        except StreamJsonEngineUnrecoverableError:
-            raise
-        except ClaudeCLIError as e:
-            holder["error"] = e
-        except Exception as e:
-            # Anything unexpected (a malformed raw event, a bug in
-            # translation) must still resolve into a recorded session
-            # error, not an unhandled exception on the fire-and-forget
-            # asyncio task -- that would leave the card stuck in its
-            # in-flight phase silently instead of surfacing the failure to
-            # the user.
-            holder["error"] = ClaudeCLIError(str(e))
+async def _run_locked_stream_json_turn(
+    card_id: int, prompt: str, *, session_id: str | None, cwd: str | None, model: str | None, effort: str | None
+) -> dict | None:
+    """`_run_stream_json_turn`'s body, run with the card's lock held."""
+    holder: dict = {}
 
-        if "error" in holder:
-            raise holder["error"]
-        return holder["turn"]
+    async def runner():
+        engine = _get_or_create_stream_json_engine(
+            card_id, cwd=cwd, model=model, effort=effort, resume_session_id=session_id
+        )
+        scope = _current_job_scope()
+        if scope is not None:
+            scope.engines[card_id] = engine
+        text_chunks: list[str] = []
+        async for raw_event in engine.stream_turn(prompt):
+            translated = translate_event(raw_event)
+            if translated is None:
+                continue
+            if translated["type"] == "text":
+                text_chunks.append(translated["text"])
+            if translated["type"] == "turn":
+                translated["context_pct"] = _context_window_pct(raw_event)
+                translated["full_text"] = "".join(text_chunks) or translated["result"]
+                holder["turn"] = translated
+                continue
+            publish(card_id, translated)
+
+    try:
+        await runner()
+    except StreamJsonEngineClosedError:
+        # Issue #260: closed on purpose (e.g. the user closed the
+        # session) -- a silent stop, never an error.
+        return None
+    except StreamJsonEngineUnrecoverableError:
+        raise
+    except ClaudeCLIError as e:
+        holder["error"] = e
+    except Exception as e:
+        # Anything unexpected (a malformed raw event, a bug in
+        # translation) must still resolve into a recorded session
+        # error, not an unhandled exception on the fire-and-forget
+        # asyncio task -- that would leave the card stuck in its
+        # in-flight phase silently instead of surfacing the failure to
+        # the user.
+        holder["error"] = ClaudeCLIError(str(e))
+
+    if "error" in holder:
+        raise holder["error"]
+    return holder["turn"]
 
 
 def _parsing_progress(conn, card_id: int, *, phase: str, raw_text: str):
@@ -898,7 +1121,7 @@ async def _maybe_clear_for_next_phase(card_id: int, conn, row, *, cwd: str | Non
 
     _close_stream_json_engine(card_id)
     engine = await asyncio.to_thread(_spawn_fresh_stream_json_engine, cwd=cwd, model=row["model"], effort=row["effort"])
-    _stream_json_engines[card_id] = engine
+    _register_job_engine(card_id, engine)
     new_session_id = engine.session_id
     db.update_session(conn, card_id, claude_session_id=new_session_id, context_pct=None)
     return new_session_id
@@ -1209,6 +1432,9 @@ async def _run_chain_step(
     function re-runs `handle_turn_completed` on every turn it drives,
     including a reply-resumed one, so it naturally re-persists/re-returns
     not-ok if the reply still doesn't satisfy the classifier."""
+    if row["phase"] == "closed":
+        # Issue #260: the user closed this card mid-job -- stop silently.
+        return False, None, ""
     db.update_session(conn, row["id"], phase=phase, error_text=None, needs_github_login=0)
     publish(card_id, {"type": "phase", "phase": phase})
 
@@ -1352,6 +1578,7 @@ async def _run_chain_from(
     await _finish_chain(card_id, conn, claude_session_id, cwd, summary=last_result)
 
 
+@_card_job
 async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
     """Grilling just finished: run /to-prd, /to-issues, /publish-to-github
     (live-streamed) via `_run_chain_from`. Uses the model already recorded
@@ -1379,6 +1606,7 @@ async def advance_past_grilling(card_id: int, cwd: str | None) -> None:
     )
 
 
+@_card_job
 async def continue_stalled_chain_step_job(card_id: int, reply: str, *, cwd: str | None) -> None:
     """Called from `POST /api/sessions/{card_id}/stall-reply` when the
     paused phase is `creating_prd`/`creating_issues`/`publishing` (issue
@@ -1403,6 +1631,7 @@ async def continue_stalled_chain_step_job(card_id: int, reply: str, *, cwd: str 
     )
 
 
+@_card_job
 async def start_do_continue_job(card_id: int, prompt: str, *, cwd: str | None) -> None:
     """Start a fresh grilling round on a /do session sitting at
     `phase="details"` -- the Continue button on the do-finished banner
@@ -1429,7 +1658,7 @@ async def start_do_continue_job(card_id: int, prompt: str, *, cwd: str | None) -
         engine = await asyncio.to_thread(
             _spawn_fresh_stream_json_engine, cwd=cwd, model=model, effort=effort
         )
-        _stream_json_engines[card_id] = engine
+        _register_job_engine(card_id, engine)
         db.update_session(conn, card_id, claude_session_id=engine.session_id, context_pct=None)
         row = db.get_session(conn, card_id)
 
@@ -1442,6 +1671,7 @@ async def start_do_continue_job(card_id: int, prompt: str, *, cwd: str | None) -
     )
 
 
+@_card_job
 async def start_session_job(card_id: int, prompt: str, *, cwd: str | None) -> None:
     """A brand-new grilling session begins here -- read the currently
     configured model once, now, and use it for this session's entire
@@ -1472,6 +1702,7 @@ async def start_session_job(card_id: int, prompt: str, *, cwd: str | None) -> No
     )
 
 
+@_card_job
 async def continue_session_job(card_id: int, reply: str, *, cwd: str | None) -> None:
     """A grilling reply.
 
@@ -1598,6 +1829,7 @@ def _launch_implement(
     return row_id
 
 
+@_card_job
 async def start_pending_implement(card_id: int, *, cwd: str | None) -> None:
     """Called from `POST .../start-implementing` once the user clicks
     Proceed on a manually-clicked PRD sitting in `awaiting_proceed` --
@@ -1664,6 +1896,7 @@ async def _drain_implement_queue(project_id: int, cwd: str | None) -> None:
     _launch_implement(conn, project_id, entry["number"], entry["title"], cwd)
 
 
+@_card_job
 async def start_implement_job(card_id: int, prd_number: int, *, cwd: str | None) -> None:
     """Run a single `/implement prd: N` turn end to end: `implementing` while
     it's in flight, then `implemented` on success with details replaced by
@@ -2178,6 +2411,7 @@ async def _finish_implement_turn(card_id: int, conn, row, turn: dict, *, cwd: st
     await _drain_implement_queue(row["project_id"], cwd)
 
 
+@_card_job
 async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -> None:
     """Called from POST /api/sessions/{card_id}/implement-reply. Resumes a
     `phase: blocked` session with the user's reply as the next turn's
@@ -2238,6 +2472,7 @@ async def continue_implement_job(card_id: int, reply: str, *, cwd: str | None) -
     await _finish_implement_turn(card_id, conn, row, turn, cwd=cwd)
 
 
+@_card_job
 async def start_move_to_qa_job(card_id: int, *, cwd: str | None) -> None:
     """Started by POST /api/sessions/{card_id}/move-to-qa (issue #250, child
     of PRD #244) -- the sole way a QA session starts now, replacing the old
@@ -2410,6 +2645,7 @@ async def start_qa_job(card_id: int, prd: dict | None, issues: list[dict], *, cw
     })
 
 
+@_card_job
 async def continue_qa_job(card_id: int, answers: dict, extra_notes: str, *, cwd: str | None) -> None:
     """Called from POST /api/session/qa-complete. Unblocks the QA session by
     running Phase 3+ with the user's per-question answers (keyed by question
@@ -2502,6 +2738,7 @@ async def continue_qa_job(card_id: int, answers: dict, extra_notes: str, *, cwd:
     publish(card_id, {"type": "done"})
 
 
+@_card_job
 async def retry_session_job(card_id: int, cwd: str | None) -> None:
     """Resume a session left in `creating_prd` or `creating_issues` -- either
     because that phase errored (e.g. GitHub auth) or because the app process

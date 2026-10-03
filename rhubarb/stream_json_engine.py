@@ -118,6 +118,16 @@ class StreamJsonEngineUnrecoverableError(StreamJsonEngineError):
         self.session_id = session_id
 
 
+class StreamJsonEngineClosedError(RuntimeError):
+    """Raised by `stream_turn` (and `start`) when this engine was deliberately
+    `close()`d -- before the turn started, or while it was in flight (issue
+    #260, PRD #259). Distinct from a crash on purpose: it is NOT a
+    `StreamJsonEngineError`, so neither the crash retry-once path nor any
+    caller's crash handling ever catches it, and a closed process is never
+    respawned. Whoever closed the engine owns what happens next; the
+    interrupted turn just ends."""
+
+
 class StreamJsonBackend(Protocol):
     """The minimal surface `StreamJsonEngine` needs from a spawned `claude`
     subprocess -- a thin line-oriented wrapper over stdin/stdout pipes, no
@@ -255,6 +265,9 @@ class StreamJsonEngine:
 
         self._process_factory = process_factory or _spawn_subprocess
         self._proc: StreamJsonBackend | None = None
+        # Set by `close()` only -- never by the internal crash-restart
+        # teardown -- so a deliberately closed engine is never respawned.
+        self._closed = False
 
     def _build_args(self) -> list[str]:
         args = [
@@ -280,6 +293,8 @@ class StreamJsonEngine:
     def start(self) -> "StreamJsonEngine":
         """Spawn (or, for a reattach, respawn) the subprocess. Idempotent
         no-op if already started."""
+        if self._closed:
+            raise StreamJsonEngineClosedError("engine was closed; not spawning")
         if self._proc is not None:
             return self
         env = _clean_env(bypass_headroom=self.bypass_headroom)
@@ -295,13 +310,19 @@ class StreamJsonEngine:
         this engine was constructed with `resume_session_id=`, or an
         earlier turn through this same instance already completed and
         recorded one); otherwise there is no established session yet to
-        resume, so the respawn is a fresh one, same as the original."""
-        self.close()
+        resume, so the respawn is a fresh one, same as the original.
+
+        Uses `_teardown()`, not `close()`: a crash restart must not mark
+        the engine closed."""
+        self._teardown()
         if self.session_id:
             self._is_resume = True
         self.start()
 
-    async def _write_turn(self, prompt: str) -> None:
+    def _closed_error(self) -> StreamJsonEngineClosedError:
+        return StreamJsonEngineClosedError("engine was closed while a turn was in flight")
+
+    async def _write_turn(self, proc: StreamJsonBackend, prompt: str) -> None:
         """Write `prompt` to the subprocess's stdin as the exact shape
         confirmed working in the empirical spike this issue is built from:
         `{"type": "user", "message": {"role": "user", "content": <text>}}`.
@@ -311,11 +332,15 @@ class StreamJsonEngine:
         anything else (see the module docstring's "Multi-line prompts"
         section -- this is the structural reason this transport has no
         PRD #180/#181-style submission failure mode)."""
-        assert self._proc is not None
         message = {"type": "user", "message": {"role": "user", "content": prompt}}
-        await asyncio.to_thread(self._proc.write_line, json.dumps(message))
+        try:
+            await asyncio.to_thread(proc.write_line, json.dumps(message))
+        except Exception:
+            if self._closed:
+                raise self._closed_error() from None
+            raise
 
-    async def _read_events_until_result(self) -> AsyncIterator[dict]:
+    async def _read_events_until_result(self, proc: StreamJsonBackend) -> AsyncIterator[dict]:
         """Read NDJSON lines off stdout, one per line, YIELDING each parsed
         event as soon as it's read (this is the actual live-streaming
         behavior `stream_turn` promises its caller -- see the bug this
@@ -342,18 +367,32 @@ class StreamJsonEngine:
         Raises `StreamJsonEngineError` if the process ends before a `result`
         line ever arrives -- `stream_turn` decides what to do with that
         (retries once via `_restart_after_death`, mirroring `PtyEngine.
-        stream_turn`)."""
-        assert self._proc is not None
+        stream_turn`).
+
+        `proc` is the attempt's own local reference to its backend (issue
+        #260): a concurrent `close()` sets `self._proc` to `None`, and this
+        loop must never re-read that attribute mid-turn. Any read that ends
+        after `close()` raises `StreamJsonEngineClosedError` instead."""
         while True:
+            if self._closed:
+                raise self._closed_error()
             try:
-                line = await asyncio.to_thread(self._proc.read_line)
+                line = await asyncio.to_thread(proc.read_line)
             except EOFError:
+                if self._closed:
+                    raise self._closed_error() from None
                 raise StreamJsonEngineError(
                     "claude process ended before printing a result event"
                 ) from None
+            except Exception:
+                if self._closed:
+                    raise self._closed_error() from None
+                raise
+            if self._closed:
+                raise self._closed_error()
             stripped = line.strip()
             if not stripped:
-                if not self._proc.is_alive():
+                if not proc.is_alive():
                     raise StreamJsonEngineError(
                         "claude process ended before printing a result event"
                     )
@@ -394,14 +433,16 @@ class StreamJsonEngine:
         exchange for genuine live streaming on the overwhelmingly common
         non-crash path."""
         self.start()
-        assert self._proc is not None
 
         last_event: dict | None = None
 
         async def _one_attempt() -> AsyncIterator[dict]:
             nonlocal last_event
-            await self._write_turn(prompt)
-            async for event in self._read_events_until_result():
+            proc = self._proc
+            if self._closed or proc is None:
+                raise self._closed_error()
+            await self._write_turn(proc, prompt)
+            async for event in self._read_events_until_result(proc):
                 last_event = event
                 yield event
 
@@ -409,11 +450,18 @@ class StreamJsonEngine:
             async for event in _one_attempt():
                 yield event
         except StreamJsonEngineError as first_error:
+            # A deliberately closed engine is never restarted (issue #260).
+            if self._closed:
+                raise self._closed_error() from None
             try:
                 self._restart_after_death()
                 async for event in _one_attempt():
                     yield event
+            except StreamJsonEngineClosedError:
+                raise
             except Exception as second_error:
+                if self._closed:
+                    raise self._closed_error() from None
                 raise StreamJsonEngineUnrecoverableError(
                     "claude process died twice in a row for the same turn "
                     f"(first: {first_error}; after one automatic --resume restart: "
@@ -436,13 +484,20 @@ class StreamJsonEngine:
             return False
 
     def close(self) -> None:
-        """Terminate the underlying subprocess, if one was started. Safe to
-        call more than once or when never started."""
-        if self._proc is None:
+        """Terminate the underlying subprocess, if one was started, and mark
+        this engine closed for good: an in-flight turn ends with
+        `StreamJsonEngineClosedError`, and nothing respawns it. Safe to call
+        more than once or when never started."""
+        self._closed = True
+        self._teardown()
+
+    def _teardown(self) -> None:
+        proc = self._proc
+        self._proc = None
+        if proc is None:
             return
         try:
-            if self._proc.is_alive():
-                self._proc.terminate(force=True)
+            if proc.is_alive():
+                proc.terminate(force=True)
         except Exception:
             pass
-        self._proc = None

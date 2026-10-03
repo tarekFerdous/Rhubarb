@@ -455,8 +455,7 @@ def test_opening_a_second_project_via_the_endpoint_gets_its_own_parser_session(c
 def test_closing_a_project_does_not_tear_down_its_parser_session(client, tmp_path, monkeypatch):
     """Per PRD #187, a parser session's lifetime is independent of project
     UI focus -- closing (or switching away from) a project must leave its
-    parser session alive, unlike the standby engine `close_project` does
-    explicitly close."""
+    parser session alive."""
     fake_class = _mock_parser_engine(monkeypatch)
     project_id = _create_project(client, tmp_path, "proj")
 

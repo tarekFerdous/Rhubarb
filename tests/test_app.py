@@ -547,23 +547,74 @@ def test_open_project_schedules_a_standby_prewarm(client, tmp_path, monkeypatch)
     assert calls[0]["effort"] == db.DEFAULT_EFFORT
 
 
-def test_close_project_closes_its_standby(client, tmp_path, monkeypatch):
-    """`close_project` closes the project's standby `StreamJsonEngine` --
-    the only engine transport since issue #225 removed `PtyEngine`."""
+def _alive_fake_standby():
+    class FakeStandby:
+        session_id = "standby-session"
+        model = None
+        effort = None
+
+        def __init__(self):
+            self.closed = False
+
+        def isalive(self):
+            return not self.closed
+
+        def close(self):
+            self.closed = True
+
+    return FakeStandby()
+
+
+def test_close_project_leaves_its_standby_alive_for_the_next_do(client, tmp_path, monkeypatch):
+    """Issue #263 (PRD #259): project Close no longer closes the project's
+    standby -- reopening the project and claiming it needs no new spawn."""
     root = tmp_path / "root"
     root.mkdir()
     _init_repo(root / "repo1", "https://github.com/x/repo1.git")
     client.post("/api/settings/root-dir", json={"root_dir": str(root)})
     project_id = client.get("/api/app-state").json()["projects"][0]["id"]
 
-    stream_json_calls = []
-    monkeypatch.setattr(
-        app_module.session_runner, "close_standby_stream_json_engine", lambda pid: stream_json_calls.append(pid)
-    )
+    standby = _alive_fake_standby()
+    app_module.session_runner._standby_stream_json_engines[project_id] = (standby, "m", "auto")
 
     client.post(f"/api/projects/{project_id}/close", json={})
 
-    assert stream_json_calls == [project_id]
+    assert standby.closed is False
+    assert app_module.session_runner._standby_stream_json_engines[project_id][0] is standby
+    assert app_module.session_runner.claim_standby_stream_json_engine(project_id, model="m", effort="auto") is standby
+
+
+def test_close_project_leaves_in_flight_card_engines_running(client, tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    _init_repo(root / "repo1", "https://github.com/x/repo1.git")
+    client.post("/api/settings/root-dir", json={"root_dir": str(root)})
+    project_id = client.get("/api/app-state").json()["projects"][0]["id"]
+
+    card_engine = _alive_fake_standby()
+    app_module.session_runner._stream_json_engines[424242] = card_engine
+    try:
+        client.post(f"/api/projects/{project_id}/close", json={})
+        assert card_engine.closed is False
+        assert app_module.session_runner._stream_json_engines[424242] is card_engine
+    finally:
+        app_module.session_runner._stream_json_engines.pop(424242, None)
+
+
+def test_app_shutdown_closes_every_standby_engine(monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(db, "DEFAULT_DB_PATH", tmp_path / "rhubarb.db")
+    monkeypatch.setattr(db, "OLD_DB_PATH", tmp_path / "not-a-real-legacy-db" / "baton.db")
+    monkeypatch.setattr(app_module, "_active_project_id", None)
+    standbys = [_alive_fake_standby(), _alive_fake_standby()]
+
+    with TestClient(app_module.app):
+        app_module.session_runner._standby_stream_json_engines[1] = (standbys[0], None, None)
+        app_module.session_runner._standby_stream_json_engines[2] = (standbys[1], None, None)
+
+    assert all(s.closed for s in standbys)
+    assert app_module.session_runner._standby_stream_json_engines == {}
 
 
 def test_session_start_claims_a_matching_standby_engine(client, tmp_path, monkeypatch):

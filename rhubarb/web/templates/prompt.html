@@ -2663,7 +2663,11 @@
       modelSelectCardEl.value = knownModel;
       modelSelectSettingsEl.value = knownModel;
 
-      if (data.respawned) {
+      if (data.deferred) {
+        // Issue #262: this card's turn is still running -- the backend
+        // applies the change once it finishes. Leave `turnInFlight` alone.
+        modelChangeTextEl.textContent = "Applies after the current turn finishes.";
+      } else if (data.respawned) {
         modelChangeTextEl.textContent =
           "Applied immediately -- your current session's Live Terminal was restarted with the new model.";
         // The respawned engine is now this card's ground truth -- refresh
@@ -2691,7 +2695,11 @@
       effortSelectCardEl.value = knownEffort;
       effortSelectSettingsEl.value = knownEffort;
 
-      if (data.respawned) {
+      if (data.deferred) {
+        // Issue #262: this card's turn is still running -- the backend
+        // applies the change once it finishes. Leave `turnInFlight` alone.
+        effortChangeTextEl.textContent = "Applies after the current turn finishes.";
+      } else if (data.respawned) {
         // Issue #141: the open card already had a live engine, which was
         // just torn down and respawned under the new effort.
         effortChangeTextEl.textContent =

@@ -39,7 +39,7 @@ issue #194 also needs) is frontend work, out of scope for this module -- see
 keyed by `card_id` -- one resident engine per SESSION CARD, claimed/closed
 alongside that card's own lifecycle (`register_stream_json_engine`/
 `_close_stream_json_engine`, `ensure_standby_stream_json_engine`/
-`claim_standby_stream_json_engine`/`close_standby_stream_json_engine`). A
+`claim_standby_stream_json_engine`/`close_all_standby_stream_json_engines`). A
 parser session is a
 different kind of thing entirely: it belongs to a PROJECT, not a session
 card, has no "claim" step (it's never handed off/reassigned the way a
@@ -188,9 +188,7 @@ def close_all_parser_sessions() -> None:
     registry. Called exactly once, from the web app's own shutdown hook
     (`rhubarb/web/app.py`'s `_lifespan`, the same place
     `db.cleanup_sessions_on_shutdown` already runs at process exit) -- a
-    parser session has no explicit per-project close action (unlike a
-    standby engine, closed when its project is closed/switched away from:
-    see `session_runner.close_standby_stream_json_engine`), so this is the
+    parser session has no explicit per-project close action, so this is the
     ONLY place a parser session is ever torn down, per issue #189/#187.
     Safe to call even with an empty registry."""
     for engine in _parser_sessions.values():

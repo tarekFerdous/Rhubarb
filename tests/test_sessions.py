@@ -3820,9 +3820,9 @@ def test_claim_standby_stream_json_engine_returns_none_when_none_exists(client, 
     assert session_runner.claim_standby_stream_json_engine(project_id, model="claude-sonnet-5", effort="auto") is None
 
 
-def test_close_standby_stream_json_engine_does_not_raise_when_none_exists(client, tmp_path):
-    project_id = _open_project(client, tmp_path, "proj")
-    session_runner.close_standby_stream_json_engine(project_id)  # no-op, must not raise
+def test_close_all_standby_stream_json_engines_does_not_raise_when_none_exist(client, tmp_path):
+    _open_project(client, tmp_path, "proj")
+    session_runner.close_all_standby_stream_json_engines()  # no-op, must not raise
 
 
 def test_count_resident_engines_includes_standby_engines(client, tmp_path, monkeypatch):
@@ -5457,19 +5457,21 @@ def test_claim_standby_stream_json_engine_returns_none_and_discards_on_model_mis
     assert project_id not in session_runner._standby_stream_json_engines
 
 
-def test_close_standby_stream_json_engine_closes_and_discards_it(client, tmp_path, monkeypatch):
-    """Stream-json mirror of `test_close_standby_engine_closes_and_discards_it`."""
+def test_close_all_standby_stream_json_engines_closes_and_discards_every_one(client, tmp_path, monkeypatch):
     project_id = _open_project(client, tmp_path, "proj")
     cwd = _cwd_for(project_id)
     fake_class = _mock_engine(monkeypatch, lambda prompt, **kw: iter([]))
     asyncio.run(
         session_runner.ensure_standby_stream_json_engine(project_id, cwd=cwd, model="claude-sonnet-5", effort="auto")
     )
+    asyncio.run(
+        session_runner.ensure_standby_stream_json_engine(project_id + 1000, cwd=cwd, model="claude-sonnet-5", effort="auto")
+    )
 
-    session_runner.close_standby_stream_json_engine(project_id)
+    session_runner.close_all_standby_stream_json_engines()
 
-    assert fake_class.instances[0].closed is True
-    assert project_id not in session_runner._standby_stream_json_engines
+    assert all(engine.closed for engine in fake_class.instances)
+    assert session_runner._standby_stream_json_engines == {}
 
 
 def test_register_stream_json_engine_makes_get_or_create_reuse_it_without_spawning(client, tmp_path, monkeypatch):
@@ -6509,3 +6511,210 @@ def test_implementing_extraction_returning_none_still_falls_back_to_the_generic_
     assert json.loads(row["stalled_json"]) == {"phase": "implementing", "context": "Asked which language to use."}
     events = live_stream._buffers.get(row_id, [])
     assert [e for e in events if e["type"] == "turn"][-1]["stalled"] is True
+
+
+# ---------------------------------------------------------------------------
+# PRD #259: engine close/turn race ('NoneType' object has no attribute
+# 'read_line'). Issue #260: a deliberately closed engine ends its turn
+# silently. Issue #261: a card's lock covers the whole job (turn, extraction,
+# verdict, advance), and teardown only closes the engine its own job used.
+# ---------------------------------------------------------------------------
+
+
+def _make_closable_fake_engine_class(entered):
+    """A fake `StreamJsonEngine` whose `stream_turn` blocks mid-turn until
+    `close()` is called, then raises `StreamJsonEngineClosedError` -- what the
+    real engine now does when closed while a read is in flight."""
+    from rhubarb.stream_json_engine import StreamJsonEngineClosedError
+
+    class ClosableFakeEngine:
+        instances: list["ClosableFakeEngine"] = []
+
+        def __init__(self, *, cwd=None, model=None, effort=None, resume_session_id=None, **_kw):
+            self.model = model
+            self.effort = effort
+            self.session_id = resume_session_id or f"fresh-{len(ClosableFakeEngine.instances) + 1}"
+            self._closed = asyncio.Event()
+            ClosableFakeEngine.instances.append(self)
+
+        def start(self):
+            return self
+
+        def isalive(self):
+            return not self._closed.is_set()
+
+        def close(self):
+            self._closed.set()
+
+        async def stream_turn(self, prompt):
+            entered.set()
+            yield {"type": "system", "subtype": "init", "session_id": self.session_id}
+            await self._closed.wait()
+            raise StreamJsonEngineClosedError("engine was closed while a turn was in flight")
+
+    return ClosableFakeEngine
+
+
+@pytest.mark.parametrize("job", ["grilling", "implementing"])
+def test_close_session_during_an_in_flight_turn_ends_silently(client, tmp_path, monkeypatch, job):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    entered = asyncio.Event()
+    monkeypatch.setattr(session_runner, "StreamJsonEngine", _make_closable_fake_engine_class(entered))
+    logged = []
+    monkeypatch.setattr(error_log, "log_error", lambda **kw: logged.append(kw))
+
+    conn = db.get_connection()
+    if job == "grilling":
+        row_id = db.create_session(conn, project_id)
+        start = lambda: session_runner.start_session_job(row_id, "a feature", cwd=cwd)  # noqa: E731
+    else:
+        row_id = db.create_session(
+            conn, project_id, session_type="implement", phase="implementing",
+            details={"prd": {"number": 5, "title": "My PRD"}},
+        )
+        start = lambda: session_runner.start_implement_job(row_id, 5, cwd=cwd)  # noqa: E731
+
+    async def scenario():
+        task = asyncio.create_task(start())
+        await entered.wait()
+        session_runner.close_session(db.get_connection(), row_id)
+        await task
+
+    asyncio.run(scenario())
+
+    events = live_stream._buffers.get(row_id, [])
+    assert [e for e in events if e["type"] == "turn" and e.get("error")] == []
+    row = db.get_session(conn, row_id)
+    assert row["error_text"] is None
+    assert row["phase"] == "closed"
+    assert logged == []
+
+
+def test_second_grilling_call_during_extraction_is_rejected_and_the_first_advances_cleanly(
+    client, tmp_path, monkeypatch
+):
+    """Card 116 regression: grilling job A finishes its turn with a "done"
+    verdict while grilling call B arrives during A's extraction. B is
+    rejected with "already in progress", A advances through the whole chain
+    under its own lock, and no `read_line`/`NoneType` error appears."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+    prompts = []
+    chain_lock_states = []
+
+    def handler(prompt, **kw):
+        prompts.append(prompt)
+        if prompt.startswith("/rhubarb:"):
+            chain_lock_states.append(session_runner._get_turn_lock(row_id).locked())
+        if prompt == "/rhubarb:publish-to-github":
+            return iter([_result_event("PRD #7: Thing\nIssue #8: Part")])
+        return iter([_result_event(f"reply to {prompt}")])
+
+    _mock_engine(monkeypatch, handler)
+
+    extraction_entered = asyncio.Event()
+    release_extraction = asyncio.Event()
+
+    async def slow_extract(project_id, text, *, card_id=None, on_progress=None):
+        extraction_entered.set()
+        await release_extraction.wait()
+        return {"header": text, "questions": [], "footer": "", "completion": {"done": True, "reason": "done"}}
+
+    monkeypatch.setattr(session_runner, "_extract_grilling_questions_via_parser_session", slow_extract)
+
+    async def scenario():
+        job_a = asyncio.create_task(session_runner.continue_session_job(row_id, "my answers", cwd=cwd))
+        await extraction_entered.wait()
+        await session_runner.continue_session_job(row_id, "double submit", cwd=cwd)
+        release_extraction.set()
+        await job_a
+
+    asyncio.run(scenario())
+
+    assert "double submit" not in prompts
+    assert chain_lock_states == [True, True, True]
+    assert not session_runner._get_turn_lock(row_id).locked()
+
+    events = live_stream._buffers.get(row_id, [])
+    error_turns = [e for e in events if e["type"] == "turn" and e.get("error")]
+    assert len(error_turns) == 1
+    assert "already in progress" in error_turns[0]["error"]
+    assert "read_line" not in json.dumps(events)
+    assert "NoneType" not in json.dumps(events)
+    assert db.get_session(conn, row_id)["phase"] == "details"
+
+
+def test_error_handler_does_not_close_an_engine_another_job_registered(client, tmp_path, monkeypatch):
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id)
+
+    def handler(prompt, **kw):
+        # Another job swaps in its own engine for this card mid-turn, then
+        # this job's turn fails.
+        session_runner.register_stream_json_engine(row_id, other_engine)
+        raise ClaudeCLIError("boom")
+
+    fake_class = _mock_engine(monkeypatch, handler)
+    other_engine = fake_class(cwd=cwd).start()
+
+    asyncio.run(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+
+    turn_engine = fake_class.instances[1]
+    assert turn_engine.closed is True
+    assert other_engine.closed is False
+    assert session_runner._stream_json_engines[row_id] is other_engine
+
+
+@pytest.mark.parametrize("kind", ["model", "effort"])
+def test_settings_change_during_an_in_flight_turn_is_deferred_until_the_job_ends(
+    client, tmp_path, monkeypatch, kind
+):
+    """Issue #262: a model/effort change while the card's turn is running
+    does not tear down its engine; the turn completes normally, and the
+    card's next turn runs on an engine spawned under the new setting."""
+    project_id = _open_project(client, tmp_path, "proj")
+    cwd = _cwd_for(project_id)
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    enter_count = {"n": 0}
+    fake_class = _make_blocking_fake_engine_class(entered, release, enter_count, result_text="Some reply")
+    monkeypatch.setattr(session_runner, "StreamJsonEngine", fake_class)
+
+    conn = db.get_connection()
+    row_id = db.create_session(conn, project_id, model="claude-old", effort="low")
+    new_value = "claude-new" if kind == "model" else "high"
+
+    async def scenario():
+        job = asyncio.create_task(session_runner.start_session_job(row_id, "a feature", cwd=cwd))
+        await entered.wait()
+        resp = client.post(f"/api/settings/{kind}", json={kind: new_value, "card_id": row_id})
+        assert resp.json() == {kind: new_value, "respawned": False, "deferred": True}
+        assert fake_class.instances[0].closed is False
+        release.set()
+        turn_completed = await job
+        return turn_completed
+
+    asyncio.run(scenario())
+
+    first_engine = fake_class.instances[0]
+    events = live_stream._buffers.get(row_id, [])
+    assert [e for e in events if e["type"] == "turn" and e.get("error")] == []
+    assert first_engine.closed is True  # replaced only after the job ended
+
+    respawned = session_runner._stream_json_engines[row_id]
+    assert respawned is not first_engine
+    assert getattr(respawned, kind) == new_value
+    assert db.get_session(conn, row_id)[kind] == new_value
+
+    asyncio.run(session_runner.continue_session_job(row_id, "next answer", cwd=cwd))
+    assert enter_count["n"] == 2
+    assert len(fake_class.instances) == 2

@@ -113,6 +113,9 @@ async def _lifespan(app: FastAPI):
     # (see `open_project`'s wiring above) -- so this shutdown hook is the
     # one and only place that ever happens.
     parser_session.close_all_parser_sessions()
+    # Issue #263: standbys also survive project Close, so shutdown is where
+    # they end too.
+    session_runner.close_all_standby_stream_json_engines()
 
 
 app = FastAPI(lifespan=_lifespan)
@@ -290,17 +293,22 @@ def set_model(body: dict):
     exactly as before this param existed -- global setting only, no engine
     touched. `respawned` is only present in the response when `card_id` was
     given, so a caller that never passes it (every existing caller) sees the
-    exact same response shape as before."""
+    exact same response shape as before. Issue #262: when that card's job is
+    running, the respawn is deferred until it finishes -- `respawned` is
+    False and `"deferred": true` is added."""
     conn = db.get_connection()
     model = body["model"]
     db.set_model(conn, model)
 
     card_id = body.get("card_id")
-    respawned = session_runner.respawn_engine_for_model_change(
+    outcome = session_runner.respawn_engine_for_model_change(
         conn, card_id, cwd=_active_project_cwd(), model=model
     )
     if card_id is not None:
-        return {"model": model, "respawned": respawned}
+        response = {"model": model, "respawned": outcome == "applied"}
+        if outcome == "deferred":
+            response["deferred"] = True
+        return response
     return {"model": model}
 
 
@@ -313,11 +321,14 @@ def set_effort(body: dict):
     db.set_effort(conn, effort)
 
     card_id = body.get("card_id")
-    respawned = session_runner.respawn_engine_for_effort_change(
+    outcome = session_runner.respawn_engine_for_effort_change(
         conn, card_id, cwd=_active_project_cwd(), effort=effort
     )
     if card_id is not None:
-        return {"effort": effort, "respawned": respawned}
+        response = {"effort": effort, "respawned": outcome == "applied"}
+        if outcome == "deferred":
+            response["deferred"] = True
+        return response
     return {"effort": effort}
 
 
@@ -853,7 +864,9 @@ def close_project(project_id: int, body: dict):
     db.save_session_state(conn, project_id, body.get("session_state", {}))
     if _active_project_id == project_id:
         _active_project_id = None
-    session_runner.close_standby_stream_json_engine(project_id)
+    # Issue #263 (PRD #259): Close leaves every one of the project's engines
+    # running -- in-flight turns and the pre-warmed standby alike -- so a
+    # switch back picks up instantly. Standbys close on app shutdown.
     return {"closed": True}
 
 
