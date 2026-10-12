@@ -5,6 +5,9 @@
 **An agentic software development controller that drives Claude Code from idea to merged feature.**
 Pick a project, describe what you want, and Rhubarb runs the whole loop: requirements grilling → PRD → issues → implementation → QA. It moves forward only when tests actually run and pass, not just because files exist.
 
+*The goal: generate full-stack applications across 13 layers, each gated on tests that actually run. V1 makes the basic flow solid first.*
+
+![Status: V1](https://img.shields.io/badge/status-V1%20%C2%B7%20basic%20flow-orange)
 ![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/FastAPI-local%20web%20UI-009688?logo=fastapi&logoColor=white)
 ![Claude Code](https://img.shields.io/badge/drives-Claude%20Code%20CLI-D97757)
@@ -135,6 +138,14 @@ pytest -k pty     # just the PTY engine tests
 
 - Modules use pure functions with injectable external calls (subprocess, HTTP, filesystem), so most of the suite runs without `claude`, `gh` or Ollama installed.
 - Record new architecture decisions in [`CLAUDE.md`](CLAUDE.md).
+
+## Roadmap
+
+Rhubarb is built in stages.
+
+- **V1 (now): the basic flow.** Make one end-to-end loop dependable: grill → PRD → issues → implement → QA on a single project, driven from the web UI. Everything described above belongs to V1.
+- **Next: all 13 layers.** Extend the loop from single features to whole applications. Rhubarb will generate a full-stack app layer by layer and gate each layer on its own tests that actually run before moving on to the next.
+- **Along the way:** settle the phase and gate design (see the limitations below), plus per-session sandboxing, an audit trail and rollback for unattended runs.
 
 ## Known limitations
 
